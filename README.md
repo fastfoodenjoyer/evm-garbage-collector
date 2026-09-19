@@ -16,6 +16,8 @@ Public RPC endpoints can rate-limit or be unavailable. The reports distinguish z
 
 See [network and token coverage](docs/coverage.md) for current gaps. The default catalog has 35 networks, 36 stablecoin contracts, and 13 verified Alchemy Portfolio mappings. For 150 wallets this means 10,650 mandatory balance checks, plus additional discovered tokens. A balance check can require several HTTP requests; the dry-run number is not an HTTP request or CU estimate. Prices may be unavailable.
 
+`config/swap-allowlist.json` is the future transaction allowlist. It defaults to `deny` and matches an asset only by exact `chain_id` plus contract address (or `native`). `swap` assets may be routed, `unwrap` assets may only be unwrapped to the native coin, and `review` assets require an explicit routing decision. The inventory scanner never signs transactions.
+
 Discovery continues when a public RPC is unavailable. Its positive token candidates are saved with their provider-reported raw balance, then verified via RPC. Only successfully verified balances enter `balances.csv`; unverified candidates and errors remain in `inventory.json` and coverage reports. RPC and Alchemy transient failures trigger a five-minute cooldown after bounded retries. Authentication failures stop that endpoint/provider for the current process.
 
 `checks.csv` includes every expected mandatory check, including checks not reached before an interruption. `coverage.csv` separates mandatory coverage, catalog review and discovery status. Progress and the run ID appear on stderr; the final summary is JSON on stdout.

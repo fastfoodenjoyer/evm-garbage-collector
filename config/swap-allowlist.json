@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "default_action": "deny",
+  "notes": "Exact chain ID and contract address must match. A symbol or token name alone never authorizes a swap or approval.",
+  "assets": [
+    {"chain_id": 1, "network": "Ethereum Mainnet", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 130, "network": "Unichain", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 1868, "network": "Soneium", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 8453, "network": "Base", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 42220, "network": "Celo", "asset_id": "native", "symbol": "CELO", "action": "swap"},
+    {"chain_id": 57073, "network": "Ink", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 81457, "network": "Blast", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 7777777, "network": "Zora", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0x0b2c639c533813f4aa9d7837caf62653d097ff85", "symbol": "USDC", "action": "swap"},
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0x7f5c764cbc14f9669b88837ca1490cca17c31607", "symbol": "USDC.e", "action": "swap"},
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", "symbol": "DAI", "action": "swap"},
+    {"chain_id": 130, "network": "Unichain", "asset_id": "0x078d782b760474a361dda0af3839290b0ef57ad6", "symbol": "USDC", "action": "swap"},
+    {"chain_id": 130, "network": "Unichain", "asset_id": "0x9151434b16b9763660705744891fa906f660ecc5", "symbol": "USDT0", "action": "swap"},
+    {"chain_id": 8453, "network": "Base", "asset_id": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "symbol": "USDC", "action": "swap"},
+    {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "0xaf88d065e77c8cc2239327c5edb3a432268e5831", "symbol": "USDC", "action": "swap"},
+    {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8", "symbol": "USDC.e", "action": "swap"},
+
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0x4200000000000000000000000000000000000006", "symbol": "WETH", "action": "unwrap"},
+    {"chain_id": 8453, "network": "Base", "asset_id": "0x4200000000000000000000000000000000000006", "symbol": "WETH", "action": "unwrap"},
+
+    {"chain_id": 1, "network": "Ethereum Mainnet", "asset_id": "0xb1d1eae60eea9525032a6dcb4c1ce336a1de71be", "symbol": "DRV", "action": "review"},
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0x4200000000000000000000000000000000000042", "symbol": "OP", "action": "review"},
+    {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0xc4d4500326981eacd020e20a81b1c479c161c7ef", "symbol": "exaWETH", "action": "review"},
+    {"chain_id": 130, "network": "Unichain", "asset_id": "0x927b51f251480a681271180da4de28d44ec4afb8", "symbol": "WBTC", "action": "review"},
+    {"chain_id": 8453, "network": "Base", "asset_id": "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", "symbol": "USDbC", "action": "review"},
+    {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "0x6694340fc020c5e6b96567843da2df01b2ce1eb6", "symbol": "STG", "action": "review"},
+    {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "0x912ce59144191c1204e64559fe8253a0e49e6548", "symbol": "ARB", "action": "review"},
+    {"chain_id": 42220, "network": "Celo", "asset_id": "0x471ece3750da237f93b8e339c536989b8978a438", "symbol": "CELO", "action": "review"},
+    {"chain_id": 42220, "network": "Celo", "asset_id": "0xc16b81af351ba9e64c1a069e3ab18c244a1e3049", "symbol": "EURA", "action": "review"},
+    {"chain_id": 57073, "network": "Ink", "asset_id": "0xf1815bd50389c46847f0bda824ec8da914045d14", "symbol": "USDC.e", "action": "review"},
+    {"chain_id": 81457, "network": "Blast", "asset_id": "0x2416092f143378750bb29b79ed961ab195cceea5", "symbol": "ezETH", "action": "review"},
+    {"chain_id": 81457, "network": "Blast", "asset_id": "0xb1a5700fa2358173fe465e6ea4ff52e36e88e2ad", "symbol": "BLAST", "action": "review"},
+    {"chain_id": 1868, "network": "Soneium", "asset_id": "0xba9986d2381edf1da03b0b9c1f8b00dc4aacc369", "symbol": "USDC.e", "action": "review"}
+  ]
+}
