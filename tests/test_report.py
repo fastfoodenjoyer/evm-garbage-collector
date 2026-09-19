@@ -139,3 +139,18 @@ def test_export_keeps_token_name_and_provider_metadata(tmp_path: Path):
     with (tmp_path / "out" / "balances.csv").open(newline="") as stream:
         csv_row = next(csv.DictReader(stream))
     assert csv_row["name"] == "USD Coin"
+
+
+def test_export_uses_network_native_symbol_when_provider_omits_it(tmp_path: Path):
+    with Store(tmp_path / "db") as store:
+        run_id = store.create_run(_snapshot())
+        native = store.ensure_job(run_id, WALLET, 1, "native")
+        store.record(
+            native,
+            {"raw_balance": "1", "decimals": 18, "symbol": "native"},
+            "provider_only",
+        )
+        export_run(store, run_id, tmp_path / "out")
+    payload = json.loads((tmp_path / "out" / "inventory.json").read_text())
+    row = next(row for row in payload["balances"] if row["asset_id"] == "native")
+    assert row["symbol"] == "ETH"

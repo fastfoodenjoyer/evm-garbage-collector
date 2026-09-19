@@ -149,7 +149,9 @@ def _discover(store, job, network, wallet, discovery):
                 if candidate["address"] == "native":
                     candidate = {
                         **candidate,
-                        "symbol": candidate.get("symbol") or network["native_symbol"],
+                        "symbol": network["native_symbol"]
+                        if candidate.get("symbol") in {None, "", "native"}
+                        else candidate["symbol"],
                         "decimals": candidate.get("decimals") or network["native_decimals"],
                     }
                 discovered = next(

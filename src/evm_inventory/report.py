@@ -43,12 +43,15 @@ def _row(job: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[st
     result = job.get("result") or {}
     meta = metadata or job.get("metadata") or {}
     raw = result.get("raw_balance")
+    symbol = result.get("symbol") or meta.get("symbol", "")
+    if job["asset_id"] == "native" and symbol == "native":
+        symbol = meta.get("symbol", "")
     return {
         "wallet": job["wallet"],
         "chain_id": job["chain_id"],
         "asset_id": job["asset_id"],
         "name": result.get("name") or meta.get("name", ""),
-        "symbol": result.get("symbol") or meta.get("symbol", ""),
+        "symbol": symbol,
         "raw_balance": str(raw) if raw is not None else None,
         "decimals": result.get("decimals", meta.get("decimals")),
         "amount": result.get("amount"),
