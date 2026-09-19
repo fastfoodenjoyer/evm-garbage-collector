@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -9,7 +10,26 @@ from .scanner import scan
 from .store import Store
 
 
+def _load_dotenv():
+    path = Path.cwd() / ".env"
+    if not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.isidentifier():
+            os.environ.setdefault(key, value.strip().strip("\"'"))
+
+
 def main(argv=None):
+    _load_dotenv()
     p=argparse.ArgumentParser(prog='evm-inventory'); sub=p.add_subparsers(dest='cmd',required=True)
     s=sub.add_parser('scan'); s.add_argument('--wallets',required=True); s.add_argument('--db',required=True); s.add_argument('--catalog'); s.add_argument('--delay-min',type=float,default=1); s.add_argument('--delay-max',type=float,default=3); s.add_argument('--dry-run',action='store_true')
     r=sub.add_parser('resume'); r.add_argument('--run',required=True); r.add_argument('--db',required=True)
