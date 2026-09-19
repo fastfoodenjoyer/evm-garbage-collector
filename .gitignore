@@ -9,6 +9,7 @@ __pycache__/
 reports/
 local/
 .idea/
+.DS_Store
 wallets*.txt
 build/
 dist/
