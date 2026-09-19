@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite*
+reports/
+local/
+wallets*.txt
+build/
+dist/

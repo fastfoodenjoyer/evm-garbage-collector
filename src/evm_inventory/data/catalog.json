@@ -1,0 +1,761 @@
+{
+  "revision": "bd6236e8d0bb7927483ed148e0a0d1c426e8399e",
+  "checked_at": "2026-09-19",
+  "source": "https://github.com/ethereum-optimism/superchain-registry/tree/bd6236e8d0bb7927483ed148e0a0d1c426e8399e",
+  "networks": [
+    {
+      "chain_id": 1,
+      "name": "Ethereum Mainnet",
+      "rpc_urls": [
+        "https://ethereum-rpc.publicnode.com"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Dai Stablecoin"
+        },
+        {
+          "address": "0x853d955acef822db058eb8505911ed77f175b99e",
+          "symbol": "FRAX",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "FRAX"
+        },
+        {
+          "address": "0x5f98805a4e8be255a32880fdec7f6728c6568ba0",
+          "symbol": "LUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "LUSD Stablecoin"
+        },
+        {
+          "address": "0x57ab1ec28d129707052df4df418d58a2d46d5f51",
+          "symbol": "sUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Synthetix USD"
+        },
+        {
+          "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "symbol": "USDT",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Tether USD"
+        },
+        {
+          "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 10,
+      "name": "OP Mainnet",
+      "rpc_urls": [
+        "https://mainnet.optimism.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x7f5c764cbc14f9669b88837ca1490cca17c31607",
+          "symbol": "USDC.e",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Bridged USDC"
+        },
+        {
+          "address": "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Dai Stablecoin"
+        },
+        {
+          "address": "0x2e3d870790dc77a83dd1d18184acc7439a53f475",
+          "symbol": "FRAX",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "FRAX"
+        },
+        {
+          "address": "0xc40f949f8a4e094d1b49a23ea9241d289b7b2819",
+          "symbol": "LUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "LUSD Stablecoin"
+        },
+        {
+          "address": "0x8c6f28f2f1a3c87f0f938b96d27520d9751ec8d9",
+          "symbol": "sUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Synthetix USD"
+        },
+        {
+          "address": "0x73cb180bf0521828d8849bc8cf2b920918e23032",
+          "symbol": "USD+",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "USD+"
+        },
+        {
+          "address": "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",
+          "symbol": "USDT",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Tether USD"
+        },
+        {
+          "address": "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 130,
+      "name": "Unichain",
+      "rpc_urls": [
+        "https://mainnet.unichain.org"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x20cab320a855b39f724131c69424240519573f81",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Dai Stablecoin"
+        },
+        {
+          "address": "0x8c7879bf25d678d9949f305857bd4437d74132b9",
+          "symbol": "FRAX",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "FRAX"
+        },
+        {
+          "address": "0xf81b7485b4cb59645f74528d702c7f8cd72577fb",
+          "symbol": "LUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "LUSD Stablecoin"
+        },
+        {
+          "address": "0x7251d204c2e867b31096d5c7091298239b3a6a0f",
+          "symbol": "sUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Synthetix USD"
+        },
+        {
+          "address": "0x588ce4f028d8e7b53b687865d6a67b3a54c75518",
+          "symbol": "USDT",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Tether USD"
+        },
+        {
+          "address": "0x078d782b760474a361dda0af3839290b0ef57ad6",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 177,
+      "name": "HashKey Chain",
+      "rpc_urls": [
+        "https://mainnet.hsk.xyz"
+      ],
+      "native_symbol": "HSK",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 183,
+      "name": "Ethernity",
+      "rpc_urls": [
+        "https://mainnet.ethernitychain.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 185,
+      "name": "Mint Mainnet",
+      "rpc_urls": [
+        "https://rpc.mintchain.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 252,
+      "name": "Fraxtal",
+      "rpc_urls": [
+        "https://rpc.frax.com"
+      ],
+      "native_symbol": "frxETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 254,
+      "name": "Swan Chain Mainnet",
+      "rpc_urls": [
+        "https://mainnet-rpc.swanchain.org"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 288,
+      "name": "Boba Mainnet",
+      "rpc_urls": [
+        "https://mainnet.boba.network"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 291,
+      "name": "Orderly Mainnet",
+      "rpc_urls": [
+        "https://rpc.orderly.network"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 360,
+      "name": "Shape",
+      "rpc_urls": [
+        "https://mainnet.shape.network/"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 480,
+      "name": "World Chain",
+      "rpc_urls": [
+        "https://worldchain-mainnet.g.alchemy.com/public"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x79a02482a880bce3f13e09da970dc34db4cd24d1",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 624,
+      "name": "Binary Mainnet",
+      "rpc_urls": [
+        "https://rpc.zero.thebinaryholdings.com"
+      ],
+      "native_symbol": "BNRY",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 690,
+      "name": "Redstone",
+      "rpc_urls": [
+        "https://rpc.redstonechain.com"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0xd5d59fc063e7548b6015a36feb10b875924a19be",
+          "symbol": "USDC.e",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Bridged USDC (Lattice)"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated stablecoin entries from official OP token list; not exhaustive.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 957,
+      "name": "Lyra Chain",
+      "rpc_urls": [
+        "https://rpc.lyra.finance"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 1135,
+      "name": "Lisk",
+      "rpc_urls": [
+        "https://rpc.api.lisk.com"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0xf242275d3a6527d877f2c927a82d9b057609cc71",
+          "symbol": "USDC.e",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Bridged USDC (Lisk)"
+        },
+        {
+          "address": "0x05d032ac25d322df992303dca074ee7392c117b9",
+          "symbol": "USDT",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Tether USD"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated stablecoin entries from official OP token list; not exhaustive.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 1750,
+      "name": "Metal L2",
+      "rpc_urls": [
+        "https://rpc.metall2.com"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 1868,
+      "name": "Soneium",
+      "rpc_urls": [
+        "https://rpc.soneium.org"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 5330,
+      "name": "Superseed",
+      "rpc_urls": [
+        "https://mainnet.superseed.xyz"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 5371,
+      "name": "Settlus Mainnet",
+      "rpc_urls": [
+        "https://settlus-mainnet.g.alchemy.com/public"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 6805,
+      "name": "RACE Mainnet",
+      "rpc_urls": [
+        "https://racemainnet.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 7560,
+      "name": "Cyber Mainnet",
+      "rpc_urls": [
+        "https://rpc.cyber.co"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 8008,
+      "name": "Polynomial",
+      "rpc_urls": [
+        "https://rpc.polynomial.fi"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 8453,
+      "name": "Base",
+      "rpc_urls": [
+        "https://mainnet.base.org"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Dai Stablecoin"
+        },
+        {
+          "address": "0x368181499736d0c0cc614dbb145e2ec1ac86b8c6",
+          "symbol": "LUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "LUSD Stablecoin"
+        },
+        {
+          "address": "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+          "symbol": "USDT",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Tether USD"
+        },
+        {
+          "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 33979,
+      "name": "Funki",
+      "rpc_urls": [
+        "https://rpc-mainnet.funkichain.com"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 34443,
+      "name": "Mode",
+      "rpc_urls": [
+        "https://mainnet.mode.network"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0xe7798f023fc62146e8aa1b36da45fb70855a77ea",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Dai Stablecoin"
+        },
+        {
+          "address": "0xd988097fb8612cc24eec14542bc03424c656005f",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "USD Coin"
+        },
+        {
+          "address": "0xf0f161fda2712db8b566946122a5af183995e2ed",
+          "symbol": "USDT",
+          "decimals": 6,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Tether USD"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated stablecoin entries from official OP token list; not exhaustive.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 42161,
+      "name": "Arbitrum One",
+      "rpc_urls": [
+        "https://arb1.arbitrum.io/rpc"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 42220,
+      "name": "Celo",
+      "rpc_urls": [
+        "https://forno.celo.org"
+      ],
+      "native_symbol": "CELO",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0xac177de2439bd0c7659c61f373dbf247d1f41abe",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "Dai Stablecoin (Celo native bridge)"
+        },
+        {
+          "address": "0xef6379fa3090310862a42f6c732dba2f20880f0a",
+          "symbol": "LUSD",
+          "decimals": 18,
+          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
+          "checked_at": "2026-09-19",
+          "variant": "LUSD Stablecoin (Celo native bridge)"
+        },
+        {
+          "address": "0xceba9300f2b948710d2653dd7b07f33a8b32118c",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 57073,
+      "name": "Ink",
+      "rpc_urls": [
+        "https://rpc-gel.inkonchain.com"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x2d270e6886d130d724215a266106e6832161eaed",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-19",
+          "variant": "Circle native USDC"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; other variants may exist.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 60808,
+      "name": "BOB",
+      "rpc_urls": [
+        "https://rpc.gobob.xyz"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 65536,
+      "name": "Automata Mainnet",
+      "rpc_urls": [
+        "https://rpc.ata.network"
+      ],
+      "native_symbol": "ATA",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 81457,
+      "name": "Blast",
+      "rpc_urls": [
+        "https://rpc.blast.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 380929,
+      "name": "Silent Data Mainnet",
+      "rpc_urls": [
+        "https://mainnet.silentdata.com/${SILENTDATA_AUTH_TOKEN}"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 2702128,
+      "name": "Xterio Chain (ETH)",
+      "rpc_urls": [
+        "https://xterio-eth.alt.technology/"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 7777777,
+      "name": "Zora",
+      "rpc_urls": [
+        "https://rpc.zora.energy"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    }
+  ]
+}
