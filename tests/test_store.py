@@ -11,7 +11,11 @@ def test_snapshot_round_trip_and_status(tmp_path: Path):
     db = tmp_path / "inventory.db"
     with Store(db) as store:
         run_id = store.create_run({"wallets": ["0x1"], "n": 1})
-        assert store.run(run_id) == {"run_id": run_id, "snapshot": {"wallets": ["0x1"], "n": 1}, "status": "pending"}
+        assert store.run(run_id) == {
+            "run_id": run_id,
+            "snapshot": {"wallets": ["0x1"], "n": 1},
+            "status": "pending",
+        }
         store.set_status(run_id, "success")
         assert store.run(run_id)["status"] == "success"
 
@@ -22,7 +26,11 @@ def test_jobs_dedup_success_zero_and_huge_balance(tmp_path: Path):
         jid = store.ensure_job(rid, "0xabc", 1, "native")
         assert store.ensure_job(rid, "0xabc", 1, "native") == jid
         assert store.jobs(rid)[0]["status"] == "pending"
-        store.record(jid, {"raw_balance": "100000000000000000000000000000000000000", "decimals": 18}, "success")
+        store.record(
+            jid,
+            {"raw_balance": "100000000000000000000000000000000000000", "decimals": 18},
+            "success",
+        )
         row = store.jobs(rid)[0]
         assert row["result"]["raw_balance"].startswith("1000")
         assert row["attempts"] == 1 and row["status"] == "success"
@@ -33,7 +41,7 @@ def test_pass_is_immutable(tmp_path: Path):
         rid = store.create_run({})
         block = {"number": 5, "hash": "0x5", "timestamp": 10}
         store.save_pass(rid, "0xabc", 1, block)
-        store.save_pass(rid, "0xabc", 1, {"number": 6, "hash": "0x6", "timestamp": 11})
+        store.save_pass(rid, "0xabc", 1, block)
         assert store.get_pass(rid, "0xabc", 1) == block
         with pytest.raises(ValueError):
             store.save_pass(rid, "0xabc", 1, {"number": 6, "hash": "0x6", "timestamp": 11})
@@ -64,7 +72,7 @@ def test_discovery_page_atomically_creates_jobs_and_advances_cursor(tmp_path: Pa
 def test_unknown_run_and_readonly_reject_writes(tmp_path: Path):
     db = tmp_path / "db"
     with Store(db) as store:
-        rid = store.create_run({})
+        store.create_run({})
     with Store(db, readonly=True) as store:
         with pytest.raises(ValueError):
             store.run("missing")

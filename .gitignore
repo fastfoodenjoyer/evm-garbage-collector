@@ -8,6 +8,7 @@ __pycache__/
 *.sqlite*
 reports/
 local/
+.idea/
 wallets*.txt
 build/
 dist/

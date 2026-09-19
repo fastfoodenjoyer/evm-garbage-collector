@@ -86,8 +86,7 @@ class Token:
     def __post_init__(self) -> None:
         if not isinstance(self.address, str) or not _ADDRESS_RE.fullmatch(self.address):
             raise ConfigError(
-                "token address must be 0x followed by 40 hex characters: "
-                f"{self.address!r}"
+                f"token address must be 0x followed by 40 hex characters: {self.address!r}"
             )
         object.__setattr__(self, "address", self.address.lower())
         if not isinstance(self.symbol, str) or not self.symbol.strip():
@@ -136,9 +135,7 @@ class Network:
         if any(token.decimals is None for token in self.tokens):
             raise ConfigError("token decimals are required for curated network tokens")
         if self.token_review_status not in _TOKEN_REVIEW_STATUSES:
-            raise ConfigError(
-                "token_review_status must be one of: verified, pending, none"
-            )
+            raise ConfigError("token_review_status must be one of: verified, pending, none")
         if not isinstance(self.notes, str):
             raise ConfigError("network notes must be a string")
         if self.token_review_status == "none" and self.tokens:

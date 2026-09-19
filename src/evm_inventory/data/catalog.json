@@ -63,7 +63,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "eth-mainnet"
     },
     {
       "chain_id": 10,
@@ -141,7 +141,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "opt-mainnet"
     },
     {
       "chain_id": 130,
@@ -203,7 +203,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "unichain-mainnet"
     },
     {
       "chain_id": 177,
@@ -307,7 +307,7 @@
       "tokens": [],
       "token_review_status": "pending",
       "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
+      "alchemy_network": "shape-mainnet"
     },
     {
       "chain_id": 480,
@@ -329,7 +329,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "worldchain-mainnet"
     },
     {
       "chain_id": 624,
@@ -433,7 +433,7 @@
       "tokens": [],
       "token_review_status": "pending",
       "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
+      "alchemy_network": "soneium-mainnet"
     },
     {
       "chain_id": 5330,
@@ -459,7 +459,7 @@
       "tokens": [],
       "token_review_status": "pending",
       "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
+      "alchemy_network": "settlus-mainnet"
     },
     {
       "chain_id": 6805,
@@ -544,7 +544,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "base-mainnet"
     },
     {
       "chain_id": 33979,
@@ -617,7 +617,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "arb-mainnet"
     },
     {
       "chain_id": 42220,
@@ -655,7 +655,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "celo-mainnet"
     },
     {
       "chain_id": 57073,
@@ -677,7 +677,7 @@
       ],
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
-      "alchemy_network": null
+      "alchemy_network": "ink-mainnet"
     },
     {
       "chain_id": 60808,
@@ -689,7 +689,7 @@
       "native_decimals": 18,
       "tokens": [],
       "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
+      "notes": "Stablecoin catalog review pending. Alchemy Portfolio returned Unsupported network: bob-mainnet on 2026-09-19.",
       "alchemy_network": null
     },
     {
@@ -716,7 +716,7 @@
       "tokens": [],
       "token_review_status": "pending",
       "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
+      "alchemy_network": "blast-mainnet"
     },
     {
       "chain_id": 380929,
@@ -755,7 +755,7 @@
       "tokens": [],
       "token_review_status": "pending",
       "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
+      "alchemy_network": "zora-mainnet"
     }
   ]
 }

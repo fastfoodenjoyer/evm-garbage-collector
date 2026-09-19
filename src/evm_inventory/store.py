@@ -22,7 +22,6 @@ class Store:
         self.path = Path(path)
         self.readonly = readonly
         self._lock = None
-        self._pass_conflicts = set()
         self.db = None
         try:
             if readonly:
@@ -99,8 +98,10 @@ class Store:
     def create_run(self, snapshot: dict[str, Any]) -> str:
         self._write_guard()
         run_id = uuid.uuid4().hex[:12]
-        self.db.execute("INSERT INTO runs(run_id,snapshot,status,created_at) VALUES (?, ?, 'pending', ?)",
-                        (run_id, json.dumps(snapshot), time.time()))
+        self.db.execute(
+            "INSERT INTO runs(run_id,snapshot,status,created_at) VALUES (?, ?, 'pending', ?)",
+            (run_id, json.dumps(snapshot), time.time()),
+        )
         self.db.commit()
         return run_id
 
@@ -108,8 +109,11 @@ class Store:
         row = self.db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             raise ValueError(f"unknown run: {run_id}")
-        return {"run_id": row["run_id"], "snapshot": json.loads(row["snapshot"]),
-                "status": row["status"]}
+        return {
+            "run_id": row["run_id"],
+            "snapshot": json.loads(row["snapshot"]),
+            "status": row["status"],
+        }
 
     def set_status(self, run_id: str, status: str) -> None:
         self._write_guard()
@@ -118,8 +122,15 @@ class Store:
             raise ValueError(f"unknown run: {run_id}")
         self.db.commit()
 
-    def ensure_job(self, run_id: str, wallet: str, chain_id: int, asset_id: str,
-                   kind: str = "mandatory", metadata: dict[str, Any] | None = None) -> int:
+    def ensure_job(
+        self,
+        run_id: str,
+        wallet: str,
+        chain_id: int,
+        asset_id: str,
+        kind: str = "mandatory",
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
         self._write_guard()
         if not self.db.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone():
             raise ValueError(f"unknown run: {run_id}")
@@ -136,8 +147,9 @@ class Store:
         self.db.commit()
         return int(row[0])
 
-    def jobs(self, run_id: str, wallet: str | None = None,
-             chain_id: int | None = None) -> list[dict[str, Any]]:
+    def jobs(
+        self, run_id: str, wallet: str | None = None, chain_id: int | None = None
+    ) -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM jobs WHERE run_id=?", [run_id]
         if wallet is not None:
             sql += " AND wallet=?"
@@ -146,14 +158,21 @@ class Store:
             sql += " AND chain_id=?"
             args.append(chain_id)
         rows = self.db.execute(sql + " ORDER BY id", args).fetchall()
-        return [{**dict(row), "retry_after": (float(row["retry_after"])
-                 if row["retry_after"] is not None else None),
-                 "metadata": json.loads(row["metadata"]),
-                 "result": json.loads(row["result"]) if row["result"] is not None else None}
-                for row in rows]
+        return [
+            {
+                **dict(row),
+                "retry_after": (
+                    float(row["retry_after"]) if row["retry_after"] is not None else None
+                ),
+                "metadata": json.loads(row["metadata"]),
+                "result": json.loads(row["result"]) if row["result"] is not None else None,
+            }
+            for row in rows
+        ]
 
-    def record(self, job_id: int, result: dict[str, Any], status: str = "success",
-               retry_after: Any = None) -> None:
+    def record(
+        self, job_id: int, result: dict[str, Any], status: str = "success", retry_after: Any = None
+    ) -> None:
         self._write_guard()
         if retry_after is not None:
             retry_after = float(retry_after)
@@ -166,8 +185,10 @@ class Store:
         self.db.commit()
 
     def get_pass(self, run_id: str, wallet: str, chain_id: int) -> dict[str, Any] | None:
-        row = self.db.execute("SELECT block FROM passes WHERE run_id=? AND wallet=? AND chain_id=?",
-                              (run_id, wallet, chain_id)).fetchone()
+        row = self.db.execute(
+            "SELECT block FROM passes WHERE run_id=? AND wallet=? AND chain_id=?",
+            (run_id, wallet, chain_id),
+        ).fetchone()
         return json.loads(row[0]) if row else None
 
     def save_pass(self, run_id: str, wallet: str, chain_id: int, block: dict[str, Any]) -> None:
@@ -177,18 +198,17 @@ class Store:
             (run_id, wallet, chain_id),
         ).fetchone()
         if row is not None:
-            key = (run_id, wallet, chain_id)
             if json.loads(row[0]) != block:
-                if key in self._pass_conflicts:
-                    raise ValueError("network pass is immutable")
-                self._pass_conflicts.add(key)
+                raise ValueError("network pass is immutable")
             return
-        self.db.execute("INSERT INTO passes VALUES(?,?,?,?)",
-                        (run_id, wallet, chain_id, json.dumps(block)))
+        self.db.execute(
+            "INSERT INTO passes VALUES(?,?,?,?)", (run_id, wallet, chain_id, json.dumps(block))
+        )
         self.db.commit()
 
-    def save_discovery_page(self, job_id: int, contracts: list[dict[str, Any]],
-                            next_cursor: str | None) -> None:
+    def save_discovery_page(
+        self, job_id: int, contracts: list[dict[str, Any]], next_cursor: str | None
+    ) -> None:
         self._write_guard()
         with self.db:
             parent = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -199,13 +219,22 @@ class Store:
                 self.db.execute(
                     "INSERT OR IGNORE INTO jobs(run_id,wallet,chain_id,asset_id,kind,metadata) "
                     "VALUES(?,?,?,?,?,?)",
-                    (parent["run_id"], parent["wallet"], parent["chain_id"], address,
-                     "discovered", json.dumps(contract)),
+                    (
+                        parent["run_id"],
+                        parent["wallet"],
+                        parent["chain_id"],
+                        address,
+                        "discovered",
+                        json.dumps(contract),
+                    ),
                 )
             result = json.loads(parent["result"]) if parent["result"] else {}
+            result.pop("error", None)
             result["cursor"] = next_cursor
             history = result.setdefault("cursor_history", [])
             if next_cursor not in history:
                 history.append(next_cursor)
-            self.db.execute("UPDATE jobs SET result=?, status=? WHERE id=?",
-                            (json.dumps(result), "success" if next_cursor is None else "pending", job_id))
+            self.db.execute(
+                "UPDATE jobs SET result=?, status=?, retry_after=NULL WHERE id=?",
+                (json.dumps(result), "success" if next_cursor is None else "pending", job_id),
+            )

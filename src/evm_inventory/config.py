@@ -16,9 +16,7 @@ from typing import Any
 from .models import Catalog, ConfigError, Network, Token
 
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-_SNAPSHOT_SETTINGS = frozenset(
-    {"delay_min", "delay_max", "interval", "discovery_enabled"}
-)
+_SNAPSHOT_SETTINGS = frozenset({"delay_min", "delay_max", "interval", "discovery_enabled"})
 
 
 def load_wallets(path: Path) -> tuple[str, ...]:
@@ -40,8 +38,10 @@ def load_wallets(path: Path) -> tuple[str, ...]:
         if not value:
             continue
         normalized = value.lower()
-        if len(value) != 42 or not normalized.startswith("0x") or any(
-            character not in "0123456789abcdef" for character in normalized[2:]
+        if (
+            len(value) != 42
+            or not normalized.startswith("0x")
+            or any(character not in "0123456789abcdef" for character in normalized[2:])
         ):
             issues.append(f"line {line_number}: invalid EVM address {value!r}")
             continue
@@ -143,8 +143,7 @@ def load_catalog(path: Path | None = None) -> Catalog:
     if not isinstance(data["networks"], list):
         raise ConfigError("catalog networks must be an array")
     networks = tuple(
-        _network_from_dict(item, index)
-        for index, item in enumerate(data["networks"], start=1)
+        _network_from_dict(item, index) for index, item in enumerate(data["networks"], start=1)
     )
     catalog = Catalog(
         networks=networks,
@@ -262,11 +261,7 @@ def format_amount(raw: int, decimals: int | None) -> str | None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise TypeError("raw balance must be an integer")
-    if (
-        isinstance(decimals, bool)
-        or not isinstance(decimals, int)
-        or not 0 <= decimals <= 255
-    ):
+    if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 255:
         raise ValueError("decimals must be an integer from 0 through 255 or null")
     with localcontext() as context:
         context.prec = 400
