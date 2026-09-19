@@ -108,3 +108,34 @@ def test_checks_csv_escapes_formula_symbol(tmp_path: Path):
     with (tmp_path / "out" / "checks.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows[1]["symbol"] == "'=FORMULA"
+
+
+def test_export_keeps_token_name_and_provider_metadata(tmp_path: Path):
+    with Store(tmp_path / "db") as store:
+        run_id = store.create_run(_snapshot())
+        token = store.ensure_job(run_id, WALLET, 1, "0x" + "b" * 40)
+        store.record(
+            token,
+            {
+                "raw_balance": "1230000",
+                "decimals": 6,
+                "amount": "1.23",
+                "name": "USD Coin",
+                "symbol": "USDC",
+                "source": "alchemy",
+                "verification": "provider_only",
+                "price_usd": "1",
+                "price_source": "alchemy",
+                "price_timestamp": "2026-09-19T00:00:00Z",
+            },
+            "provider_only",
+        )
+        export_run(store, run_id, tmp_path / "out")
+    payload = json.loads((tmp_path / "out" / "inventory.json").read_text())
+    row = next(row for row in payload["balances"] if row["asset_id"] != "native")
+    assert row["name"] == "USD Coin"
+    assert row["source"] == "alchemy"
+    assert row["verification"] == "provider_only"
+    with (tmp_path / "out" / "balances.csv").open(newline="") as stream:
+        csv_row = next(csv.DictReader(stream))
+    assert csv_row["name"] == "USD Coin"

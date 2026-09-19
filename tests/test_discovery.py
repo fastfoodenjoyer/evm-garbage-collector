@@ -12,7 +12,10 @@ def test_page_and_address_validation():
     token = "0x" + "2" * 40
 
     def handler(req):
-        assert json.loads(req.content)["addresses"][0]["networks"] == ["eth-mainnet"]
+        payload = json.loads(req.content)
+        assert payload["addresses"][0]["networks"] == ["eth-mainnet"]
+        assert payload["withMetadata"] is True
+        assert payload["withPrices"] is True
         return httpx.Response(
             200,
             json={
@@ -23,6 +26,14 @@ def test_page_and_address_validation():
                             "network": "eth-mainnet",
                             "tokenAddress": token,
                             "tokenBalance": "0x2",
+                            "tokenMetadata": {"name": "USD Coin", "symbol": "USDC", "decimals": 6},
+                            "tokenPrices": [
+                                {
+                                    "currency": "usd",
+                                    "value": "1",
+                                    "lastUpdatedAt": "2026-09-19T00:00:00Z",
+                                }
+                            ],
                         }
                     ]
                 },
@@ -36,6 +47,42 @@ def test_page_and_address_validation():
     )
     tokens, cursor = d.page(wallet, "eth-mainnet")
     assert tokens[0]["address"] == token and cursor == "next"
+    assert tokens[0]["name"] == "USD Coin"
+    assert tokens[0]["symbol"] == "USDC"
+    assert tokens[0]["decimals"] == 6
+    assert tokens[0]["price_usd"] == "1"
+
+
+def test_metadata_errors_do_not_drop_a_valid_balance():
+    wallet = "0x" + "1" * 40
+    token = "0x" + "2" * 40
+
+    def handler(_req):
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "tokens": [
+                        {
+                            "address": wallet,
+                            "network": "base-mainnet",
+                            "tokenAddress": token,
+                            "tokenBalance": "0x7",
+                            "tokenMetadata": {"name": 7, "symbol": None, "decimals": "bad"},
+                            "tokenPrices": [{"currency": "usd", "value": "not-a-number"}],
+                        }
+                    ]
+                }
+            },
+        )
+
+    t = Transport(client=httpx.Client(transport=httpx.MockTransport(handler)), interval=0)
+    tokens, _ = Discovery(t, key="test").page(wallet, "base-mainnet")
+    assert tokens[0]["reported_raw_balance"] == "7"
+    assert tokens[0]["name"] is None
+    assert tokens[0]["symbol"] == token.lower()
+    assert tokens[0]["decimals"] is None
+    assert tokens[0]["price_usd"] is None
 
 
 def test_partial_errors_not_empty_success():

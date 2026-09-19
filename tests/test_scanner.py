@@ -77,7 +77,14 @@ class Discover:
 
     def page(self, wallet, network, cursor=None):
         self.calls += 1
-        return [{"address": "0x" + "3" * 40, "symbol": "OTHER", "decimals": None}], None
+        return [
+            {
+                "address": "0x" + "3" * 40,
+                "symbol": "OTHER",
+                "decimals": 6,
+                "reported_raw_balance": "1230000",
+            }
+        ], None
 
 
 def test_discovery_runs_when_rpc_unavailable(tmp_path):
@@ -93,7 +100,9 @@ def test_discovery_runs_when_rpc_unavailable(tmp_path):
         assert summary["status"] == "incomplete"
         jobs = st.jobs(run)
         assert next(j for j in jobs if j["kind"] == "discovery")["status"] == "success"
-        assert next(j for j in jobs if j["kind"] == "discovered")["status"] == "unavailable"
+        discovered = next(j for j in jobs if j["kind"] == "discovered")
+        assert discovered["status"] == "provider_only"
+        assert discovered["result"]["amount"] == "1.230000"
 
 
 def test_failed_token_not_retried_twice_in_same_pass(tmp_path):

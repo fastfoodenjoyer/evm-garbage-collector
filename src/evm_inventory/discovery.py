@@ -4,11 +4,12 @@ import os
 import re
 import time
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
 
 from .transport import RequestError
 
-SOURCE = "https://www.alchemy.com/docs/data/portfolio-apis/portfolio-api-endpoints/portfolio-api-endpoints/get-token-balances-by-address"
+SOURCE = "https://www.alchemy.com/docs/data/portfolio-apis/portfolio-api-endpoints/portfolio-api-endpoints/get-tokens-by-wallet-address"
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
@@ -32,13 +33,17 @@ class Discovery:
             "includeNativeTokens": True,
             "includeErc20Tokens": True,
             "includeBlockMetadata": False,
+            # The Portfolio response carries token metadata and prices in this same
+            # request, avoiding a contract call for every discovered balance.
+            "withMetadata": True,
+            "withPrices": True,
         }
         if cursor:
             payload["pageKey"] = cursor
         url = (
             "https://api.g.alchemy.com/data/v1/"
             + quote(self.key, safe="")
-            + "/assets/tokens/balances/by-address"
+            + "/assets/tokens/by-address"
         )
         try:
             data = self.transport.post(url, payload)
@@ -78,16 +83,50 @@ class Discovery:
             if int(raw, 16) == 0:
                 continue
             address = contract.lower() if contract != "native" else "native"
+            metadata = token.get("tokenMetadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            name = metadata.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = None
+            symbol = metadata.get("symbol") or token.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                symbol = address
+            decimals = metadata.get("decimals")
+            if not isinstance(decimals, int) or not 0 <= decimals <= 255:
+                decimals = None
+            price_usd = price_timestamp = None
+            prices = token.get("tokenPrices")
+            if isinstance(prices, list):
+                for price in prices:
+                    if (
+                        not isinstance(price, dict)
+                        or str(price.get("currency", "")).lower() != "usd"
+                    ):
+                        continue
+                    value = price.get("value")
+                    try:
+                        parsed = Decimal(str(value))
+                    except (InvalidOperation, ValueError):
+                        continue
+                    if parsed.is_finite() and parsed >= 0:
+                        price_usd = format(parsed, "f")
+                        timestamp = price.get("lastUpdatedAt")
+                        price_timestamp = timestamp if isinstance(timestamp, str) else None
+                    break
             result[address] = {
                 "address": address,
-                "symbol": token.get("symbol") or address,
-                "decimals": None,
+                "name": name,
+                "symbol": symbol,
+                "decimals": decimals,
                 "source": SOURCE,
                 "checked_at": datetime.now(UTC).date().isoformat(),
                 "variant": "discovered ERC-20",
                 "reported_raw_balance": str(int(raw, 16)),
                 "reported_at": datetime.now(UTC).isoformat(),
                 "reported_source": "alchemy",
+                "price_usd": price_usd,
+                "price_source": "alchemy" if price_usd is not None else None,
+                "price_timestamp": price_timestamp,
             }
         next_cursor = data["data"].get("pageKey", data.get("pageKey"))
         if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor):

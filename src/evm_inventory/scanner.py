@@ -146,6 +146,12 @@ def _discover(store, job, network, wallet, discovery):
                 raw = candidate.get("reported_raw_balance")
                 if not raw:
                     continue
+                if candidate["address"] == "native":
+                    candidate = {
+                        **candidate,
+                        "symbol": candidate.get("symbol") or network["native_symbol"],
+                        "decimals": candidate.get("decimals") or network["native_decimals"],
+                    }
                 discovered = next(
                     item
                     for item in store.jobs(job["run_id"], wallet, network["chain_id"])
@@ -156,12 +162,17 @@ def _discover(store, job, network, wallet, discovery):
                     {
                         "raw_balance": raw,
                         "decimals": candidate.get("decimals"),
-                        "amount": None,
+                        "amount": format_amount(int(raw), candidate["decimals"])
+                        if candidate.get("decimals") is not None
+                        else None,
+                        "name": candidate.get("name"),
                         "symbol": candidate.get("symbol", candidate["address"]),
                         "observed_at": candidate.get("reported_at", now()),
                         "source": "alchemy",
                         "verification": "provider_only",
-                        "price_usd": None,
+                        "price_usd": candidate.get("price_usd"),
+                        "price_source": candidate.get("price_source"),
+                        "price_timestamp": candidate.get("price_timestamp"),
                     },
                     status="provider_only",
                 )
@@ -214,6 +225,7 @@ def scan(store, run_id, *, rpc=None, discovery=None, sleep=time.sleep, progress=
                 # Discovery is independent of RPC availability; persist candidates first.
                 _discover(store, dj, network, wallet, discovery)
                 jobs = store.jobs(run_id, wallet, cid)
+                dj = next(j for j in jobs if j["kind"] == "discovery")
                 pending = [j for j in jobs if j["kind"] != "discovery" and _ready(j)]
                 if network.get("alchemy_network") and dj.get("status") == "success":
                     # Alchemy supplied the indexed holdings for this network. Keep any

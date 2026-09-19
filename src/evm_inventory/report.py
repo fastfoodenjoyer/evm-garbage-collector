@@ -15,6 +15,7 @@ _CHECK_FIELDS = [
     "wallet",
     "chain_id",
     "asset_id",
+    "name",
     "symbol",
     "raw_balance",
     "decimals",
@@ -24,6 +25,10 @@ _CHECK_FIELDS = [
     "block_number",
     "observed_at",
     "price_usd",
+    "price_source",
+    "price_timestamp",
+    "source",
+    "verification",
 ]
 
 
@@ -42,6 +47,7 @@ def _row(job: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[st
         "wallet": job["wallet"],
         "chain_id": job["chain_id"],
         "asset_id": job["asset_id"],
+        "name": result.get("name") or meta.get("name", ""),
         "symbol": result.get("symbol") or meta.get("symbol", ""),
         "raw_balance": str(raw) if raw is not None else None,
         "decimals": result.get("decimals", meta.get("decimals")),
@@ -51,6 +57,10 @@ def _row(job: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[st
         "block_number": result.get("block_number"),
         "observed_at": result.get("observed_at"),
         "price_usd": result.get("price_usd"),
+        "price_source": result.get("price_source"),
+        "price_timestamp": result.get("price_timestamp"),
+        "source": result.get("source"),
+        "verification": result.get("verification"),
     }
 
 
