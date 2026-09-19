@@ -1,4 +1,4 @@
-from evm_inventory.scanner import scan
+from evm_inventory.scanner import _rpc_urls, scan
 from evm_inventory.store import Store
 
 W = "0x" + "1" * 40
@@ -140,6 +140,17 @@ def test_unavailable_rpc_has_cooldown_across_wallets(tmp_path):
         rpc = BadRPC()
         scan(st, run, rpc=rpc, sleep=lambda _: None)
         assert rpc.calls == 1
+
+
+def test_alchemy_rpc_is_used_before_public_endpoint(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_RPC_API_KEY", "test-key")
+    urls = _rpc_urls(
+        {"alchemy_network": "opt-mainnet", "rpc_urls": ["https://rpc.example"]}
+    )
+    assert urls == (
+        "https://opt-mainnet.g.alchemy.com/v2/test-key",
+        "https://rpc.example",
+    )
 
 
 def test_rpc_failure_during_balances_defers_remaining_calls(tmp_path):

@@ -1,8 +1,10 @@
 """Resumable wallet traversal with mandatory RPC checks and optional discovery."""
 
+import os
 import random
 import time
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 from .config import format_amount
 from .discovery import Discovery
@@ -44,9 +46,23 @@ def _ensure_jobs(store, run, wallet, network):
     store.ensure_job(run, wallet, network["chain_id"], "discovery", kind="discovery")
 
 
+def _rpc_urls(network):
+    """Prefer an in-memory Alchemy RPC URL when the configured key supports the chain."""
+
+    urls = list(network["rpc_urls"])
+    key = os.environ.get("ALCHEMY_RPC_API_KEY")
+    alchemy_network = network.get("alchemy_network")
+    if key and alchemy_network:
+        urls.insert(
+            0,
+            f"https://{alchemy_network}.g.alchemy.com/v2/{quote(key, safe='')}",
+        )
+    return tuple(dict.fromkeys(urls))
+
+
 def _select_endpoint(rpc, network, pinned, blocked):
     error = RequestError("no_rpc_available")
-    for url in network["rpc_urls"]:
+    for url in _rpc_urls(network):
         if url in blocked:
             saved = blocked[url]
             if saved.retry_after is None or saved.retry_after > time.time():
