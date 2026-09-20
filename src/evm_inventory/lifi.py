@@ -6,6 +6,7 @@ sign messages, or submit transactions.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -84,36 +85,36 @@ class LifiClient:
                 "allowSwitchChain": True,
             },
         }
-        response = self.http_client.post(
-            self.endpoint,
-            json=payload,
-            headers={
-                "referer": "https://jumper.exchange/",
-                "origin": "https://jumper.exchange",
-                "x-lifi-integrator": "jumper.exchange",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
+        response = self._post(payload)
         body = response.json()
         if not isinstance(body, dict) or not isinstance(body.get("routes"), list):
             raise ValueError("LI.FI response does not contain routes")
         return tuple(_route_from_dict(item) for item in body["routes"])
 
+    def _post(self, payload: dict) -> _Response:
+        headers = {
+            "referer": "https://jumper.exchange/",
+            "origin": "https://jumper.exchange",
+            "x-lifi-integrator": "jumper.exchange",
+        }
+        for attempt in range(3):
+            try:
+                response = self.http_client.post(
+                    self.endpoint, json=payload, headers=headers, timeout=30
+                )
+                response.raise_for_status()
+                return response
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status not in {429, 500, 502, 503, 504} or attempt == 2:
+                    raise
+                time.sleep(0.5 * (2**attempt))
+        raise AssertionError("unreachable")
+
     def step_transaction(self, step: dict[str, Any]) -> TransactionRequest:
         """Build unsigned calldata for one quoted step; no transaction is signed or sent."""
 
-        response = self.http_client.post(
-            self.endpoint.rsplit("/", 1)[0] + "/stepTransaction",
-            json=step,
-            headers={
-                "referer": "https://jumper.exchange/",
-                "origin": "https://jumper.exchange",
-                "x-lifi-integrator": "jumper.exchange",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
+        response = self._post_step(step)
         body = response.json()
         if not isinstance(body, dict) or not isinstance(body.get("transactionRequest"), dict):
             raise ValueError("Jumper response does not contain a transaction request")
@@ -129,6 +130,29 @@ class LifiClient:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("Jumper transaction request is malformed") from exc
+
+    def _post_step(self, step: dict[str, Any]) -> _Response:
+        headers = {
+            "referer": "https://jumper.exchange/",
+            "origin": "https://jumper.exchange",
+            "x-lifi-integrator": "jumper.exchange",
+        }
+        for attempt in range(3):
+            try:
+                response = self.http_client.post(
+                    self.endpoint.rsplit("/", 1)[0] + "/stepTransaction",
+                    json=step,
+                    headers=headers,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                return response
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status not in {429, 500, 502, 503, 504} or attempt == 2:
+                    raise
+                time.sleep(0.5 * (2**attempt))
+        raise AssertionError("unreachable")
 
 
 def _route_from_dict(value: object) -> LifiRoute:
