@@ -29,7 +29,7 @@ def create_live_plan(
     client: QuoteClient | None = None,
     targets: tuple[BitgetDepositTarget, ...] | None = None,
 ) -> dict:
-    """Quote only allowlisted balances and retain only depositable route outputs.
+    """Quote only allowlisted balances and retain routes to a wallet-owned staging balance.
 
     This function makes read-only HTTP requests. It neither asks Jumper for signed
     data nor sends a transaction.
@@ -54,6 +54,9 @@ def create_live_plan(
             )
             counts[status] += 1
             rows.append(item)
+    deposits = _staged_deposits(rows, targets=targets, deposit_addresses=deposit_addresses)
+    rows.extend(deposits)
+    counts["post_bridge_deposit"] += len(deposits)
     return {
         "version": 2,
         "mode": "read_only_quote",
@@ -95,6 +98,12 @@ def _quote_row(
     if address is None:
         return "missing_deposit_address", {**result, "status": "missing_deposit_address"}
     direct = _direct_target(chain_id, asset_id, targets)
+    if direct and (chain_id, asset_id) == _BASE_USDC:
+        return "stage_existing", {
+            **result,
+            "status": "stage_existing",
+            "target": _target_data(direct),
+        }
     if direct and raw_balance >= direct.minimum_raw:
         return "direct_deposit", {
             **result,
@@ -113,7 +122,7 @@ def _quote_row(
         to_token_address=_token_address(target.asset_id),
         from_amount=str(raw_balance),
         from_address=wallet,
-        to_address=address,
+        to_address=wallet,
     )
     try:
         routes = client.routes(request)
@@ -141,11 +150,11 @@ def _quote_row(
                 "status": "quote_failed",
                 "target": _target_data(target),
             }
-    viable = [route for route in routes if route.to_amount_min >= target.minimum_raw]
+    viable = [route for route in routes if route.to_amount_min > 0]
     if not viable:
-        return "below_deposit_minimum", {
+        return "no_staging_route", {
             **result,
-            "status": "below_deposit_minimum",
+            "status": "no_staging_route",
             "target": _target_data(target),
         }
     route = max(viable, key=lambda item: item.to_amount_min)
@@ -154,6 +163,7 @@ def _quote_row(
         "status": "route_ready",
         "target": _target_data(target),
         "deposit_address": address,
+        "settlement": "wallet",
         "route": {
             "id": route.route_id,
             "from_amount": str(route.from_amount),
@@ -217,6 +227,39 @@ def _target_data(target: BitgetDepositTarget) -> dict:
         "asset_id": target.asset_id,
         "minimum_raw": str(target.minimum_raw),
     }
+
+
+def _staged_deposits(
+    entries: list[dict],
+    *,
+    targets: tuple[BitgetDepositTarget, ...],
+    deposit_addresses: dict[str, str],
+) -> list[dict]:
+    target = _route_target(targets)
+    if target is None:
+        return []
+    totals: Counter[str] = Counter()
+    for entry in entries:
+        if entry["status"] == "stage_existing":
+            totals[entry["wallet"]] += int(entry["raw_balance"])
+        elif entry["status"] == "route_ready":
+            totals[entry["wallet"]] += int(entry["route"]["to_amount_min"])
+    return [
+        {
+            "wallet": wallet,
+            "chain_id": target.chain_id,
+            "asset_id": target.asset_id,
+            "symbol": target.coin,
+            "raw_balance": str(amount),
+            "decimals": 6,
+            "status": "post_bridge_deposit",
+            "target": _target_data(target),
+            "deposit_address": deposit_addresses[wallet],
+            "requires_gas_preflight": True,
+        }
+        for wallet, amount in sorted(totals.items())
+        if amount >= target.minimum_raw and wallet in deposit_addresses
+    ]
 
 
 def _source_gas_cost(routes: tuple, source_chain_id: int) -> int:

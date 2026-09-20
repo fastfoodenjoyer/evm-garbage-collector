@@ -7,7 +7,7 @@ from evm_inventory.live_plan import create_live_plan
 
 class Quotes:
     def routes(self, request):
-        assert request.to_address == "0x" + "2" * 40
+        assert request.to_address == "0x" + "1" * 40
         return (
             LifiRoute(
                 "r1",
@@ -53,5 +53,34 @@ def test_live_plan_keeps_only_route_meeting_bitget_minimum(tmp_path):
         targets=targets,
     )
 
-    assert plan["summary"] == {"route_ready": 1}
+    assert plan["summary"] == {"post_bridge_deposit": 1, "route_ready": 1}
     assert plan["entries"][0]["route"]["id"] == "r1"
+    assert plan["entries"][1]["status"] == "post_bridge_deposit"
+
+
+def test_live_plan_stages_existing_base_usdc_for_one_final_deposit(tmp_path):
+    balances = tmp_path / "balances.csv"
+    balances.write_text(
+        "wallet,chain_id,asset_id,raw_balance,decimals,symbol,status\n"
+        + "0x" + "1" * 40
+        + ",8453,0x833589fcd6edb6e08f4c7c32d4f71b54bda02913,10000,6,USDC,success\n"
+    )
+    allowlist = tmp_path / "allowlist.json"
+    allowlist.write_text(
+        '{"assets":[{"chain_id":8453,"asset_id":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913","action":"swap"}]}'
+    )
+    targets = (
+        BitgetDepositTarget("USDC", 8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", 9_997),
+    )
+
+    plan = create_live_plan(
+        balances,
+        deposit_addresses={"0x" + "1" * 40: "0x" + "2" * 40},
+        allowlist_path=allowlist,
+        client=Quotes(),
+        targets=targets,
+    )
+
+    assert [entry["status"] for entry in plan["entries"]] == [
+        "stage_existing", "post_bridge_deposit"
+    ]

@@ -52,7 +52,7 @@ def execute_entries(
     summary = {"submitted": 0, "skipped": 0, "failed": 0}
     by_wallet: dict[str, list[dict]] = {}
     for entry in entries:
-        if entry.get("status") in {"route_ready", "direct_deposit"}:
+        if entry.get("status") in {"route_ready", "direct_deposit", "post_bridge_deposit"}:
             by_wallet.setdefault(str(entry["wallet"]).lower(), []).append(entry)
     try:
         with Journal(journal_path) as journal:
@@ -75,12 +75,17 @@ def execute_entries(
                             rpc_urls=rpc_urls,
                         )
                         journal.record_transaction(operation_id, tx_hash)
-                        status = bitget.wait_for_deposit(
-                            tx_hash=tx_hash,
-                            started_ms=started_ms,
-                            coin=str(entry["target"]["coin"]),
-                        )
-                        journal.record_deposit_status(operation_id, (status or "timeout").lower())
+                        if entry.get("settlement") == "wallet":
+                            journal.record_deposit_status(operation_id, "staged")
+                        else:
+                            status = bitget.wait_for_deposit(
+                                tx_hash=tx_hash,
+                                started_ms=started_ms,
+                                coin=str(entry["target"]["coin"]),
+                            )
+                            journal.record_deposit_status(
+                                operation_id, (status or "timeout").lower()
+                            )
                         summary["submitted"] += 1
                     except Exception:
                         journal.record_deposit_status(operation_id, "execution_failed")
@@ -146,6 +151,16 @@ def _direct_request(
             chain_id, wallet.bitget_deposit_address, "0x", amount, gas_limit, gas_price
         )
     amount = int(entry["raw_balance"])
+    if entry["status"] == "post_bridge_deposit":
+        amount = _wait_for_staged_balance(
+            rpc,
+            url=url,
+            token=asset_id,
+            wallet=wallet.public_address,
+            expected_minimum=amount,
+        )
+        if amount < int(target["minimum_raw"]):
+            raise ValueError("staged USDC is below Bitget minimum")
     recipient = wallet.bitget_deposit_address[2:].lower().rjust(64, "0")
     data = "0xa9059cbb" + recipient + hex(amount)[2:].rjust(64, "0")
     gas_limit = _quantity(
@@ -202,6 +217,33 @@ def _approve_if_needed(
 
 def _native_balance(rpc: ExecutionRpc, *, url: str, wallet: str) -> int:
     return _quantity(rpc.call(url, "eth_getBalance", [wallet, "latest"]))
+
+
+def _token_balance(rpc: ExecutionRpc, *, url: str, token: str, wallet: str) -> int:
+    data = "0x70a08231" + wallet[2:].lower().rjust(64, "0")
+    result = rpc.call(url, "eth_call", [{"to": token, "data": data}, "latest"])
+    from .rpc import uint256
+
+    return uint256(result)
+
+
+def _wait_for_staged_balance(
+    rpc: ExecutionRpc,
+    *,
+    url: str,
+    token: str,
+    wallet: str,
+    expected_minimum: int,
+    timeout_seconds: int = 21_600,
+    poll_seconds: int = 60,
+) -> int:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        amount = _token_balance(rpc, url=url, token=token, wallet=wallet)
+        if amount >= expected_minimum:
+            return amount
+        time.sleep(poll_seconds)
+    raise TimeoutError("staged USDC did not arrive before timeout")
 
 
 def _quantity(value: object) -> int:
