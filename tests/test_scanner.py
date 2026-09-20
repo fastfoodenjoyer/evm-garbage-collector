@@ -70,6 +70,15 @@ def test_network_failure_creates_all_checks(tmp_path):
     store.close()
 
 
+def test_rpc_urls_accepts_the_documented_alchemy_api_key(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_API_KEY", "test-key")
+    network = {"rpc_urls": ["https://public.example"], "alchemy_network": "opt-mainnet"}
+
+    urls = _rpc_urls(network)
+
+    assert urls[0] == "https://opt-mainnet.g.alchemy.com/v2/test-key"
+
+
 class Discover:
     enabled = True
     transport = object()

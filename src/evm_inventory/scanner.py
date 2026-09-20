@@ -50,7 +50,7 @@ def _rpc_urls(network):
     """Prefer an in-memory Alchemy RPC URL when the configured key supports the chain."""
 
     urls = list(network["rpc_urls"])
-    key = os.environ.get("ALCHEMY_RPC_API_KEY")
+    key = os.environ.get("ALCHEMY_RPC_API_KEY") or os.environ.get("ALCHEMY_API_KEY")
     alchemy_network = network.get("alchemy_network")
     if key and alchemy_network:
         urls.insert(
