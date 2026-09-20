@@ -56,7 +56,9 @@ def _required_string(value: object, *, row_number: int, field_name: str) -> str:
     return value.strip()
 
 
-def load_wallet_workbook(path: Path) -> tuple[WalletWorkbookRow, ...]:
+def load_wallet_workbook(
+    path: Path, *, require_deposit_address: bool = True
+) -> tuple[WalletWorkbookRow, ...]:
     """Read and validate operator input without persisting private keys."""
 
     try:
@@ -89,16 +91,20 @@ def load_wallet_workbook(path: Path) -> tuple[WalletWorkbookRow, ...]:
             private_key = _required_string(
                 values[2], row_number=row_number, field_name="private key"
             )
-            deposit_address = _required_string(
-                values[3], row_number=row_number, field_name="Bitget deposit address"
-            ).lower()
+            deposit_address = (
+                _required_string(
+                    values[3], row_number=row_number, field_name="Bitget deposit address"
+                ).lower()
+                if require_deposit_address or values[3]
+                else ""
+            )
             if not _ADDRESS_RE.fullmatch(public_address):
                 raise ConfigError(f"row {row_number}: invalid public EVM address")
             if not _PRIVATE_KEY_RE.fullmatch(private_key):
                 raise ConfigError(
                     f"row {row_number}: private key must be 0x plus 64 hex characters"
                 )
-            if not _ADDRESS_RE.fullmatch(deposit_address):
+            if deposit_address and not _ADDRESS_RE.fullmatch(deposit_address):
                 raise ConfigError(f"row {row_number}: invalid Bitget EVM deposit address")
             if public_address in seen_wallets:
                 raise ConfigError(f"row {row_number}: duplicate public address")

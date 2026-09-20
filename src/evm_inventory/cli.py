@@ -139,7 +139,9 @@ def main(argv=None):
             print(json.dumps({"status": "planned", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "quote-routes":
-            wallet_rows = load_wallet_workbook(Path(args.workbook))
+            wallet_rows = load_wallet_workbook(
+                Path(args.workbook), require_deposit_address=False
+            )
             addresses = {
                 item.public_address: item.bitget_deposit_address for item in wallet_rows
             }
