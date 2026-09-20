@@ -14,7 +14,7 @@ from .models import ConfigError
 
 WORKSHEET_NAME = "Wallets"
 WORKSHEET_HEADERS = (
-    "#",
+    "# (номер)",
     "Публичный адрес",
     "Приватный ключ",
     "Адрес депозита Bitget",
