@@ -20,5 +20,22 @@ def test_create_route_plan_marks_direct_deposit_and_dust(tmp_path):
 
     plan = create_route_plan(balances, quote_floor_raw=100)
 
-    assert plan["summary"] == {"direct_deposit": 1, "dust": 1, "quote_required": 0}
+    assert plan["summary"] == {
+        "direct_deposit": 1, "dust": 1, "quote_required": 0,
+        "manual_review": 0, "denied": 0,
+    }
     assert plan["execution"]["delay_min_seconds"] == 1800
+
+
+def test_create_route_plan_denies_asset_absent_from_allowlist(tmp_path):
+    balances = tmp_path / "balances.csv"
+    balances.write_text(
+        "wallet,chain_id,asset_id,raw_balance,symbol\n"
+        + "0x" + "1" * 40 + ",8453,0xdead,10000,NOPE\n"
+    )
+    allowlist = tmp_path / "allowlist.json"
+    allowlist.write_text('{"default_action":"deny","assets":[]}')
+
+    plan = create_route_plan(balances, allowlist_path=allowlist)
+
+    assert plan["summary"]["denied"] == 1
