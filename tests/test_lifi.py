@@ -45,7 +45,7 @@ def test_lifi_routes_use_read_only_quote_endpoint_and_parse_costs():
 
     routes = client.routes(request)
 
-    assert http.calls[0][0] == "https://li.quest/v1/advanced/routes"
+    assert http.calls[0][0] == "https://api.jumper.xyz/pipeline/v1/advanced/routes"
     assert http.calls[0][1]["fromAddress"] == request.from_address
     assert http.calls[0][1]["options"]["order"] == "CHEAPEST"
     assert routes[0].to_amount_min == 990000

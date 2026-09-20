@@ -51,7 +51,7 @@ class LifiRoute:
 class LifiClient:
     """Request cheapest LI.FI routes through the current public API."""
 
-    endpoint = "https://li.quest/v1/advanced/routes"
+    endpoint = "https://api.jumper.xyz/pipeline/v1/advanced/routes"
 
     def __init__(self, http_client: _HttpClient):
         self.http_client = http_client
