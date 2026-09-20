@@ -6,6 +6,22 @@ from evm_inventory.cli import main
 from evm_inventory.models import ConfigError
 
 
+def test_workbook_commands_create_template_and_write_dry_run(tmp_path, capsys):
+    workbook = tmp_path / "wallets.xlsx"
+
+    assert main(["workbook-template", "--output", str(workbook)]) == 0
+    template_summary = json.loads(capsys.readouterr().out)
+    assert template_summary == {"status": "created", "workbook": str(workbook)}
+
+    from openpyxl import load_workbook
+
+    document = load_workbook(workbook)
+    document["Wallets"].append([1, "0x" + "1" * 40, "0x" + "a" * 64, "0x" + "2" * 40])
+    document.save(workbook)
+    assert main(["workbook-dry-run", "--workbook", str(workbook)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"wallets": 1, "actions_written": 1}
+
+
 def test_dry_run_no_db(tmp_path, capsys):
     wallets = tmp_path / "wallets.txt"
     wallets.write_text("0x" + "1" * 40 + "\n")

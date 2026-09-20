@@ -16,6 +16,7 @@ from .models import ConfigError
 from .report import export_run
 from .scanner import scan
 from .store import Store
+from .workbook import create_wallet_template, dry_run_workbook
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -99,8 +100,20 @@ def main(argv=None):
         export_parser.add_argument("--run", required=True)
         export_parser.add_argument("--db", required=True)
         export_parser.add_argument("--output", required=True)
+        template_parser = sub.add_parser("workbook-template")
+        template_parser.add_argument("--output", required=True)
+        workbook_dry_run_parser = sub.add_parser("workbook-dry-run")
+        workbook_dry_run_parser.add_argument("--workbook", required=True)
         args = parser.parse_args(argv)
 
+        if args.cmd == "workbook-template":
+            output = Path(args.output)
+            create_wallet_template(output)
+            print(json.dumps({"status": "created", "workbook": str(output)}))
+            return 0
+        if args.cmd == "workbook-dry-run":
+            print(json.dumps(dry_run_workbook(Path(args.workbook))))
+            return 0
         if args.cmd == "export":
             with Store(args.db, readonly=True) as store:
                 export_run(store, args.run, Path(args.output))
