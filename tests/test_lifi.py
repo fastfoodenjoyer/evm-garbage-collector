@@ -14,7 +14,10 @@ class Response:
                     "toAmount": "998000",
                     "toAmountMin": "990000",
                     "gasCosts": [{"amount": "21000", "amountUSD": "0.03"}],
-                    "steps": [{"tool": "across"}, {"tool": "sushiswap"}],
+                    "steps": [
+                        {"tool": "across", "id": "step-1"},
+                        {"tool": "sushiswap"},
+                    ],
                 }
             ],
             "unavailableRoutes": [],
@@ -51,3 +54,29 @@ def test_lifi_routes_use_read_only_quote_endpoint_and_parse_costs():
     assert routes[0].to_amount_min == 990000
     assert routes[0].gas_costs[0].amount == 21000
     assert routes[0].tools == ("across", "sushiswap")
+
+
+def test_lifi_step_transaction_parses_unsigned_transaction():
+    class StepResponse(Response):
+        def json(self):
+            return {
+                "transactionRequest": {
+                    "chainId": 10,
+                    "to": "0x" + "2" * 40,
+                    "data": "0x1234",
+                    "value": "0x0",
+                    "gasLimit": "0x5208",
+                    "gasPrice": "0x3b9aca00",
+                }
+            }
+
+    class StepHttp(HttpClient):
+        def post(self, url, *, json, headers, timeout):
+            self.calls.append((url, json, headers, timeout))
+            return StepResponse()
+
+    transaction = LifiClient(StepHttp()).step_transaction({"tool": "across"})
+
+    assert transaction.chain_id == 10
+    assert transaction.gas_limit == 21000
+    assert transaction.to == "0x" + "2" * 40

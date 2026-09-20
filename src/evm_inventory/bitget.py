@@ -44,6 +44,31 @@ class BitgetClient:
 
     def deposit_status(self, *, tx_hash: str, start_ms: int, end_ms: int, coin: str) -> str | None:
         for record in self.deposit_records(start_ms=start_ms, end_ms=end_ms, coin=coin):
-            if str(record.get("tradeId", "")).lower() == tx_hash.lower():
-                return str(record.get("status"))
+            hashes = (record.get("tradeId"), record.get("txId"), record.get("txHash"))
+            if any(str(value or "").lower() == tx_hash.lower() for value in hashes):
+                return str(record.get("status", "")) or None
+        return None
+
+    def wait_for_deposit(
+        self,
+        *,
+        tx_hash: str,
+        started_ms: int,
+        coin: str,
+        timeout_seconds: int = 21_600,
+        poll_seconds: int = 60,
+    ) -> str | None:
+        """Poll Bitget after a submitted deposit; returns the exchange status or None."""
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            status = self.deposit_status(
+                tx_hash=tx_hash,
+                start_ms=started_ms,
+                end_ms=int(time.time() * 1000),
+                coin=coin,
+            )
+            if status is not None:
+                return status
+            time.sleep(poll_seconds)
         return None

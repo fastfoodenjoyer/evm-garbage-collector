@@ -1,6 +1,9 @@
-# EVM Inventory
+# EVM Inventory and Bitget Consolidation
 
-Read-only inventory of native coins and a curated stablecoin list across OP Superchain mainnets, Ethereum, Arbitrum One, Base and Blast. It does not use private keys or submit transactions.
+Inventory of native coins and a curated stablecoin list across OP Superchain mainnets,
+Ethereum, Arbitrum One, Base and Blast, followed by an explicit-only route executor.
+Scanning and route quotation are read-only. The executor is the only command that can
+sign or broadcast, and it requires `--execute`.
 
 ```bash
 uv sync
@@ -12,7 +15,41 @@ The CLI automatically loads an optional `.env` file from the current directory. 
 
 The wallet file contains one public `0x` address per line. `--dry-run` validates the file and reports the planned check count without network requests. Results are resumable with `resume --run RUN_ID`. Optional additional token discovery is enabled only when `ALCHEMY_API_KEY` is present and `--no-discovery` is not supplied; the mandatory native/stablecoin RPC pass does not require it.
 
-To prepare the later transaction workflow, create an XLSX source file with `uv run evm-inventory workbook-template --output local/wallets.xlsx`. Its `Wallets` sheet has columns for a row number, public address, private key, Bitget deposit address, and proposed actions. `uv run evm-inventory workbook-dry-run --workbook local/wallets.xlsx` validates every input row and fills the final column without signing or submitting transactions. Private keys remain in memory only and are never printed or stored in the inventory database.
+Create the operation workbook with `uv run evm-inventory workbook-template --output local/wallets.xlsx`. Its `Wallets` sheet has columns for a row number, public address, private key, Bitget deposit address, and proposed actions. The deposit address must be the correct Bitget EVM address for the asset and network selected for that row. `workbook-dry-run` validates the sheet without signing or submitting transactions. Private keys remain in memory only and are never printed or stored in the inventory database.
+
+After an inventory export, make a live but read-only plan:
+
+```bash
+uv run evm-inventory quote-routes \
+  --balances local/fresh-report/balances.csv \
+  --workbook local/wallets.xlsx \
+  --output local/route-plan.json
+```
+
+`quote-routes` downloads Bitget's public coin catalog at planning time. It accepts only
+enabled EVM deposit networks, checks the exact minimum deposit in native token units,
+uses the strict `config/swap-allowlist.json`, and requests cheapest routes through
+`https://api.jumper.xyz/pipeline/v1/advanced/routes`. Route steps are accepted only
+when Jumper's `toAmountMin` meets Bitget's current minimum. Amounts below 0.01 tokens
+are classified as dust before a route request. Native-asset routes are requoted after
+reserving five times their quoted source-chain gas cost.
+
+To broadcast the saved plan, use the separate command below. It processes wallets in
+order, waits a random 30–180 minutes between wallets, signs only with the matching
+workbook key, verifies the 5× native-gas reserve, uses exact ERC-20 approvals when a
+Jumper step requires one, waits for the source-chain receipt, and records each action
+in the SQLite journal. It then polls the signed Bitget deposit API for the resulting
+transaction hash. This requires `BITGET_API_KEY`, `BITGET_SECRET_KEY`, and
+`BITGET_PASSPHRASE` in `.env`.
+
+```bash
+uv run evm-inventory execute-routes \
+  --plan local/route-plan.json \
+  --workbook local/wallets.xlsx \
+  --catalog local/rpc-allowlist-final-catalog.json \
+  --journal local/execution-journal.sqlite \
+  --execute
+```
 
 Public RPC endpoints can rate-limit or be unavailable. The reports distinguish zero balances, errors and unverified coverage. The packaged catalog is a dated snapshot and does not claim exhaustive ERC-20 discovery. Reading balances has no gas cost; the future collection phase will be a separate transaction-signing feature.
 

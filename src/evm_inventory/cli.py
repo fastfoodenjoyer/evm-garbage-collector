@@ -12,12 +12,14 @@ import sys
 from pathlib import Path
 
 from .config import load_catalog, load_wallets, snapshot, validate_delays
+from .live_plan import create_live_plan
 from .models import ConfigError
 from .report import export_run
+from .route_execution import execute_entries
 from .runbook import create_route_plan
 from .scanner import scan
 from .store import Store
-from .workbook import create_wallet_template, dry_run_workbook
+from .workbook import create_wallet_template, dry_run_workbook, load_wallet_workbook
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -109,6 +111,18 @@ def main(argv=None):
         route_plan_parser.add_argument("--balances", required=True)
         route_plan_parser.add_argument("--output", required=True)
         route_plan_parser.add_argument("--quote-floor-raw", type=int, default=100)
+        quote_routes_parser = sub.add_parser("quote-routes")
+        quote_routes_parser.add_argument("--balances", required=True)
+        quote_routes_parser.add_argument("--workbook", required=True)
+        quote_routes_parser.add_argument("--output", required=True)
+        quote_routes_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
+        quote_routes_parser.add_argument("--quote-floor", default="0.01")
+        execute_parser = sub.add_parser("execute-routes")
+        execute_parser.add_argument("--plan", required=True)
+        execute_parser.add_argument("--workbook", required=True)
+        execute_parser.add_argument("--catalog", required=True)
+        execute_parser.add_argument("--journal", required=True)
+        execute_parser.add_argument("--execute", action="store_true")
         args = parser.parse_args(argv)
 
         if args.cmd == "workbook-template":
@@ -123,6 +137,40 @@ def main(argv=None):
             plan = create_route_plan(Path(args.balances), quote_floor_raw=args.quote_floor_raw)
             Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
             print(json.dumps({"status": "planned", "output": str(args.output), **plan["summary"]}))
+            return 0
+        if args.cmd == "quote-routes":
+            wallet_rows = load_wallet_workbook(Path(args.workbook))
+            addresses = {
+                item.public_address: item.bitget_deposit_address for item in wallet_rows
+            }
+            plan = create_live_plan(
+                Path(args.balances),
+                deposit_addresses=addresses,
+                allowlist_path=Path(args.allowlist),
+                quote_floor=args.quote_floor,
+            )
+            Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps({"status": "quoted", "output": str(args.output), **plan["summary"]}))
+            return 0
+        if args.cmd == "execute-routes":
+            plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+            if not isinstance(plan, dict) or not isinstance(plan.get("entries"), list):
+                raise ConfigError("invalid route plan")
+            catalog = load_catalog(Path(args.catalog))
+            rpc_urls = {network.chain_id: network.rpc_urls[0] for network in catalog.networks}
+            wallet_rows = load_wallet_workbook(Path(args.workbook))
+            wallet_map = {item.public_address: item for item in wallet_rows}
+            execution = plan.get("execution", {})
+            summary = execute_entries(
+                plan["entries"],
+                wallets=wallet_map,
+                rpc_urls=rpc_urls,
+                journal_path=Path(args.journal),
+                execute=args.execute,
+                delay_min_seconds=int(execution.get("delay_min_seconds", 1800)),
+                delay_max_seconds=int(execution.get("delay_max_seconds", 10800)),
+            )
+            print(json.dumps({"status": "finished", **summary}))
             return 0
         if args.cmd == "export":
             with Store(args.db, readonly=True) as store:
