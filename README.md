@@ -29,9 +29,10 @@ uv run evm-inventory quote-routes \
 `quote-routes` downloads Bitget's public coin catalog at planning time. It accepts only
 enabled EVM deposit networks, checks the exact minimum deposit in native token units,
 uses the strict `config/swap-allowlist.json`, and requests cheapest routes through
-`https://api.jumper.xyz/pipeline/v1/advanced/routes`. Route steps are accepted only
-when Jumper's `toAmountMin` meets Bitget's current minimum. Amounts below 0.01 tokens
-are classified as dust before a route request. Native-asset routes are requoted after
+`https://api.jumper.xyz/pipeline/v1/advanced/routes`. Subminimum positions are routed
+to wallet-owned USDC on Base, then included in a single final transfer only when their
+combined `toAmountMin` meets Bitget's current minimum. Amounts below 0.01 tokens are
+classified as dust before a route request. Native-asset routes are requoted after
 reserving five times their quoted source-chain gas cost.
 
 To broadcast the saved plan, use the separate command below. It processes wallets in
