@@ -14,6 +14,7 @@ from pathlib import Path
 from .config import load_catalog, load_wallets, snapshot, validate_delays
 from .models import ConfigError
 from .report import export_run
+from .runbook import create_route_plan
 from .scanner import scan
 from .store import Store
 from .workbook import create_wallet_template, dry_run_workbook
@@ -104,6 +105,10 @@ def main(argv=None):
         template_parser.add_argument("--output", required=True)
         workbook_dry_run_parser = sub.add_parser("workbook-dry-run")
         workbook_dry_run_parser.add_argument("--workbook", required=True)
+        route_plan_parser = sub.add_parser("route-plan")
+        route_plan_parser.add_argument("--balances", required=True)
+        route_plan_parser.add_argument("--output", required=True)
+        route_plan_parser.add_argument("--quote-floor-raw", type=int, default=100)
         args = parser.parse_args(argv)
 
         if args.cmd == "workbook-template":
@@ -113,6 +118,11 @@ def main(argv=None):
             return 0
         if args.cmd == "workbook-dry-run":
             print(json.dumps(dry_run_workbook(Path(args.workbook))))
+            return 0
+        if args.cmd == "route-plan":
+            plan = create_route_plan(Path(args.balances), quote_floor_raw=args.quote_floor_raw)
+            Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps({"status": "planned", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "export":
             with Store(args.db, readonly=True) as store:

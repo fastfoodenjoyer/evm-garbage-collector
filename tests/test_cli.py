@@ -22,6 +22,20 @@ def test_workbook_commands_create_template_and_write_dry_run(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out) == {"wallets": 1, "actions_written": 1}
 
 
+def test_route_plan_writes_transaction_free_runbook(tmp_path, capsys):
+    balances = tmp_path / "balances.csv"
+    balances.write_text(
+        "wallet,chain_id,asset_id,raw_balance,symbol\n"
+        + "0x" + "1" * 40 + ",8453,native,1,ETH\n"
+    )
+    output = tmp_path / "runbook.json"
+
+    assert main(["route-plan", "--balances", str(balances), "--output", str(output)]) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "planned"
+    assert json.loads(output.read_text())["summary"]["dust"] == 1
+
+
 def test_dry_run_no_db(tmp_path, capsys):
     wallets = tmp_path / "wallets.txt"
     wallets.write_text("0x" + "1" * 40 + "\n")
