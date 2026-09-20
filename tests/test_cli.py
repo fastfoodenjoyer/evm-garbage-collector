@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from evm_inventory.cli import main
+from evm_inventory.cli import _execution_rpc_urls, main
 from evm_inventory.models import ConfigError
 
 
@@ -177,3 +177,17 @@ def test_keyboard_interrupt_returns_130(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("evm_inventory.cli.scan", interrupted)
     assert main(["scan", "--wallets", str(wallets), "--db", str(tmp_path / "db")]) == 130
     assert "interrupted" in capsys.readouterr().err
+
+
+def test_execution_rpc_urls_prefers_alchemy(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_API_KEY", "key")
+
+    class Network:
+        chain_id = 10
+        alchemy_network = "opt-mainnet"
+        rpc_urls = ("https://public.example",)
+
+    class Catalog:
+        networks = (Network(),)
+
+    assert _execution_rpc_urls(Catalog()) == {10: "https://opt-mainnet.g.alchemy.com/v2/key"}

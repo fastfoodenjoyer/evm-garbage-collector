@@ -157,7 +157,7 @@ def main(argv=None):
             if not isinstance(plan, dict) or not isinstance(plan.get("entries"), list):
                 raise ConfigError("invalid route plan")
             catalog = load_catalog(Path(args.catalog))
-            rpc_urls = {network.chain_id: network.rpc_urls[0] for network in catalog.networks}
+            rpc_urls = _execution_rpc_urls(catalog)
             wallet_rows = load_wallet_workbook(Path(args.workbook))
             wallet_map = {item.public_address: item for item in wallet_rows}
             execution = plan.get("execution", {})
@@ -252,3 +252,16 @@ def load_catalog_from_snapshot(snapshot_value):
         checked_at=data["checked_at"],
         source=data["source"],
     )
+
+
+def _execution_rpc_urls(catalog) -> dict[int, str]:
+    """Prefer Alchemy for execution preflight and broadcast when it maps the chain."""
+
+    key = os.environ.get("ALCHEMY_RPC_API_KEY") or os.environ.get("ALCHEMY_API_KEY")
+    urls: dict[int, str] = {}
+    for network in catalog.networks:
+        if key and network.alchemy_network:
+            urls[network.chain_id] = f"https://{network.alchemy_network}.g.alchemy.com/v2/{key}"
+        else:
+            urls[network.chain_id] = network.rpc_urls[0]
+    return urls
