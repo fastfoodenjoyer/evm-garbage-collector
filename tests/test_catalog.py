@@ -48,7 +48,7 @@ def test_packaged_catalog_has_verified_bnb_and_polygon_stablecoin_metadata():
         },
         137: {
             "name": "Polygon PoS",
-            "rpc_urls": ("https://polygon-rpc.com",),
+            "rpc_urls": ("https://polygon-bor-rpc.publicnode.com",),
             "native_symbol": "POL",
             "tokens": (
                 (
@@ -70,7 +70,7 @@ def test_packaged_catalog_has_verified_bnb_and_polygon_stablecoin_metadata():
                     "USDT0",
                     6,
                     "Tether USD (USDT0)",
-                    "https://tether.to/en/tether-token-usdt-launches-on-polygon/",
+                    "https://usdt0.to/ecosystem/polygon",
                 ),
                 (
                     "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",

@@ -247,7 +247,7 @@
       "chain_id": 137,
       "name": "Polygon PoS",
       "rpc_urls": [
-        "https://polygon-rpc.com"
+        "https://polygon-bor-rpc.publicnode.com"
       ],
       "native_symbol": "POL",
       "native_decimals": 18,
@@ -272,7 +272,7 @@
           "address": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
           "symbol": "USDT0",
           "decimals": 6,
-          "source": "https://tether.to/en/tether-token-usdt-launches-on-polygon/",
+          "source": "https://usdt0.to/ecosystem/polygon",
           "checked_at": "2026-09-21",
           "variant": "Tether USD (USDT0)"
         },
@@ -286,7 +286,7 @@
         }
       ],
       "token_review_status": "verified",
-      "notes": "Curated sourced contracts only; native and bridged USDC are distinct.",
+      "notes": "PublicNode RPC returned eth_chainId 0x89 (137) on 2026-09-21; native and bridged USDC are distinct.",
       "alchemy_network": null
     },
     {
