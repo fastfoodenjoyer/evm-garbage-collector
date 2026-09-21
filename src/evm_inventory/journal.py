@@ -40,7 +40,12 @@ class Journal:
         return int(cursor.lastrowid)
 
     def record_transaction(self, operation_id: int, tx_hash: str) -> None:
-        self._update(operation_id, "submitted", tx_hash=tx_hash)
+        self._update(
+            operation_id,
+            "submitted",
+            tx_hash=tx_hash,
+            unless_states=("deferred", "approval_completed_route_deferred"),
+        )
 
     def record_deposit_status(self, operation_id: int, status: str) -> None:
         state = "completed" if status == "success" else "deposit_pending"
