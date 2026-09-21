@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from eth_account import Account
 
@@ -337,6 +339,61 @@ def test_main_guard_deferral_preserves_confirmed_approval_hash(monkeypatch):
     assert broadcast == ["approval"]
 
 
+def test_expired_quote_after_approval_defers_route_without_route_signature(monkeypatch, tmp_path):
+    wallet = _wallet()
+    request = TransactionRequest(1, "0x" + "4" * 40, "0x", 0, 21_000, 1)
+    clock = [1_000_000]
+    signed = []
+    broadcast = []
+    monkeypatch.setattr("evm_inventory.route_execution.token_allowance", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
+    )
+    monkeypatch.setattr("evm_inventory.route_execution.pending_nonce", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.require_ethereum_gas_below_limit",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda transaction, **kwargs: signed.append(transaction) or "0x01",
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.broadcast_signed_transaction",
+        lambda *args, **kwargs: broadcast.append("tx") or "0x" + "a" * 64,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.wait_for_receipt",
+        lambda *args, **kwargs: clock.__setitem__(0, clock[0] + 1),
+    )
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
+    jumper = type("Jumper", (), {"step_transaction": lambda self, step: request})()
+    monkeypatch.setattr("evm_inventory.route_execution.LifiClient", lambda *args, **kwargs: jumper)
+    entry = {**_route_entry(wallet.public_address), "quoted_at": 100_000, "settlement": "wallet"}
+
+    summary = execute_entries(
+        [entry],
+        wallets={wallet.public_address: wallet},
+        rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite",
+        execute=True,
+        delay_min_seconds=0,
+        delay_max_seconds=0,
+        now_ms=lambda: clock[0],
+    )
+
+    assert summary == {"submitted": 0, "skipped": 0, "failed": 0, "deferred": 1}
+    assert len(signed) == 1
+    assert broadcast == ["tx"]
+    from evm_inventory.journal import Journal
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        operation = journal.operation(1)
+    assert operation["state"] == "approval_completed_route_deferred"
+    assert operation["approval_tx_hash"] == "0x" + "a" * 64
+    assert operation["reason"] == "route quote is outside the 15-minute execution window"
+
+
 def test_batch_records_partial_approval_and_continues_after_deferred_route(monkeypatch, tmp_path):
     wallet = _wallet()
     deferred = EthereumGasDeferred(
@@ -504,6 +561,150 @@ def test_final_deposit_missing_exchange_chain_is_rejected_before_execution(monke
     assert executed == []
 
 
+@pytest.mark.parametrize(
+    "quoted_at",
+    [None, True, "1000000", 1_000_001, 99_999],
+    ids=["missing", "boolean", "non_integer", "future", "older_than_15_minutes"],
+)
+def test_route_quote_is_rejected_before_execution_or_private_key_use(
+    monkeypatch, tmp_path, quoted_at
+):
+    wallet = _wallet()
+    executed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda *args, **kwargs: executed.append(True),
+    )
+    entry = _route_entry(wallet.public_address)
+    if quoted_at is None:
+        entry.pop("quoted_at", None)
+    else:
+        entry["quoted_at"] = quoted_at
+
+    with pytest.raises(ValueError, match="route quote"):
+        execute_entries(
+            [entry],
+            wallets={wallet.public_address.lower(): wallet},
+            rpc_urls={1: "https://rpc"},
+            journal_path=tmp_path / "journal.sqlite",
+            execute=True,
+            delay_min_seconds=0,
+            delay_max_seconds=0,
+            now_ms=lambda: 1_000_000,
+        )
+
+    assert executed == []
+
+
+def test_route_quote_at_exactly_15_minutes_is_accepted(monkeypatch, tmp_path):
+    wallet = _wallet()
+    executed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda *args, **kwargs: executed.append(True) or "0x" + "b" * 64,
+    )
+    entry = {**_route_entry(wallet.public_address), "quoted_at": 100_000}
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
+
+    summary = execute_entries(
+        [entry],
+        wallets={wallet.public_address.lower(): wallet},
+        rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite",
+        execute=True,
+        delay_min_seconds=0,
+        delay_max_seconds=0,
+        now_ms=lambda: 1_000_000,
+    )
+
+    assert summary["submitted"] == 1
+    assert executed == [True]
+
+
+def test_route_quote_expiring_during_inter_wallet_delay_is_not_executed(monkeypatch, tmp_path):
+    first = _wallet()
+    second = WalletWorkbookRow(
+        3,
+        2,
+        Account.from_key("0x" + "2" * 64).address.lower(),
+        "0x" + "2" * 64,
+        "0x" + "3" * 40,
+    )
+    executed = []
+    clock = [1_000_000]
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda *, entry, **kwargs: executed.append(entry["wallet"]) or "0x" + "b" * 64,
+    )
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
+    entries = [
+        {**_route_entry(first.public_address), "quoted_at": 100_000, "settlement": "wallet"},
+        {**_route_entry(second.public_address), "quoted_at": 100_000, "settlement": "wallet"},
+    ]
+
+    with pytest.raises(ValueError, match="route quote"):
+        execute_entries(
+            entries,
+            wallets={first.public_address: first, second.public_address: second},
+            rpc_urls={1: "https://rpc"},
+            journal_path=tmp_path / "journal.sqlite",
+            execute=True,
+            delay_min_seconds=1,
+            delay_max_seconds=1,
+            sleep=lambda _: clock.__setitem__(0, clock[0] + 1),
+            wallet_batches=((first.public_address,), (second.public_address,)),
+            now_ms=lambda: clock[0],
+        )
+
+    assert executed == [first.public_address]
+
+
+def test_direct_deposit_does_not_require_a_route_quote(monkeypatch, tmp_path):
+    wallet = _wallet()
+    executed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda *args, **kwargs: executed.append(True) or "0x" + "b" * 64,
+    )
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
+
+    execute_entries(
+        [_direct_entry(wallet.public_address)],
+        wallets={wallet.public_address.lower(): wallet},
+        rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite",
+        execute=True,
+        delay_min_seconds=0,
+        delay_max_seconds=0,
+        now_ms=lambda: 1_000_000,
+    )
+
+    assert executed == [True]
+
+
+def test_post_bridge_deposit_does_not_require_a_route_quote(monkeypatch, tmp_path):
+    wallet = _wallet()
+    executed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda *args, **kwargs: executed.append(True) or "0x" + "b" * 64,
+    )
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
+
+    execute_entries(
+        [{**_direct_entry(wallet.public_address), "status": "post_bridge_deposit"}],
+        wallets={wallet.public_address.lower(): wallet},
+        rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite",
+        execute=True,
+        delay_min_seconds=0,
+        delay_max_seconds=0,
+        now_ms=lambda: 1_000_000,
+    )
+
+    assert executed == [True]
+
+
 def _wallet():
     key = "0x" + "1" * 64
     return WalletWorkbookRow(2, 1, Account.from_key(key).address.lower(), key, "0x" + "2" * 40)
@@ -526,6 +727,7 @@ def _route_entry(wallet):
         "chain_id": 1,
         "asset_id": "0x" + "3" * 40,
         "raw_balance": 1,
+        "quoted_at": time.time_ns() // 1_000_000,
         "target": {"coin": "ETH"},
         "route": {"step": {"estimate": {"approvalAddress": "0x" + "5" * 40}}},
     }

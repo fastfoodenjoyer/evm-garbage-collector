@@ -52,9 +52,12 @@ def test_live_plan_keeps_only_route_meeting_bitget_minimum(tmp_path):
         quote_floor="0.01",
         client=Quotes(),
         targets=targets,
+        now_ms=lambda: 1_700_000_000_000,
     )
 
     assert plan["summary"] == {"post_bridge_deposit": 1, "route_ready": 1}
+    assert plan["quoted_at"] == 1_700_000_000_000
+    assert plan["entries"][0]["quoted_at"] == 1_700_000_000_000
     assert plan["entries"][0]["route"]["id"] == "r1"
     assert plan["entries"][1]["status"] == "post_bridge_deposit"
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -29,6 +31,7 @@ def create_live_plan(
     client: QuoteClient | None = None,
     targets: tuple[BitgetDepositTarget, ...] | None = None,
     wallet_addresses: set[str] | None = None,
+    now_ms: Callable[[], int] | None = None,
 ) -> dict:
     """Quote only allowlisted balances and retain routes to a wallet-owned staging balance.
 
@@ -36,6 +39,7 @@ def create_live_plan(
     data nor sends a transaction.
     """
 
+    quoted_at = int((now_ms or _utc_now_ms)())
     policy = _policy(allowlist_path)
     targets = targets or deposit_targets(fetch_public_coins())
     client = client or LifiClient(httpx.Client(timeout=30))
@@ -57,6 +61,7 @@ def create_live_plan(
                 deposit_addresses=deposit_addresses,
                 quote_floor=quote_floor,
                 client=client,
+                quoted_at=quoted_at,
             )
             counts[status] += 1
             rows.append(item)
@@ -66,6 +71,7 @@ def create_live_plan(
     return {
         "version": 2,
         "mode": "read_only_quote",
+        "quoted_at": quoted_at,
         "execution": {
             "sequential": True,
             "delay_min_seconds": 1800,
@@ -85,6 +91,7 @@ def _quote_row(
     deposit_addresses: dict[str, str],
     quote_floor: str,
     client: QuoteClient,
+    quoted_at: int,
 ) -> tuple[str, dict]:
     wallet = row["wallet"].lower()
     chain_id = int(row["chain_id"])
@@ -143,6 +150,7 @@ def _quote_row(
     return "route_ready", {
         **result,
         "status": "route_ready",
+        "quoted_at": quoted_at,
         "target": _target_data(target),
         "deposit_address": address,
         "settlement": "wallet",
@@ -155,6 +163,10 @@ def _quote_row(
             "step": route.first_step,
         },
     }
+
+
+def _utc_now_ms() -> int:
+    return time.time_ns() // 1_000_000
 
 
 def _base_entry(row: dict[str, str]) -> dict:

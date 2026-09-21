@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import random
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -36,6 +37,12 @@ class ExecutedTransactionHash(str):
         return result
 
 
+class RouteQuoteExpired(ValueError):
+    def __init__(self, reason: str, approval_tx_hash: str | None):
+        super().__init__(reason)
+        self.approval_tx_hash = approval_tx_hash
+
+
 def execute_entries(
     entries: list[dict],
     *,
@@ -48,6 +55,7 @@ def execute_entries(
     sleep=time.sleep,
     rng: random.Random | None = None,
     wallet_batches: tuple[tuple[str, ...], ...] | None = None,
+    now_ms: Callable[[], int] | None = None,
 ) -> dict[str, int]:
     """Execute one wallet at a time; refuses unless the caller set ``execute=True``."""
 
@@ -55,6 +63,8 @@ def execute_entries(
         raise ValueError("refusing to broadcast without --execute")
     if delay_min_seconds < 0 or delay_max_seconds < delay_min_seconds:
         raise ValueError("invalid execution delay range")
+    now_ms = now_ms or _utc_now_ms
+    _validate_route_quote_freshness(entries, now_ms=now_ms)
     _validate_final_deposit_targets(entries)
     rng = rng or random.Random()
     transport = Transport(interval=0.2)
@@ -81,6 +91,7 @@ def execute_entries(
                         summary["skipped"] += len(wallet_entries)
                         continue
                     for entry in wallet_entries:
+                        _validate_route_quote_freshness([entry], now_ms=now_ms)
                         operation_id = journal.create_operation(
                             wallet=wallet, action=str(entry["status"])
                         )
@@ -92,6 +103,7 @@ def execute_entries(
                                 rpc=rpc,
                                 jumper=jumper,
                                 rpc_urls=rpc_urls,
+                                now_ms=now_ms,
                             )
                             journal.record_transaction(operation_id, tx_hash)
                             if approval_tx_hash := getattr(tx_hash, "approval_tx_hash", None):
@@ -111,6 +123,14 @@ def execute_entries(
                                     operation_id, (status or "timeout").lower()
                                 )
                             summary["submitted"] += 1
+                        except RouteQuoteExpired as exc:
+                            if exc.approval_tx_hash is None:
+                                journal.record_deferred(operation_id, str(exc))
+                            else:
+                                journal.record_approval_completed_route_deferred(
+                                    operation_id, exc.approval_tx_hash, str(exc)
+                                )
+                            summary["deferred"] += 1
                         except EthereumGasDeferred as exc:
                             if exc.approval_tx_hash is None:
                                 journal.record_deferred(operation_id, exc.reason)
@@ -131,6 +151,23 @@ def execute_entries(
     return summary
 
 
+def _validate_route_quote_freshness(entries: list[dict], *, now_ms: Callable[[], int]) -> None:
+    current_ms = now_ms()
+    for entry in entries:
+        if entry.get("status") != "route_ready":
+            continue
+        quoted_at = entry.get("quoted_at")
+        if isinstance(quoted_at, bool) or not isinstance(quoted_at, int):
+            raise ValueError("route quote must have an integer quoted_at timestamp")
+        age_ms = current_ms - quoted_at
+        if age_ms < 0 or age_ms > 900_000:
+            raise ValueError("route quote is outside the 15-minute execution window")
+
+
+def _utc_now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
 def _execute_entry(
     *,
     entry: dict,
@@ -138,6 +175,7 @@ def _execute_entry(
     rpc: ExecutionRpc,
     jumper: LifiClient,
     rpc_urls: dict[int, str],
+    now_ms: Callable[[], int] = _utc_now_ms,
 ) -> str:
     chain_id = int(entry["chain_id"])
     url = rpc_urls[chain_id]
@@ -161,6 +199,11 @@ def _execute_entry(
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
     try:
         require_ethereum_gas_below_limit(rpc, url=url, request=request)
+        if entry["status"] == "route_ready":
+            try:
+                _validate_route_quote_freshness([entry], now_ms=now_ms)
+            except ValueError as exc:
+                raise RouteQuoteExpired(str(exc), approval_tx_hash) from exc
         raw = sign_transaction(
             request,
             private_key=wallet.private_key,
