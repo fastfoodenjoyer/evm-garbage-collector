@@ -11,10 +11,13 @@ import httpx
 
 from .bitget import BitgetClient
 from .executor import (
+    EthereumGasDeferred,
     ExecutionRpc,
     approve_transaction,
     broadcast_signed_transaction,
     pending_nonce,
+    require_ethereum_gas_below_limit,
+    require_ethereum_planned_gas_price_valid,
     require_native_reserve,
     sign_transaction,
     token_allowance,
@@ -49,7 +52,7 @@ def execute_entries(
     rpc = ExecutionRpc(transport)
     jumper = LifiClient(httpx.Client(timeout=30))
     bitget = _bitget_client()
-    summary = {"submitted": 0, "skipped": 0, "failed": 0}
+    summary = {"submitted": 0, "skipped": 0, "failed": 0, "deferred": 0}
     by_wallet: dict[str, list[dict]] = {}
     for entry in entries:
         if entry.get("status") in {"route_ready", "direct_deposit", "post_bridge_deposit"}:
@@ -68,7 +71,7 @@ def execute_entries(
                     try:
                         started_ms = int(time.time() * 1000)
                         tx_hash = _execute_entry(
-                            entry,
+                            entry=entry,
                             wallet=source,
                             rpc=rpc,
                             jumper=jumper,
@@ -87,6 +90,14 @@ def execute_entries(
                                 operation_id, (status or "timeout").lower()
                             )
                         summary["submitted"] += 1
+                    except EthereumGasDeferred as exc:
+                        if exc.approval_tx_hash is None:
+                            journal.record_deferred(operation_id, exc.reason)
+                        else:
+                            journal.record_approval_completed_route_deferred(
+                                operation_id, exc.approval_tx_hash, exc.reason
+                            )
+                        summary["deferred"] += 1
                     except Exception:
                         journal.record_deposit_status(operation_id, "execution_failed")
                         summary["failed"] += 1
@@ -114,21 +125,28 @@ def _execute_entry(
         request = _direct_request(entry, wallet=wallet, rpc=rpc, url=url)
     if request.chain_id != chain_id:
         raise ValueError("route transaction chain does not match source balance")
+    require_ethereum_planned_gas_price_valid(request)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     require_native_reserve(
         balance=balance - request.value,
         gas_cost=request.gas_limit * request.gas_price_wei,
     )
     asset_id = str(entry["asset_id"])
+    approval_tx_hash = None
     if entry["status"] == "route_ready" and asset_id != "native":
-        _approve_if_needed(entry, request, wallet=wallet, rpc=rpc, url=url)
+        approval_tx_hash = _approve_if_needed(entry, request, wallet=wallet, rpc=rpc, url=url)
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
-    raw = sign_transaction(
-        request,
-        private_key=wallet.private_key,
-        expected_sender=wallet.public_address,
-        nonce=nonce,
-    )
+    try:
+        require_ethereum_gas_below_limit(rpc, url=url, request=request)
+        raw = sign_transaction(
+            request,
+            private_key=wallet.private_key,
+            expected_sender=wallet.public_address,
+            nonce=nonce,
+        )
+    except EthereumGasDeferred as exc:
+        exc.approval_tx_hash = approval_tx_hash
+        raise
     tx_hash = broadcast_signed_transaction(rpc, url=url, raw_transaction=raw)
     wait_for_receipt(rpc, url=url, tx_hash=tx_hash)
     return tx_hash
@@ -180,7 +198,7 @@ def _approve_if_needed(
     wallet: WalletWorkbookRow,
     rpc: ExecutionRpc,
     url: str,
-) -> None:
+) -> str | None:
     spender = entry["route"]["step"].get("estimate", {}).get("approvalAddress")
     asset_id = str(entry["asset_id"])
     amount = int(entry["raw_balance"])
@@ -194,7 +212,7 @@ def _approve_if_needed(
         spender=spender,
     ) >= amount
     if allowed:
-        return
+        return None
     approval = approve_transaction(
         chain_id=request.chain_id,
         token=asset_id,
@@ -202,9 +220,11 @@ def _approve_if_needed(
         amount=amount,
         gas_price_wei=request.gas_price_wei,
     )
+    require_ethereum_planned_gas_price_valid(approval)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     require_native_reserve(balance=balance, gas_cost=approval.gas_limit * approval.gas_price_wei)
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
+    require_ethereum_gas_below_limit(rpc, url=url, request=approval)
     raw = sign_transaction(
         approval,
         private_key=wallet.private_key,
@@ -213,6 +233,7 @@ def _approve_if_needed(
     )
     tx_hash = broadcast_signed_transaction(rpc, url=url, raw_transaction=raw)
     wait_for_receipt(rpc, url=url, tx_hash=tx_hash)
+    return tx_hash
 
 
 def _native_balance(rpc: ExecutionRpc, *, url: str, wallet: str) -> int:

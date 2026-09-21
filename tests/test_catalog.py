@@ -1,6 +1,7 @@
 import pytest
 
 from evm_inventory.config import load_catalog
+from evm_inventory.models import Token
 from scripts.update_registry import build_candidate
 
 
@@ -12,6 +13,95 @@ def test_packaged_catalog_has_working_core_portfolio_mappings():
     assert mappings[8453] == "base-mainnet"
     assert mappings[81457] == "blast-mainnet"
     assert mappings[60808] is None  # Provider rejects BOB despite generic feature matrix.
+
+
+def test_packaged_catalog_has_verified_bnb_and_polygon_stablecoin_metadata():
+    networks = {network.chain_id: network for network in load_catalog().networks}
+    expected = {
+        56: {
+            "name": "BNB Chain",
+            "rpc_urls": ("https://bsc-dataseed.bnbchain.org",),
+            "native_symbol": "BNB",
+            "tokens": (
+                (
+                    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+                    "USDC",
+                    18,
+                    "Binance-Peg USD Coin",
+                    "https://bscscan.com/token/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+                ),
+                (
+                    "0x55d398326f99059ff775485246999027b3197955",
+                    "USDT",
+                    18,
+                    "Binance-Peg BSC-USD",
+                    "https://bscscan.com/token/0x55d398326f99059ff775485246999027b3197955",
+                ),
+                (
+                    "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",
+                    "DAI",
+                    18,
+                    "Binance-Peg Dai Token",
+                    "https://bscscan.com/token/0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",
+                ),
+            ),
+        },
+        137: {
+            "name": "Polygon PoS",
+            "rpc_urls": ("https://polygon-bor-rpc.publicnode.com",),
+            "native_symbol": "POL",
+            "tokens": (
+                (
+                    "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+                    "USDC",
+                    6,
+                    "Circle native USDC",
+                    "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+                ),
+                (
+                    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+                    "USDC.e",
+                    6,
+                    "Polygon PoS bridged USDC",
+                    "https://polygonscan.com/token/0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+                ),
+                (
+                    "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+                    "USDT0",
+                    6,
+                    "Tether USD (USDT0)",
+                    "https://usdt0.to/ecosystem/polygon",
+                ),
+                (
+                    "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+                    "DAI",
+                    18,
+                    "PoS bridged Dai Stablecoin",
+                    "https://polygonscan.com/token/0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+                ),
+            ),
+        },
+    }
+
+    for chain_id, metadata in expected.items():
+        network = networks[chain_id]
+        assert network.name == metadata["name"]
+        assert network.rpc_urls == metadata["rpc_urls"]
+        assert network.native_symbol == metadata["native_symbol"]
+        assert network.native_decimals == 18
+        assert network.alchemy_network is None
+        assert network.token_review_status == "verified"
+        assert (
+            tuple(
+                (token.address, token.symbol, token.decimals, token.variant, token.source)
+                for token in network.tokens
+            )
+            == metadata["tokens"]
+        )
+        assert all(
+            isinstance(token, Token) and token.checked_at == "2026-09-21"
+            for token in network.tokens
+        )
 
 
 def test_mainnets_dedup_and_preserve_tokens():

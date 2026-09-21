@@ -64,7 +64,6 @@ def create_live_plan(
             "sequential": True,
             "delay_min_seconds": 1800,
             "delay_max_seconds": 10800,
-            "gas_reserve_multiplier": 5,
             "requires_explicit_execute": True,
         },
         "summary": dict(sorted(counts.items())),
@@ -110,7 +109,6 @@ def _quote_row(
             "status": "direct_deposit",
             "target": _target_data(direct),
             "deposit_address": address,
-            "requires_gas_preflight": True,
         }
     target = _route_target(targets)
     if target is None:
@@ -128,28 +126,6 @@ def _quote_row(
         routes = client.routes(request)
     except (httpx.HTTPError, ValueError):
         return "quote_failed", {**result, "status": "quote_failed", "target": _target_data(target)}
-    if asset_id == "native":
-        reserve = 5 * _source_gas_cost(routes, chain_id)
-        spendable = raw_balance - reserve
-        if spendable < _floor_raw(quote_floor, decimals):
-            return "dust_after_gas", {**result, "status": "dust_after_gas"}
-        request = LifiRouteRequest(
-            from_chain_id=request.from_chain_id,
-            to_chain_id=request.to_chain_id,
-            from_token_address=request.from_token_address,
-            to_token_address=request.to_token_address,
-            from_amount=str(spendable),
-            from_address=request.from_address,
-            to_address=request.to_address,
-        )
-        try:
-            routes = client.routes(request)
-        except (httpx.HTTPError, ValueError):
-            return "quote_failed", {
-                **result,
-                "status": "quote_failed",
-                "target": _target_data(target),
-            }
     viable = [route for route in routes if route.to_amount_min > 0]
     if not viable:
         return "no_staging_route", {
@@ -172,7 +148,6 @@ def _quote_row(
             "tools": list(route.tools),
             "step": route.first_step,
         },
-        "requires_gas_preflight": True,
     }
 
 
@@ -255,23 +230,7 @@ def _staged_deposits(
             "status": "post_bridge_deposit",
             "target": _target_data(target),
             "deposit_address": deposit_addresses[wallet],
-            "requires_gas_preflight": True,
         }
         for wallet, amount in sorted(totals.items())
         if amount >= target.minimum_raw and wallet in deposit_addresses
     ]
-
-
-def _source_gas_cost(routes: tuple, source_chain_id: int) -> int:
-    """Extract source-chain native gas from Jumper's rich step estimate."""
-
-    if not routes:
-        return 0
-    costs = routes[0].first_step.get("estimate", {}).get("gasCosts", [])
-    return sum(
-        int(cost.get("amount", 0))
-        for cost in costs
-        if isinstance(cost, dict)
-        and cost.get("token", {}).get("chainId") == source_chain_id
-        and cost.get("token", {}).get("address") == "0x0000000000000000000000000000000000000000"
-    )

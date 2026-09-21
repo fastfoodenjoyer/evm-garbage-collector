@@ -54,7 +54,6 @@ def create_route_plan(
             "sequential": True,
             "delay_min_seconds": schedule.delay_min_seconds,
             "delay_max_seconds": schedule.delay_max_seconds,
-            "gas_reserve_multiplier": 5,
             "requires_explicit_execute": True,
         },
         "summary": {key: counts[key] for key in (

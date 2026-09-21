@@ -25,6 +25,7 @@ def test_create_route_plan_marks_direct_deposit_and_dust(tmp_path):
         "manual_review": 0, "denied": 0,
     }
     assert plan["execution"]["delay_min_seconds"] == 1800
+    assert "gas_reserve_multiplier" not in plan["execution"]
 
 
 def test_create_route_plan_denies_asset_absent_from_allowlist(tmp_path):
