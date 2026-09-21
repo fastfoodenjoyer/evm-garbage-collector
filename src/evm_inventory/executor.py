@@ -13,10 +13,20 @@ from .rpc import RpcError, quantity, uint256
 from .transport import Transport
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+ETHEREUM_GAS_LIMIT_WEI = 500_000_000
 
 
 class Broadcaster(Protocol):
     def call(self, url: str, method: str, params: list[object]) -> object: ...
+
+
+class EthereumGasDeferred(ValueError):
+    """Fail closed before an Ethereum signature when current gas is too expensive."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+        self.approval_tx_hash: str | None = None
 
 
 class ExecutionRpc:
@@ -24,6 +34,7 @@ class ExecutionRpc:
 
     _METHODS = {
         "eth_call",
+        "eth_chainId",
         "eth_estimateGas",
         "eth_gasPrice",
         "eth_getBalance",
@@ -61,6 +72,54 @@ def require_native_reserve(*, balance: int, gas_cost: int, multiplier: int = 5) 
     if balance < retained:
         raise ValueError("insufficient native balance for gas reserve")
     return retained
+
+
+def require_ethereum_gas_below_limit(
+    broadcaster: Broadcaster, *, url: str, request: TransactionRequest
+) -> None:
+    """Freshly verify Ethereum endpoint and gas immediately before signing.
+
+    Other chains retain their existing execution policy.  This deliberately does
+    not modify the request: a route is deferred rather than silently repriced.
+    """
+
+    if request.chain_id != 1:
+        return
+    try:
+        endpoint_chain_id = quantity(broadcaster.call(url, "eth_chainId", []))
+    except Exception as exc:
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=chain_probe_error;threshold_wei=500000000"
+        ) from exc
+    if endpoint_chain_id != 1:
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=chain_id;"
+            f"value_wei={endpoint_chain_id};threshold_wei=500000000"
+        )
+    try:
+        rpc_gas_price = quantity(broadcaster.call(url, "eth_gasPrice", []))
+    except Exception as exc:
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=rpc_probe_error;threshold_wei=500000000"
+        ) from exc
+    if rpc_gas_price >= ETHEREUM_GAS_LIMIT_WEI:
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=rpc;"
+            f"value_wei={rpc_gas_price};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
+        )
+    if (
+        isinstance(request.gas_price_wei, bool)
+        or not isinstance(request.gas_price_wei, int)
+        or request.gas_price_wei < 0
+    ):
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=plan_error;threshold_wei=500000000"
+        )
+    if request.gas_price_wei >= ETHEREUM_GAS_LIMIT_WEI:
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=plan;"
+            f"value_wei={request.gas_price_wei};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
+        )
 
 
 def sign_transaction(
