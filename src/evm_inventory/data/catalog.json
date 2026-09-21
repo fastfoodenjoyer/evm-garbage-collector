@@ -144,6 +144,44 @@
       "alchemy_network": "opt-mainnet"
     },
     {
+      "chain_id": 56,
+      "name": "BNB Chain",
+      "rpc_urls": [
+        "https://bsc-dataseed.bnbchain.org"
+      ],
+      "native_symbol": "BNB",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://bscscan.com/token/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+          "checked_at": "2026-09-21",
+          "variant": "Binance-Peg USD Coin"
+        },
+        {
+          "address": "0x55d398326f99059ff775485246999027b3197955",
+          "symbol": "USDT",
+          "decimals": 18,
+          "source": "https://bscscan.com/token/0x55d398326f99059ff775485246999027b3197955",
+          "checked_at": "2026-09-21",
+          "variant": "Binance-Peg BSC-USD"
+        },
+        {
+          "address": "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://bscscan.com/token/0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",
+          "checked_at": "2026-09-21",
+          "variant": "Binance-Peg Dai Token"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; BNB Chain pegged token variants listed.",
+      "alchemy_network": null
+    },
+    {
       "chain_id": 130,
       "name": "Unichain",
       "rpc_urls": [
@@ -204,6 +242,52 @@
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
       "alchemy_network": "unichain-mainnet"
+    },
+    {
+      "chain_id": 137,
+      "name": "Polygon PoS",
+      "rpc_urls": [
+        "https://polygon-rpc.com"
+      ],
+      "native_symbol": "POL",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+          "symbol": "USDC",
+          "decimals": 6,
+          "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+          "checked_at": "2026-09-21",
+          "variant": "Circle native USDC"
+        },
+        {
+          "address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+          "symbol": "USDC.e",
+          "decimals": 6,
+          "source": "https://polygonscan.com/token/0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+          "checked_at": "2026-09-21",
+          "variant": "Polygon PoS bridged USDC"
+        },
+        {
+          "address": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+          "symbol": "USDT0",
+          "decimals": 6,
+          "source": "https://tether.to/en/tether-token-usdt-launches-on-polygon/",
+          "checked_at": "2026-09-21",
+          "variant": "Tether USD (USDT0)"
+        },
+        {
+          "address": "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+          "symbol": "DAI",
+          "decimals": 18,
+          "source": "https://polygonscan.com/token/0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+          "checked_at": "2026-09-21",
+          "variant": "PoS bridged Dai Stablecoin"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "Curated sourced contracts only; native and bridged USDC are distinct.",
+      "alchemy_network": null
     },
     {
       "chain_id": 177,

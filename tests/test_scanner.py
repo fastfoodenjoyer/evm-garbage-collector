@@ -1,3 +1,4 @@
+from evm_inventory.config import load_catalog, snapshot
 from evm_inventory.scanner import _rpc_urls, scan
 from evm_inventory.store import Store
 
@@ -57,6 +58,41 @@ def test_zero_native_still_checks_stable_resume_skips(tmp_path):
     result = scan(store, run, rpc=RPC(), sleep=lambda _: None)
     assert all(j["attempts"] == 1 for j in store.jobs(run) if j["kind"] == "mandatory")
     store.close()
+
+
+def test_bnb_and_polygon_create_mandatory_jobs_for_each_wallet(tmp_path):
+    catalog = load_catalog()
+    selected = tuple(network for network in catalog.networks if network.chain_id in {56, 137})
+    assert {network.chain_id for network in selected} == {56, 137}
+    two_wallets = (W, "0x" + "4" * 40)
+    scope = snapshot(
+        catalog.__class__(
+            networks=selected,
+            revision=catalog.revision,
+            checked_at=catalog.checked_at,
+            source=catalog.source,
+        ),
+        two_wallets,
+        {"delay_min": 0, "delay_max": 0},
+    )
+
+    with Store(tmp_path / "db.sqlite") as store:
+        run = store.create_run(scope)
+        assert scan(store, run, rpc=RPC(), sleep=lambda _: None)["status"] == "completed"
+        mandatory = [job for job in store.jobs(run) if job["kind"] == "mandatory"]
+
+    expected_assets = {
+        network.chain_id: {"native", *(token.address for token in network.tokens)}
+        for network in selected
+    }
+    assert len(mandatory) == len(two_wallets) * sum(map(len, expected_assets.values()))
+    for wallet in two_wallets:
+        for chain_id, assets in expected_assets.items():
+            assert {
+                job["asset_id"]
+                for job in mandatory
+                if job["wallet"] == wallet and job["chain_id"] == chain_id
+            } == assets
 
 
 def test_network_failure_creates_all_checks(tmp_path):
@@ -153,9 +189,7 @@ def test_unavailable_rpc_has_cooldown_across_wallets(tmp_path):
 
 def test_alchemy_rpc_is_used_before_public_endpoint(monkeypatch):
     monkeypatch.setenv("ALCHEMY_RPC_API_KEY", "test-key")
-    urls = _rpc_urls(
-        {"alchemy_network": "opt-mainnet", "rpc_urls": ["https://rpc.example"]}
-    )
+    urls = _rpc_urls({"alchemy_network": "opt-mainnet", "rpc_urls": ["https://rpc.example"]})
     assert urls == (
         "https://opt-mainnet.g.alchemy.com/v2/test-key",
         "https://rpc.example",
