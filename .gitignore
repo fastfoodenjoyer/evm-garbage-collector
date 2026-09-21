@@ -14,3 +14,4 @@ local/
 wallets*.txt
 build/
 dist/
+docs/
