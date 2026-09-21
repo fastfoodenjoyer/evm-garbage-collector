@@ -97,6 +97,7 @@ def main(argv=None):
         scan_parser.add_argument("--wallets", required=True)
         scan_parser.add_argument("--db", required=True)
         scan_parser.add_argument("--catalog")
+        scan_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
         scan_parser.add_argument("--delay-min", type=float, default=1)
         scan_parser.add_argument("--delay-max", type=float, default=3)
         scan_parser.add_argument("--interval", type=float, default=1)
@@ -225,8 +226,7 @@ def main(argv=None):
                 "discovery_enabled": key_present and not args.no_discovery,
             }
             scope = snapshot(catalog, wallets, settings)
-            if args.catalog is None:
-                scope = add_allowlisted_tokens(scope, Path("config/swap-allowlist.json"))
+            scope = add_allowlisted_tokens(scope, Path(args.allowlist))
             if args.dry_run:
                 checks_per_wallet = sum(
                     1 + len(network["tokens"]) for network in scope["catalog"]["networks"]

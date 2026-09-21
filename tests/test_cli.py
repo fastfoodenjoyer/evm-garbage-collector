@@ -95,6 +95,8 @@ def test_dry_run_counts_native_and_each_token_per_wallet(tmp_path, capsys):
             }
         )
     )
+    allowlist = tmp_path / "allowlist.json"
+    allowlist.write_text(json.dumps({"assets": []}))
     assert (
         main(
             [
@@ -105,6 +107,8 @@ def test_dry_run_counts_native_and_each_token_per_wallet(tmp_path, capsys):
                 str(tmp_path / "db"),
                 "--catalog",
                 str(catalog),
+                "--allowlist",
+                str(allowlist),
                 "--dry-run",
             ]
         )

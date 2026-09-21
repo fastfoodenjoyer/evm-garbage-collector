@@ -245,6 +245,21 @@ def test_allowlisted_contracts_are_added_to_mandatory_scan_scope(tmp_path: Path)
     ]
 
 
+def test_packaged_allowlist_is_entirely_in_mandatory_scan_scope() -> None:
+    root = Path(__file__).parents[1]
+    policy = root / "config" / "swap-allowlist.json"
+    scope = add_allowlisted_tokens(
+        snapshot(load_catalog(), ("0x" + "1" * 40,), {}), policy
+    )
+    networks = {network["chain_id"]: network for network in scope["catalog"]["networks"]}
+
+    for asset in json.loads(policy.read_text(encoding="utf-8"))["assets"]:
+        if asset["asset_id"] == "native":
+            continue
+        addresses = {token["address"].lower() for token in networks[asset["chain_id"]]["tokens"]}
+        assert asset["asset_id"].lower() in addresses
+
+
 def test_format_amount_is_exact_and_unknown_decimals_are_none() -> None:
     assert format_amount(123456789012345678901234567890, 18) == "123456789012.345678901234567890"
     assert format_amount(100, 0) == "100"
