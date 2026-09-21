@@ -182,6 +182,28 @@
       "alchemy_network": null
     },
     {
+      "chain_id": 100,
+      "name": "Gnosis",
+      "rpc_urls": [
+        "https://rpc.gnosischain.com"
+      ],
+      "native_symbol": "XDAI",
+      "native_decimals": 18,
+      "tokens": [
+        {
+          "address": "0xe91d153e0b41518a2ce8dd3d7944fa863463a97d",
+          "symbol": "WXDAI",
+          "decimals": 18,
+          "source": "https://gnosisscan.io/token/0xe91d153e0b41518a2ce8dd3d7944fa863463a97d",
+          "checked_at": "2026-09-21",
+          "variant": "Wrapped xDai"
+        }
+      ],
+      "token_review_status": "verified",
+      "notes": "WXDAI contract verified by RPC; other Gnosis assets may exist.",
+      "alchemy_network": null
+    },
+    {
       "chain_id": 130,
       "name": "Unichain",
       "rpc_urls": [
@@ -828,6 +850,110 @@
       "name": "Xterio Chain (ETH)",
       "rpc_urls": [
         "https://xterio-eth.alt.technology/"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 204,
+      "name": "opBNB",
+      "rpc_urls": [
+        "https://opbnb-mainnet-rpc.bnbchain.org"
+      ],
+      "native_symbol": "BNB",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 324,
+      "name": "ZKsync Era",
+      "rpc_urls": [
+        "https://mainnet.era.zksync.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 1088,
+      "name": "Metis",
+      "rpc_urls": [
+        "https://andromeda.metis.io/?owner=1088"
+      ],
+      "native_symbol": "METIS",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 1116,
+      "name": "Core",
+      "rpc_urls": [
+        "https://rpc.coredao.org"
+      ],
+      "native_symbol": "CORE",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 43114,
+      "name": "Avalanche C-Chain",
+      "rpc_urls": [
+        "https://api.avax.network/ext/bc/C/rpc"
+      ],
+      "native_symbol": "AVAX",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 534352,
+      "name": "Scroll",
+      "rpc_urls": [
+        "https://rpc.scroll.io"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 59144,
+      "name": "Linea",
+      "rpc_urls": [
+        "https://rpc.linea.build"
+      ],
+      "native_symbol": "ETH",
+      "native_decimals": 18,
+      "tokens": [],
+      "token_review_status": "pending",
+      "notes": "Stablecoin catalog review pending.",
+      "alchemy_network": null
+    },
+    {
+      "chain_id": 167000,
+      "name": "Taiko Mainnet",
+      "rpc_urls": [
+        "https://rpc.mainnet.taiko.xyz"
       ],
       "native_symbol": "ETH",
       "native_decimals": 18,

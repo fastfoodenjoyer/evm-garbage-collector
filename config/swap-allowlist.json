@@ -5,6 +5,7 @@
   "assets": [
     {"chain_id": 1, "network": "Ethereum Mainnet", "asset_id": "native", "symbol": "ETH", "action": "swap"},
     {"chain_id": 10, "network": "OP Mainnet", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 100, "network": "Gnosis", "asset_id": "native", "symbol": "XDAI", "action": "swap"},
     {"chain_id": 130, "network": "Unichain", "asset_id": "native", "symbol": "ETH", "action": "swap"},
     {"chain_id": 1868, "network": "Soneium", "asset_id": "native", "symbol": "ETH", "action": "swap"},
     {"chain_id": 8453, "network": "Base", "asset_id": "native", "symbol": "ETH", "action": "swap"},
@@ -17,6 +18,7 @@
     {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0x0b2c639c533813f4aa9d7837caf62653d097ff85", "symbol": "USDC", "action": "swap"},
     {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0x7f5c764cbc14f9669b88837ca1490cca17c31607", "symbol": "USDC.e", "action": "swap"},
     {"chain_id": 10, "network": "OP Mainnet", "asset_id": "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", "symbol": "DAI", "action": "swap"},
+    {"chain_id": 100, "network": "Gnosis", "asset_id": "0xe91d153e0b41518a2ce8dd3d7944fa863463a97d", "symbol": "WXDAI", "action": "swap"},
     {"chain_id": 130, "network": "Unichain", "asset_id": "0x078d782b760474a361dda0af3839290b0ef57ad6", "symbol": "USDC", "action": "swap"},
     {"chain_id": 130, "network": "Unichain", "asset_id": "0x9151434b16b9763660705744891fa906f660ecc5", "symbol": "USDT0", "action": "swap"},
     {"chain_id": 8453, "network": "Base", "asset_id": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "symbol": "USDC", "action": "swap"},

@@ -15,6 +15,27 @@ def test_packaged_catalog_has_working_core_portfolio_mappings():
     assert mappings[60808] is None  # Provider rejects BOB despite generic feature matrix.
 
 
+def test_packaged_catalog_includes_requested_mainnet_networks():
+    networks = {network.chain_id: network for network in load_catalog().networks}
+    expected = {
+        100: ("Gnosis", "https://rpc.gnosischain.com", "XDAI"),
+        204: ("opBNB", "https://opbnb-mainnet-rpc.bnbchain.org", "BNB"),
+        324: ("ZKsync Era", "https://mainnet.era.zksync.io", "ETH"),
+        1088: ("Metis", "https://andromeda.metis.io/?owner=1088", "METIS"),
+        1116: ("Core", "https://rpc.coredao.org", "CORE"),
+        43114: ("Avalanche C-Chain", "https://api.avax.network/ext/bc/C/rpc", "AVAX"),
+        534352: ("Scroll", "https://rpc.scroll.io", "ETH"),
+        59144: ("Linea", "https://rpc.linea.build", "ETH"),
+        7560: ("Cyber Mainnet", "https://rpc.cyber.co", "ETH"),
+        167000: ("Taiko Mainnet", "https://rpc.mainnet.taiko.xyz", "ETH"),
+    }
+    for chain_id, (name, rpc, native_symbol) in expected.items():
+        network = networks[chain_id]
+        assert network.name == name
+        assert network.rpc_urls == (rpc,)
+        assert network.native_symbol == native_symbol
+
+
 def test_packaged_catalog_mandatorily_checks_allowlisted_arbitrum_usdc_e():
     networks = {network.chain_id: network for network in load_catalog().networks}
 
@@ -27,6 +48,21 @@ def test_packaged_catalog_mandatorily_checks_allowlisted_arbitrum_usdc_e():
     ) in {
         (token.address, token.symbol, token.decimals, token.variant, token.source)
         for token in networks[42161].tokens
+    }
+
+
+def test_packaged_catalog_mandatorily_checks_allowlisted_gnosis_wxdai():
+    networks = {network.chain_id: network for network in load_catalog().networks}
+
+    assert (
+        "0xe91d153e0b41518a2ce8dd3d7944fa863463a97d",
+        "WXDAI",
+        18,
+        "Wrapped xDai",
+        "https://gnosisscan.io/token/0xe91d153e0b41518a2ce8dd3d7944fa863463a97d",
+    ) in {
+        (token.address, token.symbol, token.decimals, token.variant, token.source)
+        for token in networks[100].tokens
     }
 
 
