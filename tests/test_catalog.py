@@ -26,7 +26,7 @@ def test_packaged_catalog_has_verified_bnb_and_polygon_stablecoin_metadata():
                 (
                     "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
                     "USDC",
-                    6,
+                    18,
                     "Binance-Peg USD Coin",
                     "https://bscscan.com/token/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
                 ),
