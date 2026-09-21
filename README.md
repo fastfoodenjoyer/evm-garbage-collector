@@ -32,13 +32,13 @@ uses the strict `config/swap-allowlist.json`, and requests cheapest routes throu
 `https://api.jumper.xyz/pipeline/v1/advanced/routes`. Subminimum positions are routed
 to wallet-owned USDC on Base, then included in a single final transfer only when their
 combined `toAmountMin` meets Bitget's current minimum. Amounts below 0.01 tokens are
-classified as dust before a route request. Native-asset routes are requoted after
-reserving five times their quoted source-chain gas cost.
+classified as dust before a route request. Quotes and plans do not read, subtract, or
+otherwise evaluate gas.
 
 To broadcast the saved plan, use the separate command below. It processes wallets in
 order, waits a random 30–180 minutes between wallets, signs only with the matching
-workbook key, verifies the 5× native-gas reserve, uses exact ERC-20 approvals when a
-Jumper step requires one, waits for the source-chain receipt, and records each action
+workbook key, verifies the transaction-time 5× native-gas reserve, uses exact ERC-20
+approvals when a Jumper step requires one, waits for the source-chain receipt, and records each action
 in the SQLite journal. It then polls the signed Bitget deposit API for the resulting
 transaction hash. This requires `BITGET_API_KEY`, `BITGET_SECRET_KEY`, and
 `BITGET_PASSPHRASE` in `.env`.
@@ -54,7 +54,7 @@ uv run evm-inventory execute-routes \
 
 Public RPC endpoints can rate-limit or be unavailable. The reports distinguish zero balances, errors and unverified coverage. The packaged catalog is a dated snapshot and does not claim exhaustive ERC-20 discovery. Reading balances has no gas cost; the future collection phase will be a separate transaction-signing feature.
 
-See [network and token coverage](docs/coverage.md) for current gaps. The default catalog has 35 networks, 36 stablecoin contracts, and 13 verified Alchemy Portfolio mappings. For 150 wallets this means 10,650 mandatory balance checks, plus additional discovered tokens. A balance check can require several HTTP requests; the dry-run number is not an HTTP request or CU estimate. Prices may be unavailable.
+See [network and token coverage](docs/coverage.md) for current gaps. The default catalog has 37 networks, 43 stablecoin contracts, and 13 verified Alchemy Portfolio mappings. For 150 wallets this means 12,000 mandatory balance checks, plus additional discovered tokens. A balance check can require several HTTP requests; the dry-run number is not an HTTP request or CU estimate. Prices may be unavailable.
 
 `config/swap-allowlist.json` is the future transaction allowlist. It defaults to `deny` and matches an asset only by exact `chain_id` plus contract address (or `native`). `swap` assets may be routed, `unwrap` assets may only be unwrapped to the native coin, and `review` assets require an explicit routing decision. The inventory scanner never signs transactions.
 

@@ -84,3 +84,52 @@ def test_live_plan_stages_existing_base_usdc_for_one_final_deposit(tmp_path):
     assert [entry["status"] for entry in plan["entries"]] == [
         "stage_existing", "post_bridge_deposit"
     ]
+
+
+def test_live_plan_quotes_full_native_balance_without_gas_preflight_fields(tmp_path):
+    balances = tmp_path / "balances.csv"
+    balances.write_text(
+        "wallet,chain_id,asset_id,raw_balance,decimals,symbol,status\n"
+        + "0x" + "1" * 40 + ",10,native,10000,6,ETH,success\n"
+    )
+    allowlist = tmp_path / "allowlist.json"
+    allowlist.write_text('{"assets":[{"chain_id":10,"asset_id":"native","action":"swap"}]}')
+    target = BitgetDepositTarget("USDC", 8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", 1)
+
+    class NativeQuotes:
+        def __init__(self):
+            self.requests = []
+
+        def routes(self, request):
+            self.requests.append(request)
+            return (
+                LifiRoute(
+                    "native-route",
+                    10_000,
+                    10_000,
+                    10_000,
+                    (),
+                    ("across",),
+                    {
+                        "estimate": {
+                            "gasCosts": [{"amount": "999999", "token": {"chainId": 10}}]
+                        }
+                    },
+                ),
+            )
+
+    quotes = NativeQuotes()
+    plan = create_live_plan(
+        balances,
+        deposit_addresses={"0x" + "1" * 40: "0x" + "2" * 40},
+        allowlist_path=allowlist,
+        client=quotes,
+        targets=(target,),
+    )
+
+    assert quotes.requests[0].from_amount == "10000"
+    assert len(quotes.requests) == 1
+    assert plan["entries"][0]["status"] == "route_ready"
+    assert "requires_gas_preflight" not in plan["entries"][0]
+    assert "requires_gas_preflight" not in plan["entries"][1]
+    assert "gas_reserve_multiplier" not in plan["execution"]
