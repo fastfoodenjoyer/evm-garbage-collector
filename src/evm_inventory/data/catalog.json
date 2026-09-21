@@ -697,6 +697,14 @@
           "source": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
           "checked_at": "2026-09-19",
           "variant": "Circle native USDC"
+        },
+        {
+          "address": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+          "symbol": "USDC.e",
+          "decimals": 6,
+          "source": "https://arbiscan.io/token/0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+          "checked_at": "2026-09-21",
+          "variant": "Arbitrum bridged USDC"
         }
       ],
       "token_review_status": "verified",

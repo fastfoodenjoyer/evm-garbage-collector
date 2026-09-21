@@ -15,6 +15,21 @@ def test_packaged_catalog_has_working_core_portfolio_mappings():
     assert mappings[60808] is None  # Provider rejects BOB despite generic feature matrix.
 
 
+def test_packaged_catalog_mandatorily_checks_allowlisted_arbitrum_usdc_e():
+    networks = {network.chain_id: network for network in load_catalog().networks}
+
+    assert (
+        "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+        "USDC.e",
+        6,
+        "Arbitrum bridged USDC",
+        "https://arbiscan.io/token/0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+    ) in {
+        (token.address, token.symbol, token.decimals, token.variant, token.source)
+        for token in networks[42161].tokens
+    }
+
+
 def test_packaged_catalog_has_verified_bnb_and_polygon_stablecoin_metadata():
     networks = {network.chain_id: network for network in load_catalog().networks}
     expected = {
