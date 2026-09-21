@@ -47,22 +47,24 @@ def _ensure_jobs(store, run, wallet, network):
 
 
 def _rpc_urls(network):
-    """Prefer an in-memory Alchemy RPC URL when the configured key supports the chain."""
+    """Return the preferred endpoints for one network.
+
+    When Alchemy advertises a network and a key is configured, its endpoint is the
+    only endpoint used. Public RPCs are reserved for networks without an Alchemy
+    mapping (or when no Alchemy key is configured).
+    """
 
     urls = list(network["rpc_urls"])
     key = os.environ.get("ALCHEMY_RPC_API_KEY") or os.environ.get("ALCHEMY_API_KEY")
     alchemy_network = network.get("alchemy_network")
     if key and alchemy_network:
-        urls.insert(
-            0,
-            f"https://{alchemy_network}.g.alchemy.com/v2/{quote(key, safe='')}",
-        )
+        return (f"https://{alchemy_network}.g.alchemy.com/v2/{quote(key, safe='')}",)
     return tuple(dict.fromkeys(urls))
 
 
-def _select_endpoint(rpc, network, pinned, blocked):
+def _select_endpoint(rpc, network, pinned, blocked, *, rpc_urls=None):
     error = RequestError("no_rpc_available")
-    for url in _rpc_urls(network):
+    for url in _rpc_urls(network) if rpc_urls is None else rpc_urls:
         if url in blocked:
             saved = blocked[url]
             if saved.retry_after is None or saved.retry_after > time.time():
@@ -229,6 +231,11 @@ def scan(store, run_id, *, rpc=None, discovery=None, sleep=time.sleep, progress=
     discovery = discovery or Discovery(
         transport, key="" if not settings.get("discovery_enabled", True) else None
     )
+    # Resolve every endpoint once before traversing wallets. The same immutable map
+    # is reused for the entire run, so endpoint construction never happens per wallet.
+    rpc_urls = {
+        network["chain_id"]: _rpc_urls(network) for network in scope["catalog"]["networks"]
+    }
     blocked = {}
     store.set_status(run_id, "running")
     try:
@@ -260,7 +267,9 @@ def scan(store, run_id, *, rpc=None, discovery=None, sleep=time.sleep, progress=
                     continue
                 pinned = store.get_pass(run_id, wallet, cid)
                 try:
-                    url, block = _select_endpoint(rpc, network, pinned, blocked)
+                    url, block = _select_endpoint(
+                        rpc, network, pinned, blocked, rpc_urls=rpc_urls[cid]
+                    )
                 except RequestError as exc:
                     for job in pending:
                         _failure(store, job, exc, "unavailable")

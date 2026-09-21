@@ -187,13 +187,26 @@ def test_unavailable_rpc_has_cooldown_across_wallets(tmp_path):
         assert rpc.calls == 1
 
 
-def test_alchemy_rpc_is_used_before_public_endpoint(monkeypatch):
+def test_alchemy_rpc_is_used_without_public_fallback(monkeypatch):
     monkeypatch.setenv("ALCHEMY_RPC_API_KEY", "test-key")
     urls = _rpc_urls({"alchemy_network": "opt-mainnet", "rpc_urls": ["https://rpc.example"]})
-    assert urls == (
-        "https://opt-mainnet.g.alchemy.com/v2/test-key",
-        "https://rpc.example",
-    )
+    assert urls == ("https://opt-mainnet.g.alchemy.com/v2/test-key",)
+
+
+def test_rpc_urls_are_resolved_once_for_all_networks(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALCHEMY_API_KEY", "test-key")
+    calls = []
+    original = __import__("evm_inventory.scanner", fromlist=["_rpc_urls"])._rpc_urls
+
+    def counted(network):
+        calls.append(network["chain_id"])
+        return original(network)
+
+    monkeypatch.setattr("evm_inventory.scanner._rpc_urls", counted)
+    with Store(tmp_path / "db.sqlite") as store:
+        run = store.create_run(scope())
+        scan(store, run, rpc=RPC(), sleep=lambda _: None)
+    assert calls == [10]
 
 
 def test_rpc_failure_during_balances_defers_remaining_calls(tmp_path):

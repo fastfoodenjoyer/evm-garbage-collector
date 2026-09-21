@@ -89,7 +89,7 @@ def test_packaged_catalog_has_verified_bnb_and_polygon_stablecoin_metadata():
         assert network.rpc_urls == metadata["rpc_urls"]
         assert network.native_symbol == metadata["native_symbol"]
         assert network.native_decimals == 18
-        assert network.alchemy_network is None
+        assert network.alchemy_network == ("polygon-mainnet" if chain_id == 137 else None)
         assert network.token_review_status == "verified"
         assert (
             tuple(

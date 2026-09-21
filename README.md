@@ -61,7 +61,7 @@ treated as its own batch: balances and quotes retain workbook order, while the e
 randomizes wallet order inside each batch immediately before sending transactions. Omitted
 ranges select the whole workbook as one batch.
 
-See [network and token coverage](docs/coverage.md) for current gaps. The default catalog has 37 networks, 43 stablecoin contracts, and 13 verified Alchemy Portfolio mappings. For 150 wallets this means 12,000 mandatory balance checks, plus additional discovered tokens. A balance check can require several HTTP requests; the dry-run number is not an HTTP request or CU estimate. Prices may be unavailable.
+See [network and token coverage](docs/coverage.md) for current gaps. The default catalog has 37 networks, 43 stablecoin contracts, and 14 verified Alchemy Portfolio mappings. For 150 wallets this means 12,000 mandatory balance checks, plus additional discovered tokens. A balance check can require several HTTP requests; the dry-run number is not an HTTP request or CU estimate. Prices may be unavailable.
 
 `config/swap-allowlist.json` is the future transaction allowlist. It defaults to `deny` and matches an asset only by exact `chain_id` plus contract address (or `native`). `swap` assets may be routed, `unwrap` assets may only be unwrapped to the native coin, and `review` assets require an explicit routing decision. The inventory scanner never signs transactions.
 
