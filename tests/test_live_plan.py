@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 
 from evm_inventory.bitget_catalog import BitgetDepositTarget
 from evm_inventory.lifi import LifiGasCost, LifiRoute
@@ -133,3 +134,24 @@ def test_live_plan_quotes_full_native_balance_without_gas_preflight_fields(tmp_p
     assert "requires_gas_preflight" not in plan["entries"][0]
     assert "requires_gas_preflight" not in plan["entries"][1]
     assert "gas_reserve_multiplier" not in plan["execution"]
+
+
+def test_live_plan_quotes_ohno_only_on_blast_with_the_configured_allowlist(tmp_path):
+    contract = "0x000000daa580e54635a043d2773f2c698593836a"
+    balances = tmp_path / "balances.csv"
+    balances.write_text(
+        "wallet,chain_id,asset_id,raw_balance,decimals,symbol,status\n"
+        + "0x" + "1" * 40 + f",81457,{contract},10000000000000000,18,OHNO,success\n"
+        + "0x" + "1" * 40 + f",10,{contract},10000000000000000,18,OHNO,success\n"
+    )
+    target = BitgetDepositTarget("USDC", 8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", 1)
+
+    plan = create_live_plan(
+        balances,
+        deposit_addresses={"0x" + "1" * 40: "0x" + "2" * 40},
+        allowlist_path=Path(__file__).parents[1] / "config" / "swap-allowlist.json",
+        client=Quotes(),
+        targets=(target,),
+    )
+
+    assert [entry["status"] for entry in plan["entries"][:2]] == ["route_ready", "denied"]

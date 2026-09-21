@@ -24,6 +24,8 @@ class Journal:
         }
         if "reason" not in columns:
             self.connection.execute("ALTER TABLE operations ADD COLUMN reason TEXT")
+        if "approval_tx_hash" not in columns:
+            self.connection.execute("ALTER TABLE operations ADD COLUMN approval_tx_hash TEXT")
         self.connection.commit()
 
     def __enter__(self):
@@ -59,13 +61,16 @@ class Journal:
     def record_deferred(self, operation_id: int, reason: str) -> None:
         self._update(operation_id, "deferred", reason=reason)
 
+    def record_approval_hash(self, operation_id: int, approval_tx_hash: str) -> None:
+        self._update(operation_id, "submitted", approval_tx_hash=approval_tx_hash)
+
     def record_approval_completed_route_deferred(
         self, operation_id: int, approval_tx_hash: str, reason: str
     ) -> None:
         self._update(
             operation_id,
             "approval_completed_route_deferred",
-            tx_hash=approval_tx_hash,
+            approval_tx_hash=approval_tx_hash,
             reason=reason,
         )
 
@@ -85,15 +90,19 @@ class Journal:
         tx_hash: str | None = None,
         status: str | None = None,
         reason: str | None = None,
+        approval_tx_hash: str | None = None,
         unless_states: tuple[str, ...] = (),
     ) -> None:
         query = (
             "UPDATE operations SET state=?, tx_hash=COALESCE(?, tx_hash), "
+            "approval_tx_hash=COALESCE(?, approval_tx_hash), "
             "deposit_status=COALESCE(?, deposit_status), "
             "reason=COALESCE(?, reason), "
             "updated_at=CURRENT_TIMESTAMP WHERE id=?"
         )
-        parameters: tuple[str | int | None, ...] = (state, tx_hash, status, reason, operation_id)
+        parameters: tuple[str | int | None, ...] = (
+            state, tx_hash, approval_tx_hash, status, reason, operation_id
+        )
         if unless_states:
             placeholders = ", ".join("?" for _ in unless_states)
             query += f" AND state NOT IN ({placeholders})"

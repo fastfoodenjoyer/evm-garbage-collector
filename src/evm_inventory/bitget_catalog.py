@@ -26,6 +26,7 @@ class BitgetDepositTarget:
     chain_id: int
     asset_id: str
     minimum_raw: int
+    chain: str = ""
 
 
 def fetch_public_coins(http_client: httpx.Client | None = None) -> tuple[dict, ...]:
@@ -63,7 +64,9 @@ def deposit_targets(coins: Iterable[dict]) -> tuple[BitgetDepositTarget, ...]:
             except (InvalidOperation, KeyError, ValueError):
                 continue
             if minimum_raw > 0:
-                targets.append(BitgetDepositTarget(coin, chain_id, asset_id, minimum_raw))
+                targets.append(
+                    BitgetDepositTarget(coin, chain_id, asset_id, minimum_raw, str(chain["chain"]))
+                )
     return tuple(targets)
 
 

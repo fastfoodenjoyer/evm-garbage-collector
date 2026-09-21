@@ -29,6 +29,13 @@ from .transport import Transport
 from .workbook import WalletWorkbookRow
 
 
+class ExecutedTransactionHash(str):
+    def __new__(cls, tx_hash: str, approval_tx_hash: str | None):
+        result = super().__new__(cls, tx_hash)
+        result.approval_tx_hash = approval_tx_hash
+        return result
+
+
 def execute_entries(
     entries: list[dict],
     *,
@@ -48,6 +55,7 @@ def execute_entries(
         raise ValueError("refusing to broadcast without --execute")
     if delay_min_seconds < 0 or delay_max_seconds < delay_min_seconds:
         raise ValueError("invalid execution delay range")
+    _validate_final_deposit_targets(entries)
     rng = rng or random.Random()
     transport = Transport(interval=0.2)
     rpc = ExecutionRpc(transport)
@@ -86,13 +94,18 @@ def execute_entries(
                                 rpc_urls=rpc_urls,
                             )
                             journal.record_transaction(operation_id, tx_hash)
+                            if approval_tx_hash := getattr(tx_hash, "approval_tx_hash", None):
+                                journal.record_approval_hash(operation_id, approval_tx_hash)
                             if entry.get("settlement") == "wallet":
                                 journal.record_deposit_status(operation_id, "staged")
-                            else:
+                            elif entry["status"] in {"direct_deposit", "post_bridge_deposit"}:
                                 status = bitget.wait_for_deposit(
                                     tx_hash=tx_hash,
                                     started_ms=started_ms,
                                     coin=str(entry["target"]["coin"]),
+                                    chain=str(entry["target"]["chain"]),
+                                    recipient=source.bitget_deposit_address,
+                                    minimum_raw=int(entry["target"]["minimum_raw"]),
                                 )
                                 journal.record_deposit_status(
                                     operation_id, (status or "timeout").lower()
@@ -159,7 +172,7 @@ def _execute_entry(
         raise
     tx_hash = broadcast_signed_transaction(rpc, url=url, raw_transaction=raw)
     wait_for_receipt(rpc, url=url, tx_hash=tx_hash)
-    return tx_hash
+    return ExecutedTransactionHash(tx_hash, approval_tx_hash)
 
 
 def _direct_request(
@@ -281,6 +294,19 @@ def _quantity(value: object) -> int:
     from .rpc import quantity
 
     return quantity(value)
+
+
+def _validate_final_deposit_targets(entries: list[dict]) -> None:
+    for entry in entries:
+        if entry.get("status") not in {"direct_deposit", "post_bridge_deposit"}:
+            continue
+        target = entry.get("target")
+        if (
+            not isinstance(target, dict)
+            or not isinstance(target.get("chain"), str)
+            or not target["chain"]
+        ):
+            raise ValueError("final deposit is missing Bitget exchange chain")
 
 
 def _bitget_client() -> BitgetClient:

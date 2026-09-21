@@ -6,9 +6,16 @@ import base64
 import hashlib
 import hmac
 import time
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 
 import httpx
+
+_COIN_DECIMALS = {"ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18}
+
+
+def _is_credited_status(status: str | None) -> bool:
+    return status is not None and status.lower() == "success"
 
 
 class BitgetClient:
@@ -42,10 +49,26 @@ class BitgetClient:
             raise ValueError("Bitget deposit record request failed")
         return tuple(item for item in body["data"] if isinstance(item, dict))
 
-    def deposit_status(self, *, tx_hash: str, start_ms: int, end_ms: int, coin: str) -> str | None:
+    def deposit_status(
+        self,
+        *,
+        tx_hash: str,
+        start_ms: int,
+        end_ms: int,
+        coin: str,
+        chain: str,
+        recipient: str,
+        minimum_raw: int,
+    ) -> str | None:
         for record in self.deposit_records(start_ms=start_ms, end_ms=end_ms, coin=coin):
             hashes = (record.get("tradeId"), record.get("txId"), record.get("txHash"))
-            if any(str(value or "").lower() == tx_hash.lower() for value in hashes):
+            if (
+                any(str(value or "").lower() == tx_hash.lower() for value in hashes)
+                and record.get("coin") == coin
+                and record.get("chain") == chain
+                and str(record.get("address", "")).lower() == recipient.lower()
+                and _record_raw_amount(record, coin) >= minimum_raw
+            ):
                 return str(record.get("status", "")) or None
         return None
 
@@ -55,6 +78,9 @@ class BitgetClient:
         tx_hash: str,
         started_ms: int,
         coin: str,
+        chain: str,
+        recipient: str,
+        minimum_raw: int,
         timeout_seconds: int = 21_600,
         poll_seconds: int = 60,
     ) -> str | None:
@@ -67,8 +93,26 @@ class BitgetClient:
                 start_ms=started_ms,
                 end_ms=int(time.time() * 1000),
                 coin=coin,
+                chain=chain,
+                recipient=recipient,
+                minimum_raw=minimum_raw,
             )
-            if status is not None:
+            if _is_credited_status(status):
                 return status
             time.sleep(poll_seconds)
         return None
+
+
+def _record_raw_amount(record: dict, coin: str) -> int:
+    decimals = _COIN_DECIMALS.get(coin)
+    if decimals is None:
+        return -1
+    try:
+        raw = Decimal(str(record["size"])) * (10**decimals)
+    except (InvalidOperation, KeyError, ValueError):
+        return -1
+    if not raw.is_finite():
+        return -1
+    if raw != raw.to_integral_value():
+        return -1
+    return int(raw)

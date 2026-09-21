@@ -56,8 +56,20 @@ def test_journal_records_approval_completed_route_deferred_hash_and_reason(tmp_p
         row = journal.operation(operation_id)
 
     assert row["state"] == "approval_completed_route_deferred"
-    assert row["tx_hash"] == approval_hash
+    assert row["tx_hash"] is None
+    assert row["approval_tx_hash"] == approval_hash
     assert row["reason"] == "insufficient native gas for deposit"
+
+
+def test_journal_retains_approval_hash_separately_from_final_transaction(tmp_path):
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        operation_id = journal.create_operation(wallet="0x" + "1" * 40, action="route_ready")
+        journal.record_approval_hash(operation_id, "0x" + "a" * 64)
+        journal.record_transaction(operation_id, "0x" + "b" * 64)
+        row = journal.operation(operation_id)
+
+    assert row["approval_tx_hash"] == "0x" + "a" * 64
+    assert row["tx_hash"] == "0x" + "b" * 64
 
 
 def test_deposit_status_does_not_overwrite_deferred_terminal_states(tmp_path):
@@ -103,4 +115,5 @@ def test_transaction_does_not_overwrite_deferred_terminal_states(tmp_path):
     assert deferred["tx_hash"] is None
     assert route_deferred["state"] == "approval_completed_route_deferred"
     assert route_deferred["reason"] == "insufficient native gas for deposit"
-    assert route_deferred["tx_hash"] == "0x" + "a" * 64
+    assert route_deferred["tx_hash"] is None
+    assert route_deferred["approval_tx_hash"] == "0x" + "a" * 64

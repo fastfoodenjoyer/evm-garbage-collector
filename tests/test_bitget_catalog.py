@@ -15,4 +15,5 @@ def test_deposit_targets_only_include_enabled_supported_evm_chains():
 
     assert len(targets) == 1
     assert targets[0].chain_id == 8453
+    assert targets[0].chain == "BASE"
     assert targets[0].minimum_raw == 9_997

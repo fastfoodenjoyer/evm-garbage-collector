@@ -205,6 +205,7 @@ def _target_data(target: BitgetDepositTarget) -> dict:
     return {
         "coin": target.coin,
         "chain_id": target.chain_id,
+        "chain": target.chain,
         "asset_id": target.asset_id,
         "minimum_raw": str(target.minimum_raw),
     }

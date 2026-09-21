@@ -365,7 +365,8 @@ def test_batch_records_partial_approval_and_continues_after_deferred_route(monke
 
     with Journal(tmp_path / "journal.sqlite") as journal:
         assert journal.operation(1)["state"] == "approval_completed_route_deferred"
-        assert journal.operation(1)["tx_hash"] == "0x" + "a" * 64
+        assert journal.operation(1)["tx_hash"] is None
+        assert journal.operation(1)["approval_tx_hash"] == "0x" + "a" * 64
         assert journal.operation(2)["state"] == "completed"
 
 
@@ -415,6 +416,94 @@ def test_batch_continues_after_real_initial_gas_deferral_without_first_signature
         assert journal.operation(2)["state"] == "completed"
 
 
+def test_wallet_settled_route_is_staged_without_calling_bitget(monkeypatch, tmp_path):
+    wallet = _wallet()
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry", lambda *args, **kwargs: "0x" + "b" * 64
+    )
+
+    class Bitget:
+        def wait_for_deposit(self, **kwargs):
+            raise AssertionError("wallet-settled bridge must not be checked at Bitget")
+
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: Bitget())
+
+    summary = execute_entries(
+        [{**_route_entry(wallet.public_address), "settlement": "wallet"}],
+        wallets={wallet.public_address.lower(): wallet}, rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite", execute=True,
+        delay_min_seconds=0, delay_max_seconds=0,
+    )
+
+    assert summary == {"submitted": 1, "skipped": 0, "failed": 0, "deferred": 0}
+    from evm_inventory.journal import Journal
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        assert journal.operation(1)["deposit_status"] == "staged"
+
+
+def test_final_deposit_passes_exact_target_identity_to_bitget(monkeypatch, tmp_path):
+    wallet = _wallet()
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry", lambda *args, **kwargs: "0x" + "b" * 64
+    )
+    bitget = _Bitget()
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: bitget)
+    entry = {
+        **_direct_entry(wallet.public_address), "status": "post_bridge_deposit",
+        "target": {"coin": "USDC", "chain": "BASE", "minimum_raw": "9997"},
+    }
+
+    execute_entries(
+        [entry], wallets={wallet.public_address.lower(): wallet}, rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite", execute=True,
+        delay_min_seconds=0, delay_max_seconds=0,
+    )
+
+    assert bitget.calls[0]["chain"] == "BASE"
+    assert bitget.calls[0]["recipient"] == wallet.bitget_deposit_address
+    assert bitget.calls[0]["minimum_raw"] == 9997
+
+
+def test_bitget_api_failure_is_journaled_as_execution_failed(monkeypatch, tmp_path):
+    wallet = _wallet()
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry", lambda *args, **kwargs: "0x" + "b" * 64
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._bitget_client", lambda: _Bitget(RuntimeError("api"))
+    )
+
+    summary = execute_entries(
+        [_direct_entry(wallet.public_address)], wallets={wallet.public_address.lower(): wallet},
+        rpc_urls={1: "https://rpc"}, journal_path=tmp_path / "journal.sqlite", execute=True,
+        delay_min_seconds=0, delay_max_seconds=0,
+    )
+
+    assert summary["failed"] == 1
+    from evm_inventory.journal import Journal
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        assert journal.operation(1)["deposit_status"] == "execution_failed"
+
+
+def test_final_deposit_missing_exchange_chain_is_rejected_before_execution(monkeypatch, tmp_path):
+    wallet = _wallet()
+    executed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda *args, **kwargs: executed.append(True),
+    )
+
+    with pytest.raises(ValueError, match="exchange chain"):
+        execute_entries(
+            [{**_direct_entry(wallet.public_address), "target": {"coin": "ETH", "minimum_raw": 1}}],
+            wallets={wallet.public_address.lower(): wallet}, rpc_urls={1: "https://rpc"},
+            journal_path=tmp_path / "journal.sqlite", execute=True,
+            delay_min_seconds=0, delay_max_seconds=0,
+        )
+
+    assert executed == []
+
+
 def _wallet():
     key = "0x" + "1" * 64
     return WalletWorkbookRow(2, 1, Account.from_key(key).address.lower(), key, "0x" + "2" * 40)
@@ -426,7 +515,7 @@ def _direct_entry(wallet):
         "wallet": wallet,
         "chain_id": 1,
         "asset_id": "native",
-        "target": {"minimum_raw": 1, "coin": "ETH"},
+        "target": {"minimum_raw": 1, "coin": "ETH", "chain": "ETH"},
     }
 
 
@@ -449,5 +538,12 @@ def _raise_or_return(value):
 
 
 class _Bitget:
+    def __init__(self, outcome="success"):
+        self.outcome = outcome
+        self.calls = []
+
     def wait_for_deposit(self, **kwargs):
-        return "success"
+        self.calls.append(kwargs)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome

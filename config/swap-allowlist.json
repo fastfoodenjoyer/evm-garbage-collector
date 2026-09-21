@@ -36,6 +36,7 @@
     {"chain_id": 42220, "network": "Celo", "asset_id": "0x471ece3750da237f93b8e339c536989b8978a438", "symbol": "CELO", "action": "review"},
     {"chain_id": 42220, "network": "Celo", "asset_id": "0xc16b81af351ba9e64c1a069e3ab18c244a1e3049", "symbol": "EURA", "action": "swap"},
     {"chain_id": 57073, "network": "Ink", "asset_id": "0xf1815bd50389c46847f0bda824ec8da914045d14", "symbol": "USDC.e", "action": "swap"},
+    {"chain_id": 81457, "network": "Blast", "asset_id": "0x000000daa580e54635a043d2773f2c698593836a", "symbol": "OHNO", "action": "swap"},
     {"chain_id": 81457, "network": "Blast", "asset_id": "0x2416092f143378750bb29b79ed961ab195cceea5", "symbol": "ezETH", "action": "swap"},
     {"chain_id": 81457, "network": "Blast", "asset_id": "0xb1a5700fa2358173fe465e6ea4ff52e36e88e2ad", "symbol": "BLAST", "action": "review"},
     {"chain_id": 1868, "network": "Soneium", "asset_id": "0xba9986d2381edf1da03b0b9c1f8b00dc4aacc369", "symbol": "USDC.e", "action": "swap"}
