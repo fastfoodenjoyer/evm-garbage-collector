@@ -107,6 +107,19 @@ def require_ethereum_gas_below_limit(
             "ethereum_gas_deferred:source=rpc;"
             f"value_wei={rpc_gas_price};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
         )
+    require_ethereum_planned_gas_price_valid(request)
+    if request.gas_price_wei >= ETHEREUM_GAS_LIMIT_WEI:
+        raise EthereumGasDeferred(
+            "ethereum_gas_deferred:source=plan;"
+            f"value_wei={request.gas_price_wei};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
+        )
+
+
+def require_ethereum_planned_gas_price_valid(request: TransactionRequest) -> None:
+    """Reject malformed planned Ethereum gas before arithmetic can use it."""
+
+    if request.chain_id != 1:
+        return
     if (
         isinstance(request.gas_price_wei, bool)
         or not isinstance(request.gas_price_wei, int)
@@ -114,11 +127,6 @@ def require_ethereum_gas_below_limit(
     ):
         raise EthereumGasDeferred(
             "ethereum_gas_deferred:source=plan_error;threshold_wei=500000000"
-        )
-    if request.gas_price_wei >= ETHEREUM_GAS_LIMIT_WEI:
-        raise EthereumGasDeferred(
-            "ethereum_gas_deferred:source=plan;"
-            f"value_wei={request.gas_price_wei};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
         )
 
 

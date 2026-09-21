@@ -122,7 +122,7 @@ def test_ethereum_guard_does_not_probe_non_ethereum_requests():
 
 def test_direct_deposit_is_guarded_before_signing(monkeypatch):
     wallet = _wallet()
-    rpc = _Rpc(["0x1", "0x100000", "0x100000", "0x1", "0x1dcd6500"])
+    rpc = _Rpc(["0x1", "0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500"])
     signed = []
     monkeypatch.setattr(
         "evm_inventory.route_execution.sign_transaction",
@@ -135,6 +135,124 @@ def test_direct_deposit_is_guarded_before_signing(monkeypatch):
             wallet=wallet,
             rpc=rpc,
             jumper=object(),
+            rpc_urls={1: "https://rpc"},
+        )
+
+    assert signed == []
+    assert "eth_sendRawTransaction" not in rpc.calls
+    assert rpc.calls[-2:] == ["eth_chainId", "eth_gasPrice"]
+
+
+@pytest.mark.parametrize("chain_id", ["not-a-quantity", "0x2"])
+def test_direct_deposit_rejects_bad_ethereum_chain_identity_before_signing(monkeypatch, chain_id):
+    wallet = _wallet()
+    rpc = _Rpc(["0x1", "0x100000", "0x100000", "0x0", chain_id])
+    signed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda *args, **kwargs: signed.append(args),
+    )
+
+    with pytest.raises(EthereumGasDeferred):
+        _execute_entry(
+            entry=_direct_entry(wallet.public_address),
+            wallet=wallet,
+            rpc=rpc,
+            jumper=object(),
+            rpc_urls={1: "https://rpc"},
+        )
+
+    assert signed == []
+    assert "eth_sendRawTransaction" not in rpc.calls
+
+
+@pytest.mark.parametrize("gas_price", ["invalid", -1])
+def test_invalid_ethereum_planned_gas_price_defers_before_signing(monkeypatch, gas_price):
+    wallet = _wallet()
+    request = TransactionRequest(1, "0x" + "4" * 40, "0x", 0, 21_000, gas_price)
+    signed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
+    )
+    monkeypatch.setattr("evm_inventory.route_execution.pending_nonce", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda *args, **kwargs: signed.append(args),
+    )
+    jumper = type("Jumper", (), {"step_transaction": lambda self, step: request})()
+    rpc = _Rpc([])
+
+    with pytest.raises(EthereumGasDeferred):
+        _execute_entry(
+            entry={**_route_entry(wallet.public_address), "asset_id": "native"},
+            wallet=wallet,
+            rpc=rpc,
+            jumper=jumper,
+            rpc_urls={1: "https://rpc"},
+        )
+
+    assert signed == []
+    assert "eth_sendRawTransaction" not in rpc.calls
+
+
+@pytest.mark.parametrize("approval_gas_price", ["invalid", -1])
+def test_invalid_approval_gas_price_defers_before_signing(monkeypatch, approval_gas_price):
+    wallet = _wallet()
+    request = TransactionRequest(1, "0x" + "4" * 40, "0x", 0, 21_000, 1)
+    signed = []
+    monkeypatch.setattr("evm_inventory.route_execution.token_allowance", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
+    )
+    monkeypatch.setattr("evm_inventory.route_execution.pending_nonce", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.approve_transaction",
+        lambda **kwargs: TransactionRequest(
+            1, "0x" + "3" * 40, "0x", 0, 100_000, approval_gas_price
+        ),
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda *args, **kwargs: signed.append(args),
+    )
+    jumper = type("Jumper", (), {"step_transaction": lambda self, step: request})()
+    rpc = _Rpc([])
+
+    with pytest.raises(EthereumGasDeferred):
+        _execute_entry(
+            entry=_route_entry(wallet.public_address),
+            wallet=wallet,
+            rpc=rpc,
+            jumper=jumper,
+            rpc_urls={1: "https://rpc"},
+        )
+
+    assert signed == []
+    assert "eth_sendRawTransaction" not in rpc.calls
+
+
+def test_approval_gas_deferral_does_not_sign_or_broadcast(monkeypatch):
+    wallet = _wallet()
+    request = TransactionRequest(1, "0x" + "4" * 40, "0x", 0, 21_000, 1)
+    rpc = _Rpc(["0x1", "0x1dcd6500"])
+    signed = []
+    monkeypatch.setattr("evm_inventory.route_execution.token_allowance", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
+    )
+    monkeypatch.setattr("evm_inventory.route_execution.pending_nonce", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda *args, **kwargs: signed.append(args),
+    )
+    jumper = type("Jumper", (), {"step_transaction": lambda self, step: request})()
+
+    with pytest.raises(EthereumGasDeferred):
+        _execute_entry(
+            entry=_route_entry(wallet.public_address),
+            wallet=wallet,
+            rpc=rpc,
+            jumper=jumper,
             rpc_urls={1: "https://rpc"},
         )
 
@@ -248,6 +366,52 @@ def test_batch_records_partial_approval_and_continues_after_deferred_route(monke
     with Journal(tmp_path / "journal.sqlite") as journal:
         assert journal.operation(1)["state"] == "approval_completed_route_deferred"
         assert journal.operation(1)["tx_hash"] == "0x" + "a" * 64
+        assert journal.operation(2)["state"] == "completed"
+
+
+def test_batch_continues_after_real_initial_gas_deferral_without_first_signature(
+    monkeypatch, tmp_path
+):
+    wallet = _wallet()
+    rpc = _Rpc(
+        [
+            "0x1", "0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500",  # deferred first
+            "0x1", "0x100000", "0x100000", "0x1", "0x1", "0x1",  # accepted second
+            "0x" + "b" * 64, {"status": "0x1"},
+        ]
+    )
+    monkeypatch.setattr("evm_inventory.route_execution.ExecutionRpc", lambda transport: rpc)
+    monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
+    signed = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda request, **kwargs: signed.append(request)
+        or sign_transaction(
+            request,
+            private_key=wallet.private_key,
+            expected_sender=wallet.public_address,
+            nonce=0,
+        ),
+    )
+
+    summary = execute_entries(
+        [_direct_entry(wallet.public_address), _direct_entry(wallet.public_address)],
+        wallets={wallet.public_address.lower(): wallet},
+        rpc_urls={1: "https://rpc"},
+        journal_path=tmp_path / "journal.sqlite",
+        execute=True,
+        delay_min_seconds=0,
+        delay_max_seconds=0,
+    )
+
+    assert summary == {"submitted": 1, "skipped": 0, "failed": 0, "deferred": 1}
+    assert len(signed) == 1
+    assert rpc.calls.count("eth_sendRawTransaction") == 1
+    from evm_inventory.journal import Journal
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        assert journal.operation(1)["state"] == "deferred"
+        assert journal.operation(1)["tx_hash"] is None
         assert journal.operation(2)["state"] == "completed"
 
 

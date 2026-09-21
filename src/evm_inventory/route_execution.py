@@ -17,6 +17,7 @@ from .executor import (
     broadcast_signed_transaction,
     pending_nonce,
     require_ethereum_gas_below_limit,
+    require_ethereum_planned_gas_price_valid,
     require_native_reserve,
     sign_transaction,
     token_allowance,
@@ -70,7 +71,7 @@ def execute_entries(
                     try:
                         started_ms = int(time.time() * 1000)
                         tx_hash = _execute_entry(
-                            entry,
+                            entry=entry,
                             wallet=source,
                             rpc=rpc,
                             jumper=jumper,
@@ -124,6 +125,7 @@ def _execute_entry(
         request = _direct_request(entry, wallet=wallet, rpc=rpc, url=url)
     if request.chain_id != chain_id:
         raise ValueError("route transaction chain does not match source balance")
+    require_ethereum_planned_gas_price_valid(request)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     require_native_reserve(
         balance=balance - request.value,
@@ -218,6 +220,7 @@ def _approve_if_needed(
         amount=amount,
         gas_price_wei=request.gas_price_wei,
     )
+    require_ethereum_planned_gas_price_valid(approval)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     require_native_reserve(balance=balance, gas_cost=approval.gas_limit * approval.gas_price_wei)
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
