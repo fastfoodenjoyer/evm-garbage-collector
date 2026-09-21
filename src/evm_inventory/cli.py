@@ -11,7 +11,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .config import load_catalog, load_wallets, snapshot, validate_delays
+from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot, validate_delays
 from .live_plan import create_live_plan
 from .models import ConfigError
 from .report import export_run
@@ -225,8 +225,12 @@ def main(argv=None):
                 "discovery_enabled": key_present and not args.no_discovery,
             }
             scope = snapshot(catalog, wallets, settings)
+            if args.catalog is None:
+                scope = add_allowlisted_tokens(scope, Path("config/swap-allowlist.json"))
             if args.dry_run:
-                checks_per_wallet = sum(1 + len(network.tokens) for network in catalog.networks)
+                checks_per_wallet = sum(
+                    1 + len(network["tokens"]) for network in scope["catalog"]["networks"]
+                )
                 result = {
                     "wallets": len(wallets),
                     "networks": len(catalog.networks),

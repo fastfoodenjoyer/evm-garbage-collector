@@ -10,6 +10,7 @@ import pytest
 
 from evm_inventory.config import (
     ConfigError,
+    add_allowlisted_tokens,
     format_amount,
     load_catalog,
     load_wallets,
@@ -220,6 +221,28 @@ def test_snapshot_is_json_friendly_and_hash_is_canonical() -> None:
             "catalog": value["catalog"],
         }
     )
+
+
+def test_allowlisted_contracts_are_added_to_mandatory_scan_scope(tmp_path: Path) -> None:
+    policy = tmp_path / "allowlist.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "assets": [
+                    {"chain_id": 1, "asset_id": "native", "symbol": "ETH"},
+                    {"chain_id": 1, "asset_id": "0x" + "b" * 40, "symbol": "TOKEN"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    scope = snapshot(_catalog(_network()), ("0x" + "1" * 40,), {})
+
+    got = add_allowlisted_tokens(scope, policy)
+
+    assert got["catalog"]["networks"][0]["tokens"] == [
+        {"address": "0x" + "b" * 40, "symbol": "TOKEN", "source": str(policy)}
+    ]
 
 
 def test_format_amount_is_exact_and_unknown_decimals_are_none() -> None:

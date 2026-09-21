@@ -241,6 +241,42 @@ def snapshot(
     )
 
 
+def add_allowlisted_tokens(scope: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Make every exact non-native execution asset a mandatory RPC check.
+
+    Token decimals are deliberately omitted here: the RPC reader obtains them
+    from the contract, avoiding guessed metadata in a safety boundary.
+    """
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot read execution allowlist {path}") from exc
+    assets = data.get("assets") if isinstance(data, dict) else None
+    if not isinstance(assets, list):
+        raise ConfigError("execution allowlist assets must be an array")
+    copied = _jsonable(scope)
+    networks = {item["chain_id"]: item for item in copied["catalog"]["networks"]}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise ConfigError("execution allowlist asset must be an object")
+        chain_id, address = asset.get("chain_id"), asset.get("asset_id")
+        if address == "native":
+            continue
+        if not isinstance(chain_id, int) or not isinstance(address, str):
+            raise ConfigError("execution allowlist asset has invalid chain or address")
+        network = networks.get(chain_id)
+        if network is None:
+            raise ConfigError(f"execution allowlist chain {chain_id} is absent from catalog")
+        address = address.lower()
+        if any(token["address"].lower() == address for token in network["tokens"]):
+            continue
+        network["tokens"].append(
+            {"address": address, "symbol": str(asset.get("symbol", address)), "source": str(path)}
+        )
+    return copied
+
+
 def snapshot_hash(value: Mapping[str, Any], wallets: Any = None, settings: Any = None) -> str:
     """Hash a canonical snapshot; the optional arguments support the 3-value shorthand."""
 
