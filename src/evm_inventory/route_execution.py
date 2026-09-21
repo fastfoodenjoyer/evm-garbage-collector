@@ -40,6 +40,7 @@ def execute_entries(
     delay_max_seconds: int = 10800,
     sleep=time.sleep,
     rng: random.Random | None = None,
+    wallet_batches: tuple[tuple[str, ...], ...] | None = None,
 ) -> dict[str, int]:
     """Execute one wallet at a time; refuses unless the caller set ``execute=True``."""
 
@@ -59,49 +60,58 @@ def execute_entries(
             by_wallet.setdefault(str(entry["wallet"]).lower(), []).append(entry)
     try:
         with Journal(journal_path) as journal:
-            for wallet, wallet_entries in sorted(by_wallet.items()):
-                source = wallets.get(wallet)
-                if source is None:
-                    summary["skipped"] += len(wallet_entries)
-                    continue
-                for entry in wallet_entries:
-                    operation_id = journal.create_operation(
-                        wallet=wallet, action=str(entry["status"])
-                    )
-                    try:
-                        started_ms = int(time.time() * 1000)
-                        tx_hash = _execute_entry(
-                            entry=entry,
-                            wallet=source,
-                            rpc=rpc,
-                            jumper=jumper,
-                            rpc_urls=rpc_urls,
+            batches = wallet_batches or (tuple(sorted(by_wallet)),)
+            for batch_index, batch in enumerate(batches):
+                wallet_order = list(batch)
+                rng.shuffle(wallet_order)
+                for wallet in wallet_order:
+                    wallet_entries = by_wallet.get(wallet, [])
+                    if not wallet_entries:
+                        continue
+                    source = wallets.get(wallet)
+                    if source is None:
+                        summary["skipped"] += len(wallet_entries)
+                        continue
+                    for entry in wallet_entries:
+                        operation_id = journal.create_operation(
+                            wallet=wallet, action=str(entry["status"])
                         )
-                        journal.record_transaction(operation_id, tx_hash)
-                        if entry.get("settlement") == "wallet":
-                            journal.record_deposit_status(operation_id, "staged")
-                        else:
-                            status = bitget.wait_for_deposit(
-                                tx_hash=tx_hash,
-                                started_ms=started_ms,
-                                coin=str(entry["target"]["coin"]),
+                        try:
+                            started_ms = int(time.time() * 1000)
+                            tx_hash = _execute_entry(
+                                entry=entry,
+                                wallet=source,
+                                rpc=rpc,
+                                jumper=jumper,
+                                rpc_urls=rpc_urls,
                             )
-                            journal.record_deposit_status(
-                                operation_id, (status or "timeout").lower()
-                            )
-                        summary["submitted"] += 1
-                    except EthereumGasDeferred as exc:
-                        if exc.approval_tx_hash is None:
-                            journal.record_deferred(operation_id, exc.reason)
-                        else:
-                            journal.record_approval_completed_route_deferred(
-                                operation_id, exc.approval_tx_hash, exc.reason
-                            )
-                        summary["deferred"] += 1
-                    except Exception:
-                        journal.record_deposit_status(operation_id, "execution_failed")
-                        summary["failed"] += 1
-                if wallet != sorted(by_wallet)[-1]:
+                            journal.record_transaction(operation_id, tx_hash)
+                            if entry.get("settlement") == "wallet":
+                                journal.record_deposit_status(operation_id, "staged")
+                            else:
+                                status = bitget.wait_for_deposit(
+                                    tx_hash=tx_hash,
+                                    started_ms=started_ms,
+                                    coin=str(entry["target"]["coin"]),
+                                )
+                                journal.record_deposit_status(
+                                    operation_id, (status or "timeout").lower()
+                                )
+                            summary["submitted"] += 1
+                        except EthereumGasDeferred as exc:
+                            if exc.approval_tx_hash is None:
+                                journal.record_deferred(operation_id, exc.reason)
+                            else:
+                                journal.record_approval_completed_route_deferred(
+                                    operation_id, exc.approval_tx_hash, exc.reason
+                                )
+                            summary["deferred"] += 1
+                        except Exception:
+                            journal.record_deposit_status(operation_id, "execution_failed")
+                            summary["failed"] += 1
+                    if wallet != wallet_order[-1]:
+                        sleep(rng.randint(delay_min_seconds, delay_max_seconds))
+                if batch_index != len(batches) - 1 and batch:
                     sleep(rng.randint(delay_min_seconds, delay_max_seconds))
     finally:
         transport.close()

@@ -23,6 +23,7 @@ After an inventory export, make a live but read-only plan:
 uv run evm-inventory quote-routes \
   --balances local/fresh-report/balances.csv \
   --workbook local/wallets.xlsx \
+  --wallet-ranges 1-50,75,100-120 \
   --output local/route-plan.json
 ```
 
@@ -35,8 +36,8 @@ combined `toAmountMin` meets Bitget's current minimum. Amounts below 0.01 tokens
 classified as dust before a route request. Quotes and plans do not read, subtract, or
 otherwise evaluate gas.
 
-To broadcast the saved plan, use the separate command below. It processes wallets in
-order, waits a random 30–180 minutes between wallets, signs only with the matching
+To broadcast the saved plan, use the separate command below. It processes selected
+workbook ordinals, waits a random 30–180 minutes between wallets, signs only with the matching
 workbook key, verifies the transaction-time 5× native-gas reserve, uses exact ERC-20
 approvals when a Jumper step requires one, waits for the source-chain receipt, and records each action
 in the SQLite journal. It then polls the signed Bitget deposit API for the resulting
@@ -47,12 +48,18 @@ transaction hash. This requires `BITGET_API_KEY`, `BITGET_SECRET_KEY`, and
 uv run evm-inventory execute-routes \
   --plan local/route-plan.json \
   --workbook local/wallets.xlsx \
+  --wallet-ranges 1-50,75,100-120 \
   --catalog local/rpc-allowlist-final-catalog.json \
   --journal local/execution-journal.sqlite \
   --execute
 ```
 
 Public RPC endpoints can rate-limit or be unavailable. The reports distinguish zero balances, errors and unverified coverage. The packaged catalog is a dated snapshot and does not claim exhaustive ERC-20 discovery. Reading balances has no gas cost; the future collection phase will be a separate transaction-signing feature.
+
+`--wallet-ranges` uses inclusive workbook ordinals (`1-50,75,100-120`). Each range is
+treated as its own batch: balances and quotes retain workbook order, while the executor
+randomizes wallet order inside each batch immediately before sending transactions. Omitted
+ranges select the whole workbook as one batch.
 
 See [network and token coverage](docs/coverage.md) for current gaps. The default catalog has 37 networks, 43 stablecoin contracts, and 13 verified Alchemy Portfolio mappings. For 150 wallets this means 12,000 mandatory balance checks, plus additional discovered tokens. A balance check can require several HTTP requests; the dry-run number is not an HTTP request or CU estimate. Prices may be unavailable.
 

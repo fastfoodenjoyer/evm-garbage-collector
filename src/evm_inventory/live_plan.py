@@ -28,6 +28,7 @@ def create_live_plan(
     quote_floor: str = "0.01",
     client: QuoteClient | None = None,
     targets: tuple[BitgetDepositTarget, ...] | None = None,
+    wallet_addresses: set[str] | None = None,
 ) -> dict:
     """Quote only allowlisted balances and retain routes to a wallet-owned staging balance.
 
@@ -42,6 +43,11 @@ def create_live_plan(
     counts: Counter[str] = Counter()
     with balances_path.open(newline="") as stream:
         for row in csv.DictReader(stream):
+            if (
+                wallet_addresses is not None
+                and row.get("wallet", "").lower() not in wallet_addresses
+            ):
+                continue
             if row.get("status") != "success" or int(row["raw_balance"]) <= 0:
                 continue
             status, item = _quote_row(

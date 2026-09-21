@@ -7,9 +7,12 @@ from evm_inventory.models import ConfigError
 from evm_inventory.workbook import (
     WORKSHEET_HEADERS,
     WORKSHEET_NAME,
+    WalletWorkbookRow,
     create_wallet_template,
     dry_run_workbook,
     load_wallet_workbook,
+    parse_ordinal_ranges,
+    wallet_range_batches,
 )
 
 
@@ -64,3 +67,29 @@ def test_read_only_planning_accepts_blank_deposit_address(tmp_path: Path):
     rows = load_wallet_workbook(output, require_deposit_address=False)
 
     assert rows[0].bitget_deposit_address == ""
+
+
+def test_parse_ranges_and_group_rows():
+    assert parse_ordinal_ranges("1-2, 5, 8-9") == ((1, 2), (5, 5), (8, 9))
+    rows = tuple(
+        WalletWorkbookRow(index + 2, ordinal, f"0x{ordinal:040x}", "0x" + "a" * 64, "")
+        for index, ordinal in enumerate((1, 2, 5, 8, 9))
+    )
+    batches = wallet_range_batches(rows, parse_ordinal_ranges("1-2,8-9"))
+    assert [[row.ordinal for row in batch] for batch in batches] == [[1, 2], [8, 9]]
+
+
+def test_selected_workbook_range_ignores_invalid_unselected_rows(tmp_path: Path):
+    output = tmp_path / "wallets.xlsx"
+    create_wallet_template(output)
+    workbook = load_workbook(output)
+    workbook[WORKSHEET_NAME].append([1, "0x" + "b" * 40, "0x" + "a" * 64, "0x" + "c" * 40])
+    workbook[WORKSHEET_NAME].append([2, "not-an-address", "bad-key", ""])
+    workbook.save(output)
+
+    rows = load_wallet_workbook(
+        output,
+        ordinal_ranges=parse_ordinal_ranges("1"),
+    )
+
+    assert [row.ordinal for row in rows] == [1]

@@ -19,7 +19,13 @@ from .route_execution import execute_entries
 from .runbook import create_route_plan
 from .scanner import scan
 from .store import Store
-from .workbook import create_wallet_template, dry_run_workbook, load_wallet_workbook
+from .workbook import (
+    create_wallet_template,
+    dry_run_workbook,
+    load_wallet_workbook,
+    parse_ordinal_ranges,
+    wallet_range_batches,
+)
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -117,12 +123,20 @@ def main(argv=None):
         quote_routes_parser.add_argument("--output", required=True)
         quote_routes_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
         quote_routes_parser.add_argument("--quote-floor", default="0.01")
+        quote_routes_parser.add_argument(
+            "--wallet-ranges",
+            help="inclusive workbook ordinals, e.g. 1-50,75,100-120",
+        )
         execute_parser = sub.add_parser("execute-routes")
         execute_parser.add_argument("--plan", required=True)
         execute_parser.add_argument("--workbook", required=True)
         execute_parser.add_argument("--catalog", required=True)
         execute_parser.add_argument("--journal", required=True)
         execute_parser.add_argument("--execute", action="store_true")
+        execute_parser.add_argument(
+            "--wallet-ranges",
+            help="inclusive workbook ordinals, e.g. 1-50,75,100-120",
+        )
         args = parser.parse_args(argv)
 
         if args.cmd == "workbook-template":
@@ -139,9 +153,13 @@ def main(argv=None):
             print(json.dumps({"status": "planned", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "quote-routes":
+            ordinal_ranges = parse_ordinal_ranges(args.wallet_ranges)
             wallet_rows = load_wallet_workbook(
-                Path(args.workbook), require_deposit_address=False
+                Path(args.workbook),
+                require_deposit_address=False,
+                ordinal_ranges=ordinal_ranges,
             )
+            wallet_range_batches(wallet_rows, ordinal_ranges)
             addresses = {
                 item.public_address: item.bitget_deposit_address for item in wallet_rows
             }
@@ -150,27 +168,42 @@ def main(argv=None):
                 deposit_addresses=addresses,
                 allowlist_path=Path(args.allowlist),
                 quote_floor=args.quote_floor,
+                wallet_addresses=set(addresses),
             )
             Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
             print(json.dumps({"status": "quoted", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "execute-routes":
+            ordinal_ranges = parse_ordinal_ranges(args.wallet_ranges)
             plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
             if not isinstance(plan, dict) or not isinstance(plan.get("entries"), list):
                 raise ConfigError("invalid route plan")
             catalog = load_catalog(Path(args.catalog))
             rpc_urls = _execution_rpc_urls(catalog)
-            wallet_rows = load_wallet_workbook(Path(args.workbook))
+            wallet_rows = load_wallet_workbook(
+                Path(args.workbook), ordinal_ranges=ordinal_ranges
+            )
+            batches = wallet_range_batches(wallet_rows, ordinal_ranges)
             wallet_map = {item.public_address: item for item in wallet_rows}
+            selected_wallets = set(wallet_map)
+            entries = [
+                entry
+                for entry in plan["entries"]
+                if str(entry.get("wallet", "")).lower() in selected_wallets
+            ]
+            wallet_batches = tuple(
+                tuple(row.public_address for row in batch) for batch in batches
+            )
             execution = plan.get("execution", {})
             summary = execute_entries(
-                plan["entries"],
+                entries,
                 wallets=wallet_map,
                 rpc_urls=rpc_urls,
                 journal_path=Path(args.journal),
                 execute=args.execute,
                 delay_min_seconds=int(execution.get("delay_min_seconds", 1800)),
                 delay_max_seconds=int(execution.get("delay_max_seconds", 10800)),
+                wallet_batches=wallet_batches,
             )
             print(json.dumps({"status": "finished", **summary}))
             return 0

@@ -22,6 +22,7 @@ WORKSHEET_HEADERS = (
 )
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_ORDINAL_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,54 @@ class WalletWorkbookRow:
     public_address: str
     private_key: str = field(repr=False)
     bitget_deposit_address: str
+
+
+def parse_ordinal_ranges(spec: str | None) -> tuple[tuple[int, int], ...] | None:
+    """Parse inclusive ordinal ranges such as ``1-50,75,100-120``."""
+
+    if spec is None:
+        return None
+    parts = [part.strip() for part in spec.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ConfigError("wallet ranges must be comma-separated positive numbers or ranges")
+    ranges: list[tuple[int, int]] = []
+    for part in parts:
+        match = _ORDINAL_RANGE_RE.fullmatch(part)
+        if match is None:
+            raise ConfigError(f"invalid wallet range {part!r}")
+        start = int(match.group(1))
+        end = int(match.group(2) or match.group(1))
+        if start <= 0 or end <= 0 or end < start:
+            raise ConfigError(f"invalid wallet range {part!r}")
+        ranges.append((start, end))
+    for index, current in enumerate(ranges):
+        for previous in ranges[:index]:
+            if current[0] <= previous[1] and previous[0] <= current[1]:
+                raise ConfigError("wallet ranges must not overlap")
+    return tuple(ranges)
+
+
+def wallet_range_batches(
+    rows: tuple[WalletWorkbookRow, ...],
+    ranges: tuple[tuple[int, int], ...] | None,
+) -> tuple[tuple[WalletWorkbookRow, ...], ...]:
+    """Return selected rows grouped by requested ranges, preserving sheet order."""
+
+    if ranges is None:
+        return (rows,)
+    batches: list[tuple[WalletWorkbookRow, ...]] = []
+    found: set[int] = set()
+    for start, end in ranges:
+        batch = tuple(row for row in rows if start <= row.ordinal <= end)
+        found.update(row.ordinal for row in batch)
+        batches.append(batch)
+    requested = {ordinal for start, end in ranges for ordinal in range(start, end + 1)}
+    missing = sorted(requested - found)
+    if missing:
+        preview = ", ".join(str(item) for item in missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise ConfigError(f"wallet ordinal(s) not found in workbook: {preview}{suffix}")
+    return tuple(batches)
 
 
 def create_wallet_template(path: Path) -> None:
@@ -57,7 +106,10 @@ def _required_string(value: object, *, row_number: int, field_name: str) -> str:
 
 
 def load_wallet_workbook(
-    path: Path, *, require_deposit_address: bool = True
+    path: Path,
+    *,
+    require_deposit_address: bool = True,
+    ordinal_ranges: tuple[tuple[int, int], ...] | None = None,
 ) -> tuple[WalletWorkbookRow, ...]:
     """Read and validate operator input without persisting private keys."""
 
@@ -83,6 +135,10 @@ def load_wallet_workbook(
             ordinal = values[0]
             if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal <= 0:
                 raise ConfigError(f"row {row_number}: # must be a positive integer")
+            if ordinal_ranges is not None and not any(
+                start <= ordinal <= end for start, end in ordinal_ranges
+            ):
+                continue
             if ordinal in seen_ordinals:
                 raise ConfigError(f"row {row_number}: duplicate # {ordinal}")
             public_address = _required_string(
