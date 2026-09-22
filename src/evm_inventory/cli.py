@@ -14,7 +14,7 @@ from pathlib import Path
 from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot, validate_delays
 from .live_plan import create_live_plan
 from .models import ConfigError
-from .report import export_run
+from .report import export_current
 from .route_execution import execute_entries
 from .runbook import create_route_plan
 from .scanner import scan
@@ -103,11 +103,7 @@ def main(argv=None):
         scan_parser.add_argument("--interval", type=float, default=1)
         scan_parser.add_argument("--no-discovery", action="store_true")
         scan_parser.add_argument("--dry-run", action="store_true")
-        resume_parser = sub.add_parser("resume")
-        resume_parser.add_argument("--run", required=True)
-        resume_parser.add_argument("--db", required=True)
         export_parser = sub.add_parser("export")
-        export_parser.add_argument("--run", required=True)
         export_parser.add_argument("--db", required=True)
         export_parser.add_argument("--output", required=True)
         template_parser = sub.add_parser("workbook-template")
@@ -210,7 +206,7 @@ def main(argv=None):
             return 0
         if args.cmd == "export":
             with Store(args.db, readonly=True) as store:
-                export_run(store, args.run, Path(args.output))
+                export_current(store, Path(args.output))
             return 0
         if args.cmd == "scan":
             wallets = load_wallets(Path(args.wallets))
@@ -239,23 +235,9 @@ def main(argv=None):
                 print(json.dumps(_summary(result, catalog, key_present=key_present)))
                 return 0
             with Store(args.db) as store:
-                run_id = store.create_run(scope)
-                print(
-                    json.dumps({"run_id": run_id, "status": "started"}), file=sys.stderr, flush=True
-                )
-                result = scan(store, run_id, progress=_progress)
+                result = scan(store, scope, progress=_progress)
             print(json.dumps(_summary(result, catalog, key_present=key_present)))
-            return 0 if result["status"] == "completed" else 3
-
-        with Store(args.db) as store:
-            result = scan(store, args.run, progress=_progress, resume=True)
-            catalog = load_catalog_from_snapshot(store.run(args.run)["snapshot"])
-        print(
-            json.dumps(
-                _summary(result, catalog, key_present=bool(os.environ.get("ALCHEMY_API_KEY")))
-            )
-        )
-        return 0 if result["status"] == "completed" else 3
+            return 0 if result.get("status", "completed") == "completed" else 3
     except KeyboardInterrupt:
         print(json.dumps({"status": "interrupted"}), file=sys.stderr, flush=True)
         return 130
@@ -265,33 +247,6 @@ def main(argv=None):
     except (ConfigError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-
-
-def load_catalog_from_snapshot(snapshot_value):
-    """Reconstruct catalog metadata stored in a run snapshot for resume output."""
-    from .models import Catalog, Network, Token
-
-    data = snapshot_value["catalog"]
-    return Catalog(
-        networks=tuple(
-            Network(
-                chain_id=n["chain_id"],
-                name=n["name"],
-                rpc_urls=tuple(n["rpc_urls"]),
-                native_symbol=n["native_symbol"],
-                native_decimals=n["native_decimals"],
-                tokens=tuple(Token(**t) for t in n["tokens"]),
-                token_review_status=n.get("token_review_status", "pending"),
-                notes=n.get("notes", ""),
-                alchemy_network=n.get("alchemy_network"),
-            )
-            for n in data["networks"]
-        ),
-        revision=data["revision"],
-        checked_at=data["checked_at"],
-        source=data["source"],
-    )
-
 
 def _execution_rpc_urls(catalog) -> dict[int, str]:
     """Prefer Alchemy for execution preflight and broadcast when it maps the chain."""

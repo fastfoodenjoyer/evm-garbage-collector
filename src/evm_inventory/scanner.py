@@ -1,4 +1,4 @@
-"""Resumable wallet traversal with mandatory RPC checks and optional discovery."""
+"""Resumable wallet traversal backed by the current inventory store."""
 
 import os
 import random
@@ -20,40 +20,61 @@ def now():
     return datetime.now(UTC).isoformat()
 
 
-def _ready(job):
-    return job["status"] not in DONE and (job.get("retry_after") or 0) <= time.time()
+def _ready(asset):
+    return asset["status"] not in DONE and (asset.get("retry_after") or 0) <= time.time()
 
 
-def _failure(store, job, error, status="error"):
-    store.record(
-        job["id"],
+def _failure(store, asset, error, status="error"):
+    store.record_asset(
+        asset["id"],
         {"error": error.code, "observed_at": now()},
         status="deferred" if error.retry_after else status,
         retry_after=error.retry_after,
     )
 
 
-def _ensure_jobs(store, run, wallet, network):
-    store.ensure_job(
-        run,
-        wallet,
-        network["chain_id"],
-        "native",
-        metadata={"symbol": network["native_symbol"], "decimals": network["native_decimals"]},
-    )
-    for token in network["tokens"]:
-        store.ensure_job(run, wallet, network["chain_id"], token["address"], metadata=token)
-    store.ensure_job(run, wallet, network["chain_id"], "discovery", kind="discovery")
+def _mandatory_metadata(network, asset_id, metadata):
+    return {
+        **metadata,
+        "network_name": network["name"],
+        "token_review_status": network["token_review_status"],
+    }
+
+
+def _ensure_mandatory(store, wallet, network):
+    """Refresh the catalog-owned assets and make them retryable for this traversal."""
+    specs = [
+        (
+            "native",
+            {
+                "symbol": network["native_symbol"],
+                "decimals": network["native_decimals"],
+            },
+        )
+    ]
+    specs.extend((token["address"], token) for token in network["tokens"])
+    ids = []
+    for asset_id, metadata in specs:
+        row_id = store.upsert_asset(
+            wallet,
+            network["chain_id"],
+            asset_id,
+            "mandatory",
+            _mandatory_metadata(network, asset_id, metadata),
+        )
+        existing = next(
+            row for row in store.assets(wallet, network["chain_id"]) if row["id"] == row_id
+        )
+        # Store intentionally exposes updates through record_asset.  Re-recording
+        # the prior payload clears an old cooldown while preserving the last result
+        # until the authoritative RPC answer replaces it.
+        store.record_asset(row_id, existing["result"] or {}, status="pending")
+        ids.append(row_id)
+    return ids
 
 
 def _rpc_urls(network):
-    """Return the preferred endpoints for one network.
-
-    When Alchemy advertises a network and a key is configured, its endpoint is the
-    only endpoint used. Public RPCs are reserved for networks without an Alchemy
-    mapping (or when no Alchemy key is configured).
-    """
-
+    """Return the preferred endpoints for one network."""
     urls = list(network["rpc_urls"])
     key = os.environ.get("ALCHEMY_RPC_API_KEY") or os.environ.get("ALCHEMY_API_KEY")
     alchemy_network = network.get("alchemy_network")
@@ -86,17 +107,17 @@ def _select_endpoint(rpc, network, pinned, blocked, *, rpc_urls=None):
     raise error
 
 
-def _balances(store, run, wallet, network, rpc, url, block, blocked):
+def _balances(store, assets, wallet, network, rpc, url, block, blocked):
     endpoint_error = None
-    for job in store.jobs(run, wallet, network["chain_id"]):
-        if job["kind"] == "discovery" or job["status"] == "provider_only" or not _ready(job):
+    for asset in assets:
+        if not _ready(asset):
             continue
         if endpoint_error is not None:
-            _failure(store, job, endpoint_error)
+            _failure(store, asset, endpoint_error)
             continue
-        meta = job["metadata"]
+        metadata = asset["metadata"]
         try:
-            if job["asset_id"] == "native":
+            if asset["asset_id"] == "native":
                 raw = rpc.native(url, network["chain_id"], wallet, block["number"])
                 decimals = network["native_decimals"]
             else:
@@ -104,17 +125,17 @@ def _balances(store, run, wallet, network, rpc, url, block, blocked):
                     url,
                     network["chain_id"],
                     wallet,
-                    job["asset_id"],
+                    asset["asset_id"],
                     block["number"],
-                    meta.get("decimals"),
+                    metadata.get("decimals"),
                 )
-            store.record(
-                job["id"],
+            store.record_asset(
+                asset["id"],
                 {
                     "raw_balance": str(raw),
                     "decimals": decimals,
                     "amount": format_amount(raw, decimals),
-                    "symbol": meta.get("symbol", job["asset_id"]),
+                    "symbol": metadata.get("symbol", asset["asset_id"]),
                     "block_number": block["number"],
                     "block_hash": block["hash"],
                     "observed_at": now(),
@@ -125,8 +146,6 @@ def _balances(store, run, wallet, network, rpc, url, block, blocked):
                 },
             )
         except RequestError as exc:
-            if job["kind"] == "discovered" and (job.get("result") or {}).get("raw_balance"):
-                continue
             if exc.code in TRANSIENT_RPC_ERRORS:
                 exc = RequestError(exc.code, exc.retry_after or time.time() + 300)
                 endpoint_error = exc
@@ -137,56 +156,68 @@ def _balances(store, run, wallet, network, rpc, url, block, blocked):
             elif exc.code not in {"invalid_contract", "decimals_mismatch", "missing_contract_code"}:
                 endpoint_error = RequestError(exc.code, exc.retry_after or time.time() + 300)
                 blocked[url] = endpoint_error
-            _failure(store, job, exc)
+            _failure(store, asset, exc)
 
 
-def _discover(store, job, network, wallet, discovery):
-    if job["status"] == "success":
-        return
+def _reset_discovery(store, wallet, chain_id):
+    """Begin a fresh provider traversal without replacing the state row."""
+    store.write_discovery_state(wallet, chain_id, cursor=None, cursor_history=[], status="pending")
+
+
+def _discover(store, network, wallet, discovery, mandatory_ids):
+    chain_id = network["chain_id"]
     if not discovery.enabled:
-        store.record(job["id"], {"reason": "no_api_key"}, status="disabled")
-        return
+        store.write_discovery_state(
+            wallet,
+            chain_id,
+            status="disabled",
+            result={"reason": "no_api_key"},
+        )
+        return []
     if not network.get("alchemy_network"):
-        store.record(job["id"], {"reason": "unsupported_network"}, status="disabled")
-        return
-    if not _ready(job):
-        return
-    result = job.get("result") or {}
-    cursor = result.get("cursor")
-    seen = set(result.get("cursor_history", []))
+        store.write_discovery_state(
+            wallet,
+            chain_id,
+            status="disabled",
+            result={"reason": "unsupported_network"},
+        )
+        return []
+
+    state = store.discovery_state(wallet, chain_id)
+    cursor = state["cursor"]
+    history = state["cursor_history"]
+    seen = set(history)
+    discovered_ids = []
     try:
         for _ in range(100):
             contracts, next_cursor = discovery.page(wallet, network["alchemy_network"], cursor)
             if next_cursor and (next_cursor in seen or next_cursor == cursor):
                 raise RequestError("discovery_cursor_cycle")
-            store.save_discovery_page(job["id"], contracts, next_cursor)
+            current = {row["asset_id"]: row for row in store.assets(wallet, chain_id)}
             for candidate in contracts:
                 raw = candidate.get("reported_raw_balance")
                 if not raw:
                     continue
-                if candidate["address"] == "native":
-                    candidate = {
-                        **candidate,
-                        "symbol": network["native_symbol"]
-                        if candidate.get("symbol") in {None, "", "native"}
-                        else candidate["symbol"],
-                        "decimals": candidate.get("decimals") or network["native_decimals"],
-                    }
-                discovered = next(
-                    item
-                    for item in store.jobs(job["run_id"], wallet, network["chain_id"])
-                    if item["asset_id"] == candidate["address"]
+                address = (
+                    candidate["address"].lower() if candidate["address"] != "native" else "native"
                 )
-                store.record(
-                    discovered["id"],
+                existing = current.get(address)
+                # A current catalog entry remains authoritative even when the
+                # discovery provider reports it with conflicting metadata.
+                if existing is not None and existing["id"] in mandatory_ids:
+                    continue
+                row_id = store.upsert_asset(wallet, chain_id, address, "discovered", candidate)
+                decimals = candidate.get("decimals")
+                store.record_asset(
+                    row_id,
                     {
-                        "raw_balance": raw,
-                        "decimals": candidate.get("decimals"),
-                        "amount": format_amount(int(raw), candidate["decimals"])
-                        if candidate.get("decimals") is not None
+                        "raw_balance": str(raw),
+                        "decimals": decimals,
+                        "amount": format_amount(int(raw), decimals)
+                        if decimals is not None
                         else None,
                         "name": candidate.get("name"),
-                        "symbol": candidate.get("symbol", candidate["address"]),
+                        "symbol": candidate.get("symbol", address),
                         "observed_at": candidate.get("reported_at", now()),
                         "source": "alchemy",
                         "verification": "provider_only",
@@ -196,31 +227,39 @@ def _discover(store, job, network, wallet, discovery):
                     },
                     status="provider_only",
                 )
+                discovered_ids.append(row_id)
+            if next_cursor is not None:
+                seen.add(next_cursor)
+                history.append(next_cursor)
+            store.write_discovery_state(
+                wallet,
+                chain_id,
+                cursor=next_cursor,
+                cursor_history=history,
+                status="success" if next_cursor is None else "pending",
+                result={"observed_at": now()},
+            )
             if next_cursor is None:
-                return
-            seen.add(next_cursor)
+                return discovered_ids
             cursor = next_cursor
         raise RequestError("discovery_page_limit")
     except RequestError as exc:
-        # Keep the persisted cursor when marking a resumable page error.
-        latest = next(
-            j
-            for j in store.jobs(job["run_id"], wallet, network["chain_id"])
-            if j["id"] == job["id"]
-        )
-        saved = latest.get("result") or {}
-        saved.update(error=exc.code, observed_at=now())
-        store.record(
-            job["id"],
-            saved,
+        latest = store.discovery_state(wallet, chain_id)
+        store.write_discovery_state(
+            wallet,
+            chain_id,
+            cursor=latest["cursor"],
+            cursor_history=latest["cursor_history"],
             status="deferred" if exc.retry_after else "error",
             retry_after=exc.retry_after,
+            result=latest["result"],
+            error={"code": exc.code, "observed_at": now()},
         )
+        return discovered_ids
 
 
-def scan(store, run_id, *, rpc=None, discovery=None, sleep=time.sleep, progress=None, resume=False):
-    run = store.run(run_id)
-    scope = run["snapshot"]
+def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=None):
+    """Scan the supplied scope into the store's current inventory."""
     settings = scope["settings"]
     transport = (
         Transport(interval=settings.get("interval", 1))
@@ -231,79 +270,70 @@ def scan(store, run_id, *, rpc=None, discovery=None, sleep=time.sleep, progress=
     discovery = discovery or Discovery(
         transport, key="" if not settings.get("discovery_enabled", True) else None
     )
-    # Resolve every endpoint once before traversing wallets. The same immutable map
-    # is reused for the entire run, so endpoint construction never happens per wallet.
-    rpc_urls = {
-        network["chain_id"]: _rpc_urls(network) for network in scope["catalog"]["networks"]
-    }
+    networks = scope["catalog"]["networks"]
+    rpc_urls = {network["chain_id"]: _rpc_urls(network) for network in networks}
     blocked = {}
-    store.set_status(run_id, "running")
+    mandatory_total = mandatory_failed = discovered_checks = discovered_failed = (
+        positive_balances
+    ) = 0
+    discovery_statuses = {
+        status: 0
+        for status in ("success", "disabled", "error", "deferred", "pending", "unavailable")
+    }
     try:
         for wi, wallet in enumerate(scope["wallets"]):
             if wi:
                 sleep(random.uniform(settings.get("delay_min", 1), settings.get("delay_max", 3)))
-            for network in scope["catalog"]["networks"]:
+            for network in networks:
                 cid = network["chain_id"]
-                _ensure_jobs(store, run_id, wallet, network)
-                jobs = store.jobs(run_id, wallet, cid)
-                dj = next(j for j in jobs if j["kind"] == "discovery")
-                # Discovery is independent of RPC availability; persist candidates first.
-                _discover(store, dj, network, wallet, discovery)
-                jobs = store.jobs(run_id, wallet, cid)
-                dj = next(j for j in jobs if j["kind"] == "discovery")
-                pending = [j for j in jobs if j["kind"] != "discovery" and _ready(j)]
-                if network.get("alchemy_network") and dj.get("status") == "success":
-                    # Alchemy supplied the indexed holdings for this network. Keep any
-                    # curated contracts it did not return pending for a later RPC pass,
-                    # while allowing the cheap provider-only inventory to complete.
-                    pending = []
-                    continue
+                mandatory_ids = _ensure_mandatory(store, wallet, network)
+                mandatory = [row for row in store.assets(wallet, cid) if row["id"] in mandatory_ids]
+                mandatory_total += len(mandatory)
+                _reset_discovery(store, wallet, cid)
+                discovered_ids = _discover(store, network, wallet, discovery, set(mandatory_ids))
+                state = store.discovery_state(wallet, cid)
+                discovery_statuses[state["status"]] = discovery_statuses.get(state["status"], 0) + 1
+                discovered = [
+                    row for row in store.assets(wallet, cid) if row["id"] in discovered_ids
+                ]
+                discovered_checks += len(discovered)
+                discovered_failed += sum(row["status"] != "success" for row in discovered)
                 if progress:
                     progress(
                         f"Wallet {wi + 1}/{len(scope['wallets'])} | "
-                        f"{network['name']} | {len(pending)} checks"
+                        f"{network['name']} | {len(mandatory)} checks"
                     )
-                if not pending:
-                    continue
-                pinned = store.get_pass(run_id, wallet, cid)
                 try:
+                    # A pass is a current snapshot, not a run-scoped immutable pin.
                     url, block = _select_endpoint(
-                        rpc, network, pinned, blocked, rpc_urls=rpc_urls[cid]
+                        rpc, network, None, blocked, rpc_urls=rpc_urls[cid]
                     )
                 except RequestError as exc:
-                    for job in pending:
-                        _failure(store, job, exc, "unavailable")
-                    continue
-                if pinned is None:
-                    store.save_pass(run_id, wallet, cid, block)
-                _balances(store, run_id, wallet, network, rpc, url, block, blocked)
-        jobs = store.jobs(run_id)
-        mandatory = [j for j in jobs if j["kind"] == "mandatory"]
-        failures = sum(j["status"] != "success" for j in mandatory)
-        gaps = sum(n["token_review_status"] == "pending" for n in scope["catalog"]["networks"])
-        status = "incomplete" if failures or gaps else "completed"
-        store.set_status(run_id, status)
+                    for asset in mandatory:
+                        _failure(store, asset, exc, "unavailable")
+                else:
+                    store.save_pass(wallet, cid, block)
+                    _balances(store, mandatory, wallet, network, rpc, url, block, blocked)
+                current = [
+                    row
+                    for row in store.assets(wallet, cid)
+                    if row["id"] in {*mandatory_ids, *discovered_ids}
+                ]
+                mandatory_failed += sum(
+                    row["status"] != "success" for row in current if row["id"] in mandatory_ids
+                )
+                positive_balances += sum(
+                    int((row["result"] or {}).get("raw_balance", "0")) > 0 for row in current
+                )
         return {
-            "run_id": run_id,
-            "status": status,
-            "mandatory_total": len(mandatory),
-            "mandatory_failed": failures,
-            "catalog_gaps": gaps,
-            "discovery_statuses": {
-                status: sum(j["kind"] == "discovery" and j["status"] == status for j in jobs)
-                for status in ("success", "disabled", "error", "deferred", "pending", "unavailable")
-            },
-            "discovered_checks": sum(j["kind"] == "discovered" for j in jobs),
-            "discovered_failed": sum(
-                j["kind"] == "discovered" and j["status"] != "success" for j in jobs
-            ),
-            "positive_balances": sum(
-                int((j.get("result") or {}).get("raw_balance", "0")) > 0 for j in jobs
-            ),
+            "mandatory_total": mandatory_total,
+            "mandatory_failed": mandatory_failed,
+            "catalog_gaps": sum(n["token_review_status"] == "pending" for n in networks),
+            "discovery_statuses": discovery_statuses,
+            "discovered_checks": discovered_checks,
+            "discovered_failed": discovered_failed,
+            "positive_balances": positive_balances,
         }
-    except KeyboardInterrupt:
-        store.set_status(run_id, "interrupted")
-        raise
     finally:
         if transport is not None:
             transport.close()
