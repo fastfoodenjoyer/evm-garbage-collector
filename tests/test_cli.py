@@ -160,6 +160,8 @@ def test_scan_progress_and_final_summary_are_json_and_stderr_without_run_id(
 ):
     wallets = tmp_path / "wallets.txt"
     wallets.write_text("0x" + "1" * 40 + "\n")
+    monkeypatch.delenv("ALCHEMY_API_KEY", raising=False)
+    monkeypatch.setattr("evm_inventory.cli._load_dotenv", lambda: None)
     monkeypatch.setattr(
         "evm_inventory.cli.scan",
         lambda _st, _scope, progress=None: (
