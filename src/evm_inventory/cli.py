@@ -11,14 +11,21 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import httpx
+
 from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot, validate_delays
+from .lifi import LifiClient
 from .live_plan import create_live_plan
 from .models import ConfigError
+from .planner_gas import PlannerGasEstimator
 from .report import export_current
-from .route_execution import execute_entries
+from .route_execution import execute_entries, resume_routes_read_only
+from .routing_settings import load_routing_settings
+from .rpc import RpcReader
 from .runbook import create_route_plan
 from .scanner import scan
 from .store import Store
+from .transport import Transport
 from .workbook import (
     create_wallet_template,
     dry_run_workbook,
@@ -119,6 +126,7 @@ def main(argv=None):
         quote_routes_parser.add_argument("--workbook", required=True)
         quote_routes_parser.add_argument("--output", required=True)
         quote_routes_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
+        quote_routes_parser.add_argument("--catalog")
         quote_routes_parser.add_argument("--quote-floor", default="0.01")
         quote_routes_parser.add_argument(
             "--wallet-ranges",
@@ -134,6 +142,8 @@ def main(argv=None):
             "--wallet-ranges",
             help="inclusive workbook ordinals, e.g. 1-50,75,100-120",
         )
+        resume_routes_parser = sub.add_parser("resume-routes")
+        resume_routes_parser.add_argument("--journal", required=True)
         args = parser.parse_args(argv)
 
         if args.cmd == "workbook-template":
@@ -150,6 +160,7 @@ def main(argv=None):
             print(json.dumps({"status": "planned", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "quote-routes":
+            routing_settings = load_routing_settings()
             ordinal_ranges = parse_ordinal_ranges(args.wallet_ranges)
             wallet_rows = load_wallet_workbook(
                 Path(args.workbook),
@@ -160,17 +171,32 @@ def main(argv=None):
             addresses = {
                 item.public_address: item.bitget_deposit_address for item in wallet_rows
             }
-            plan = create_live_plan(
-                Path(args.balances),
-                deposit_addresses=addresses,
-                allowlist_path=Path(args.allowlist),
-                quote_floor=args.quote_floor,
-                wallet_addresses=set(addresses),
-            )
+            catalog = load_catalog(Path(args.catalog) if args.catalog else None)
+            transport = Transport()
+            lifi_http = httpx.Client(timeout=30)
+            quote_client = LifiClient(lifi_http)
+            try:
+                gas_estimator = PlannerGasEstimator(
+                    RpcReader(transport), _execution_rpc_urls(catalog), quote_client
+                )
+                plan = create_live_plan(
+                    Path(args.balances),
+                    deposit_addresses=addresses,
+                    allowlist_path=Path(args.allowlist),
+                    quote_floor=args.quote_floor,
+                    wallet_addresses=set(addresses),
+                    max_route_loss_pct=routing_settings.max_route_loss_pct,
+                    client=quote_client,
+                    gas_estimator=gas_estimator,
+                )
+            finally:
+                lifi_http.close()
+                transport.close()
             Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
             print(json.dumps({"status": "quoted", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "execute-routes":
+            routing_settings = load_routing_settings()
             ordinal_ranges = parse_ordinal_ranges(args.wallet_ranges)
             plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
             if not isinstance(plan, dict) or not isinstance(plan.get("entries"), list):
@@ -201,8 +227,12 @@ def main(argv=None):
                 delay_min_seconds=int(execution.get("delay_min_seconds", 1800)),
                 delay_max_seconds=int(execution.get("delay_max_seconds", 10800)),
                 wallet_batches=wallet_batches,
+                max_route_loss_pct=routing_settings.max_route_loss_pct,
             )
             print(json.dumps({"status": "finished", **summary}))
+            return 0
+        if args.cmd == "resume-routes":
+            print(json.dumps(resume_routes_read_only(journal_path=Path(args.journal))))
             return 0
         if args.cmd == "export":
             with Store(args.db, readonly=True) as store:

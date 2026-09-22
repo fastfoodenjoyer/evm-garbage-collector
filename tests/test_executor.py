@@ -4,13 +4,25 @@ import pytest
 from eth_account import Account
 
 from evm_inventory.executor import (
+    AmbiguousBroadcast,
     EthereumGasDeferred,
+    broadcast_durable_transaction,
     require_ethereum_gas_below_limit,
     require_native_reserve,
     sign_transaction,
+    signed_transaction_hash,
 )
+from evm_inventory.journal import Journal
 from evm_inventory.lifi import TransactionRequest
-from evm_inventory.route_execution import _direct_request, _execute_entry, execute_entries
+from evm_inventory.route_execution import (
+    _approve_if_needed,
+    _direct_request,
+    _execute_entry,
+    advance_route_state,
+    execute_entries,
+    reconcile_bridge_observation,
+    requote_after_swap_output,
+)
 from evm_inventory.rpc import RpcError
 from evm_inventory.workbook import WalletWorkbookRow
 
@@ -67,6 +79,177 @@ def test_batch_executor_refuses_without_explicit_execute(tmp_path):
         )
 
 
+def test_ambiguous_broadcast_recovers_recorded_hash_without_signing_again(tmp_path):
+    tx_hash = "0x" + "a" * 64
+
+    class Rpc:
+        calls = []
+
+        def call(self, _url, method, _params):
+            self.calls.append(method)
+            if method == "eth_sendRawTransaction":
+                raise TimeoutError("rpc timeout after broadcast")
+            if method == "eth_getTransactionByHash":
+                return {"hash": tx_hash, "nonce": "0x7"}
+            raise AssertionError(method)
+
+    rpc = Rpc()
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:1:asset", wallet="0x" + "1" * 40
+        )
+        first = broadcast_durable_transaction(
+            rpc,
+            url="https://rpc",
+            journal=journal,
+            position_id=position["id"],
+            step_key="bridge",
+            nonce=7,
+            calldata="0x1234",
+            signed_transaction="0x01",
+            tx_hash=tx_hash,
+        )
+        recovered = broadcast_durable_transaction(
+            rpc,
+            url="https://rpc",
+            journal=journal,
+            position_id=position["id"],
+            step_key="bridge",
+            nonce=7,
+            calldata="0x1234",
+            signed_transaction="0x01",
+            tx_hash=tx_hash,
+        )
+
+    assert first is None
+    assert recovered == tx_hash
+    assert rpc.calls == ["eth_sendRawTransaction", "eth_getTransactionByHash"]
+
+
+def test_ambiguous_approval_uses_durable_step_and_does_not_fallback_broadcast(
+    tmp_path, monkeypatch
+):
+    wallet = _wallet()
+    route_step_key = "bridge:route-1"
+    durable_calls = []
+    fallback_calls = []
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.token_allowance", lambda *_args, **_kwargs: 0
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._native_balance", lambda *_args, **_kwargs: 10**18
+    )
+    monkeypatch.setattr("evm_inventory.route_execution.pending_nonce", lambda *_a, **_k: 7)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.require_ethereum_gas_below_limit",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction",
+        lambda *_args, **_kwargs: "0x01",
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.signed_transaction_hash",
+        lambda _raw: "0x" + "a" * 64,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.broadcast_signed_transaction",
+        lambda *_args, **_kwargs: fallback_calls.append(True),
+    )
+
+    def ambiguous_broadcast(_rpc, **kwargs):
+        durable_calls.append(kwargs["step_key"])
+        return None
+
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.broadcast_durable_transaction",
+        ambiguous_broadcast,
+    )
+    request = TransactionRequest(10, "0x" + "4" * 40, "0x", 0, 50_000, 1)
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:10:approval", wallet=wallet.public_address
+        )
+        with pytest.raises(AmbiguousBroadcast):
+            _approve_if_needed(
+                {
+                    "asset_id": "0x" + "3" * 40,
+                    "raw_balance": "1000",
+                    "route": {"step": {"estimate": {"approvalAddress": "0x" + "5" * 40}}},
+                },
+                request,
+                wallet=wallet,
+                rpc=object(),
+                url="https://rpc.example",
+                journal=journal,
+                position_id=position["id"],
+                route_step_key=route_step_key,
+            )
+
+    assert durable_calls == [f"approval:{route_step_key}"]
+    assert fallback_calls == []
+
+
+def test_failed_swap_cannot_transition_to_bridge_submission():
+    assert advance_route_state("submitted", "swap_reverted") == "manual_review"
+    with pytest.raises(ValueError, match="invalid route transition"):
+        advance_route_state("manual_review", "submit_bridge")
+
+
+def test_non_stable_swap_output_is_requoted_under_original_loss_cap():
+    entry = {"reservations": {"whole_position_loss_usd": "2.50"}}
+    seen = []
+
+    route = requote_after_swap_output(
+        entry,
+        observed_output_raw=987,
+        requote=lambda amount: seen.append(amount) or {"valuation": {"loss_usd": "2.49"}},
+    )
+
+    assert seen == [987]
+    assert route["valuation"]["loss_usd"] == "2.49"
+
+    with pytest.raises(ValueError, match="loss cap"):
+        requote_after_swap_output(
+            entry, observed_output_raw=987,
+            requote=lambda _: {"valuation": {"loss_usd": "2.51"}},
+        )
+
+
+def test_bridge_reconciliation_requires_correlation_and_reports_at_30_minutes(tmp_path):
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:1:asset", wallet="0x" + "1" * 40
+        )
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="bridge", nonce=7,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "c" * 64)
+        journal.record_receipt(step["id"], status="confirmed", finality_block=123)
+        journal.record_balance_baseline(step["id"], balance_raw=100, expected_delta_raw=90)
+
+        early = reconcile_bridge_observation(
+            journal, step_id=step["id"], observed_balance_raw=500,
+            correlated_arrival_raw=None, confirmed_at_ms=0, now_ms=1_799_999,
+        )
+        timeout = reconcile_bridge_observation(
+            journal, step_id=step["id"], observed_balance_raw=500,
+            correlated_arrival_raw=None, confirmed_at_ms=0, now_ms=1_800_000,
+        )
+        credited = reconcile_bridge_observation(
+            journal, step_id=step["id"], observed_balance_raw=190,
+            correlated_arrival_raw=89, confirmed_at_ms=0, now_ms=1_800_000,
+        )
+
+        row = journal.step(step["id"])
+
+    assert early == "awaiting_bridge"
+    assert timeout == "no_correlated_arrival"
+    assert credited == "credited"
+    assert row["state"] == "credited"
+
+
 class _Rpc:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -75,6 +258,8 @@ class _Rpc:
     def call(self, url, method, params):
         self.calls.append(method)
         response = self.responses.pop(0)
+        if callable(response):
+            response = response()
         if isinstance(response, Exception):
             raise response
         return response
@@ -464,22 +649,24 @@ def test_batch_continues_after_real_initial_gas_deferral_without_first_signature
         [
             "0x1", "0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500",  # deferred first
             "0x1", "0x100000", "0x100000", "0x1", "0x1", "0x1",  # accepted second
-            "0x" + "b" * 64, {"status": "0x1"},
+            lambda: signed_transaction_hash(raw_transactions[0]), {"status": "0x1"},
         ]
     )
     monkeypatch.setattr("evm_inventory.route_execution.ExecutionRpc", lambda transport: rpc)
     monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
     signed = []
-    monkeypatch.setattr(
-        "evm_inventory.route_execution.sign_transaction",
-        lambda request, **kwargs: signed.append(request)
-        or sign_transaction(
+    raw_transactions = []
+    def signed_transaction(request, **_kwargs):
+        signed.append(request)
+        raw_transactions.append(sign_transaction(
             request,
             private_key=wallet.private_key,
             expected_sender=wallet.public_address,
             nonce=0,
-        ),
-    )
+        ))
+        return raw_transactions[-1]
+
+    monkeypatch.setattr("evm_inventory.route_execution.sign_transaction", signed_transaction)
 
     summary = execute_entries(
         [_direct_entry(wallet.public_address), _direct_entry(wallet.public_address)],

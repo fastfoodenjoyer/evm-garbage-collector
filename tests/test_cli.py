@@ -1,4 +1,6 @@
 import json
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -193,9 +195,51 @@ def test_export_accepts_current_database_without_run_argument(tmp_path):
     assert main(["export", "--db", str(db), "--output", str(tmp_path / "out")]) == 0
 
 
-def test_resume_is_not_a_cli_command():
-    with pytest.raises(SystemExit):
-        main(["resume"])
+def test_resume_routes_prints_key_free_durable_status(tmp_path, capsys):
+    from evm_inventory.journal import Journal
+
+    journal_path = tmp_path / "journal.sqlite"
+    with Journal(journal_path) as journal:
+        group = journal.get_or_create_group(
+            group_key="wallet:10:plan", wallet="0x" + "1" * 40,
+            source_chain_id=10, loss_budget_pct="15", source_usd="100",
+        )
+        journal.record_group_state(
+            group["id"], "manual_review_group_threshold_exceeded",
+            reason="loss_threshold_exceeded",
+        )
+        position = journal.get_or_create_position(
+            position_key="wallet:10:native", wallet="0x" + "1" * 40,
+            group_id=group["id"],
+        )
+        journal.record_position_state(
+            position["id"], "manual_review_after_swap",
+            actual_asset_id="native", actual_balance_raw="123",
+            reason="bridge requote is unavailable",
+        )
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="bridge", nonce=3,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "c" * 64)
+        journal.record_receipt(step["id"], status="confirmed", finality_block=123)
+        journal.record_timeout_report(step["id"], "no_correlated_arrival")
+
+    assert main(["resume-routes", "--journal", str(journal_path)]) == 0
+
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result == {
+        "status": "read_only",
+        "groups": {"manual_review_group_threshold_exceeded": 1},
+        "positions": {"manual_review_after_swap": 1},
+        "steps": {"bridge_timeout": 1},
+        "reasons": [{"reason": "bridge requote is unavailable", "count": 1}],
+        "bridge_timeout": 1,
+        "manual_review": 0,
+        "pending": 0,
+    }
+    assert "private" not in captured.out.lower()
 
 
 @pytest.mark.parametrize(
@@ -275,3 +319,88 @@ def test_execution_rpc_urls_prefers_alchemy(monkeypatch):
         networks = (Network(),)
 
     assert _execution_rpc_urls(Catalog()) == {10: "https://opt-mainnet.g.alchemy.com/v2/key"}
+
+
+def test_quote_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("evm_inventory.cli._load_dotenv", lambda: None)
+    monkeypatch.setenv("MAX_ROUTE_LOSS_PCT", "7.25")
+    wallet = SimpleNamespace(
+        public_address="0x" + "1" * 40,
+        bitget_deposit_address="0x" + "2" * 40,
+    )
+    monkeypatch.setattr("evm_inventory.cli.parse_ordinal_ranges", lambda _ranges: None)
+    monkeypatch.setattr(
+        "evm_inventory.cli.load_wallet_workbook",
+        lambda *_args, **_kwargs: [wallet],
+    )
+    monkeypatch.setattr(
+        "evm_inventory.cli.wallet_range_batches",
+        lambda *_args, **_kwargs: ((wallet,),),
+    )
+    calls = {}
+
+    def create_live_plan(*_args, **kwargs):
+        calls.update(kwargs)
+        return {"summary": {}, "entries": []}
+
+    monkeypatch.setattr("evm_inventory.cli.create_live_plan", create_live_plan)
+
+    assert main(
+        [
+            "quote-routes",
+            "--balances",
+            str(tmp_path / "balances.csv"),
+            "--workbook",
+            str(tmp_path / "wallets.xlsx"),
+            "--output",
+            str(tmp_path / "plan.json"),
+        ]
+    ) == 0
+
+    assert calls["max_route_loss_pct"] == Decimal("7.25")
+    capsys.readouterr()
+
+
+def test_execute_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("evm_inventory.cli._load_dotenv", lambda: None)
+    monkeypatch.setenv("MAX_ROUTE_LOSS_PCT", "8.5")
+    wallet = SimpleNamespace(public_address="0x" + "1" * 40)
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"entries": [], "execution": {}}))
+    monkeypatch.setattr("evm_inventory.cli.parse_ordinal_ranges", lambda _ranges: None)
+    monkeypatch.setattr(
+        "evm_inventory.cli.load_catalog",
+        lambda _path: SimpleNamespace(networks=()),
+    )
+    monkeypatch.setattr(
+        "evm_inventory.cli.load_wallet_workbook",
+        lambda *_args, **_kwargs: [wallet],
+    )
+    monkeypatch.setattr(
+        "evm_inventory.cli.wallet_range_batches",
+        lambda *_args, **_kwargs: ((wallet,),),
+    )
+    calls = {}
+
+    def execute_entries(_entries, **kwargs):
+        calls.update(kwargs)
+        return {"submitted": 0, "skipped": 0, "failed": 0, "deferred": 0}
+
+    monkeypatch.setattr("evm_inventory.cli.execute_entries", execute_entries)
+
+    assert main(
+        [
+            "execute-routes",
+            "--plan",
+            str(plan),
+            "--workbook",
+            str(tmp_path / "wallets.xlsx"),
+            "--catalog",
+            str(tmp_path / "catalog.json"),
+            "--journal",
+            str(tmp_path / "journal.sqlite"),
+        ]
+    ) == 0
+
+    assert calls["max_route_loss_pct"] == Decimal("8.5")
+    capsys.readouterr()

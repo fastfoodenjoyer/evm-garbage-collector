@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 import time
+from hashlib import sha256
 from typing import Protocol
 
 from eth_account import Account
+from eth_utils import keccak
 
 from .lifi import TransactionRequest
 from .rpc import RpcError, quantity, uint256
@@ -30,6 +32,14 @@ class EthereumGasDeferred(ValueError):
         self.approval_tx_hash: str | None = None
 
 
+class AmbiguousBroadcast(RuntimeError):
+    """A send may have reached the network; it must be observed, not retried."""
+
+    def __init__(self, tx_hash: str):
+        super().__init__("transaction broadcast outcome is ambiguous")
+        self.tx_hash = tx_hash
+
+
 class ExecutionRpc:
     """Small RPC client whose write capability is used only by the execute command."""
 
@@ -41,6 +51,7 @@ class ExecutionRpc:
         "eth_getBalance",
         "eth_getTransactionCount",
         "eth_getTransactionReceipt",
+        "eth_getTransactionByHash",
         "eth_sendRawTransaction",
     }
 
@@ -174,6 +185,73 @@ def broadcast_signed_transaction(
     if not isinstance(result, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", result):
         raise ValueError("RPC did not return a transaction hash")
     return result.lower()
+
+
+def signed_transaction_hash(raw_transaction: str) -> str:
+    if not isinstance(raw_transaction, str) or not re.fullmatch(r"0x[0-9a-fA-F]+", raw_transaction):
+        raise ValueError("invalid signed transaction")
+    return "0x" + keccak(bytes.fromhex(raw_transaction[2:])).hex()
+
+
+def recover_durable_broadcast(
+    broadcaster: Broadcaster, *, url: str, journal, position_id: int, step_key: str
+) -> str | None:
+    """Observe an existing durable submission before any new signature is created."""
+
+    step = journal.latest_step(position_id=position_id, step_key=step_key)
+    if not step or not step.get("tx_hash"):
+        return None
+    tx_hash = str(step["tx_hash"])
+    observed = broadcaster.call(url, "eth_getTransactionByHash", [tx_hash])
+    if isinstance(observed, dict) and str(observed.get("hash", "")).lower() == tx_hash:
+        return tx_hash
+    raise AmbiguousBroadcast(tx_hash)
+
+
+def broadcast_durable_transaction(
+    broadcaster: Broadcaster,
+    *,
+    url: str,
+    journal,
+    position_id: int,
+    step_key: str,
+    nonce: int,
+    calldata: str,
+    signed_transaction: str,
+    tx_hash: str,
+) -> str | None:
+    """Broadcast one previously signed transaction, recovering ambiguous sends.
+
+    The journal receives only SHA-256 digests.  On a later invocation a saved
+    transaction hash is queried first, so a timeout cannot cause re-signing or
+    a duplicate send for the same durable nonce intent.
+    """
+
+    intent = journal.record_step_intent(
+        position_id=position_id,
+        step_key=step_key,
+        nonce=nonce,
+        calldata_digest=sha256(calldata.encode()).hexdigest(),
+        signed_payload_digest=sha256(signed_transaction.encode()).hexdigest(),
+    )
+    existing_hash = intent.get("tx_hash")
+    if existing_hash:
+        observed = broadcaster.call(url, "eth_getTransactionByHash", [existing_hash])
+        if isinstance(observed, dict) and str(observed.get("hash", "")).lower() == existing_hash:
+            return existing_hash
+        return None
+    journal.record_broadcast_attempt(intent["id"], tx_hash)
+    try:
+        returned_hash = broadcast_signed_transaction(
+            broadcaster, url=url, raw_transaction=signed_transaction
+        )
+    except (TimeoutError, RpcError):
+        # The locally derived hash is durable; a resume observes it before any
+        # later signing/broadcast decision.
+        return None
+    if returned_hash != tx_hash.lower():
+        raise ValueError("RPC transaction hash does not match durable intent")
+    return returned_hash
 
 
 def pending_nonce(broadcaster: Broadcaster, *, url: str, wallet: str) -> int:

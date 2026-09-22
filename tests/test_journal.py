@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from evm_inventory.journal import Journal
 
 
@@ -117,3 +119,188 @@ def test_transaction_does_not_overwrite_deferred_terminal_states(tmp_path):
     assert route_deferred["reason"] == "insufficient native gas for deposit"
     assert route_deferred["tx_hash"] is None
     assert route_deferred["approval_tx_hash"] == "0x" + "a" * 64
+
+
+def test_journal_persists_idempotent_position_step_intent_without_sensitive_payloads(tmp_path):
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:1:asset", wallet="0x" + "1" * 40
+        )
+        first = journal.record_step_intent(
+            position_id=position["id"],
+            step_key="bridge",
+            nonce=7,
+            calldata_digest="a" * 64,
+            signed_payload_digest="b" * 64,
+        )
+        second = journal.record_step_intent(
+            position_id=position["id"],
+            step_key="bridge",
+            nonce=7,
+            calldata_digest="a" * 64,
+            signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(first["id"], "0x" + "c" * 64)
+        journal.record_receipt(first["id"], status="confirmed", finality_block=123)
+        journal.record_balance_baseline(first["id"], balance_raw=100, expected_delta_raw=90)
+        journal.record_timeout_report(first["id"], "no_correlated_arrival")
+        row = journal.step(first["id"])
+
+        columns = {
+            item["name"] for item in journal.connection.execute("PRAGMA table_info(route_steps)")
+        }
+
+    assert first["id"] == second["id"]
+    assert row["nonce"] == 7
+    assert row["calldata_digest"] == "a" * 64
+    assert row["signed_payload_digest"] == "b" * 64
+    assert row["tx_hash"] == "0x" + "c" * 64
+    assert row["broadcast_attempts"] == 1
+    assert row["receipt_status"] == "confirmed"
+    assert row["finality_block"] == 123
+    assert row["balance_baseline_raw"] == 100
+    assert row["expected_delta_raw"] == 90
+    assert row["timeout_report"] == "no_correlated_arrival"
+    assert "calldata" not in columns
+    assert "signed_payload" not in columns
+
+
+def test_journal_rejects_conflicting_intent_for_same_position_step_nonce(tmp_path):
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:1:asset", wallet="0x" + "1" * 40
+        )
+        journal.record_step_intent(
+            position_id=position["id"], step_key="bridge", nonce=7,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+
+        with pytest.raises(ValueError, match="conflicting durable step intent"):
+            journal.record_step_intent(
+                position_id=position["id"], step_key="bridge", nonce=7,
+                calldata_digest="d" * 64, signed_payload_digest="b" * 64,
+            )
+
+
+def test_journal_persists_group_budget_projection_and_realised_loss(tmp_path):
+    wallet = "0x" + "1" * 40
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=f"{wallet}:10",
+            wallet=wallet,
+            source_chain_id=10,
+            loss_budget_pct="15",
+            source_usd="100",
+        )
+        journal.record_group_state(group["id"], "active")
+        journal.record_group_projection(
+            group["id"], projected_loss_usd="12.5", projected_loss_pct="12.5"
+        )
+        journal.record_group_realized_loss(
+            group["id"], realized_loss_usd="4.25"
+        )
+        row = journal.group(group["id"])
+
+    assert row["group_key"] == f"{wallet}:10"
+    assert row["loss_budget_pct"] == "15"
+    assert row["projected_loss_usd"] == "12.5"
+    assert row["projected_loss_pct"] == "12.5"
+    assert row["realized_loss_usd"] == "4.25"
+    assert row["state"] == "active"
+
+
+def test_journal_persists_post_swap_requote_evidence_and_partial_asset_state(tmp_path):
+    wallet = "0x" + "1" * 40
+    balance_raw = "90000000000000000000000000000000000001"
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=f"{wallet}:10",
+            wallet=wallet,
+            source_chain_id=10,
+            loss_budget_pct="15",
+            source_usd="100",
+        )
+        position = journal.get_or_create_position(
+            position_key=f"{wallet}:10:{'0x' + 'a' * 40}",
+            wallet=wallet,
+            group_id=group["id"],
+            source_asset_id="0x" + "a" * 40,
+            source_amount_raw="100000000000000000000000000000000000001",
+        )
+        journal.record_position_state(
+            position["id"],
+            "source_asset_converted_bridge_pending",
+            actual_asset_id="native",
+            actual_balance_raw=balance_raw,
+        )
+        journal.record_requote_after_swap(
+            position["id"],
+            old_route_id="planned-bridge",
+            old_payload_hash="a" * 64,
+            new_route_id="replacement-bridge",
+            new_payload_hash="b" * 64,
+            input_amount_raw=balance_raw,
+            actual_asset_id="native",
+        )
+        journal.record_position_state(
+            position["id"], "manual_review_after_swap", reason="no_eligible_bridge"
+        )
+        row = journal.position(position["id"])
+        event = journal.position_events(position["id"])[0]
+
+    assert row["state"] == "manual_review_after_swap"
+    assert row["actual_asset_id"] == "native"
+    assert row["actual_balance_raw"] == balance_raw
+    assert event["event_type"] == "requote_after_swap"
+    assert event["old_route_id"] == "planned-bridge"
+    assert event["old_payload_hash"] == "a" * 64
+    assert event["new_route_id"] == "replacement-bridge"
+    assert event["new_payload_hash"] == "b" * 64
+    assert event["input_amount_raw"] == balance_raw
+
+
+def test_journal_rejects_backward_position_and_step_transitions(tmp_path):
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:10:asset", wallet="0x" + "1" * 40
+        )
+        journal.record_position_state(
+            position["id"],
+            "source_asset_converted_bridge_pending",
+            actual_asset_id="native",
+            actual_balance_raw="100",
+        )
+        with pytest.raises(ValueError, match="invalid position transition"):
+            journal.record_position_state(position["id"], "planned")
+
+        step = journal.record_step_intent(
+            position_id=position["id"],
+            step_key="swap",
+            nonce=1,
+            calldata_digest="a" * 64,
+            signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "c" * 64)
+        with pytest.raises(ValueError, match="invalid route step transition"):
+            journal.record_step_state(step["id"], "planned")
+
+
+def test_journal_persists_group_threshold_halt_state(tmp_path):
+    wallet = "0x" + "1" * 40
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=f"{wallet}:10",
+            wallet=wallet,
+            source_chain_id=10,
+            loss_budget_pct="15",
+            source_usd="100",
+        )
+        journal.record_group_state(
+            group["id"],
+            "manual_review_group_threshold_exceeded",
+            reason="projected loss exceeded the configured group budget",
+        )
+        row = journal.group(group["id"])
+
+    assert row["state"] == "manual_review_group_threshold_exceeded"
+    assert row["reason"] == "projected loss exceeded the configured group budget"
