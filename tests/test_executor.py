@@ -10,7 +10,7 @@ from evm_inventory.executor import (
     sign_transaction,
 )
 from evm_inventory.lifi import TransactionRequest
-from evm_inventory.route_execution import _execute_entry, execute_entries
+from evm_inventory.route_execution import _direct_request, _execute_entry, execute_entries
 from evm_inventory.rpc import RpcError
 from evm_inventory.workbook import WalletWorkbookRow
 
@@ -44,7 +44,13 @@ def test_sign_transaction_rejects_wrong_sender():
         )
 
 
-def test_native_reserve_requires_five_times_estimated_gas():
+def test_native_reserve_defaults_to_three_times_estimated_gas():
+    assert require_native_reserve(balance=30, gas_cost=10) == 30
+    with pytest.raises(ValueError, match="gas reserve"):
+        require_native_reserve(balance=29, gas_cost=10)
+
+
+def test_native_reserve_accepts_explicit_multiplier_override():
     assert require_native_reserve(balance=100, gas_cost=10, multiplier=5) == 50
     with pytest.raises(ValueError, match="gas reserve"):
         require_native_reserve(balance=49, gas_cost=10, multiplier=5)
@@ -72,6 +78,29 @@ class _Rpc:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def test_native_direct_request_retains_three_gas_reserves():
+    wallet = _wallet()
+    gas_price = 2
+    balance = 1_000_000
+    rpc = _Rpc([hex(gas_price), hex(balance)])
+    entry = {**_direct_entry(wallet.public_address), "target": {"minimum_raw": 874_000}}
+
+    request = _direct_request(entry, wallet=wallet, rpc=rpc, url="https://rpc")
+
+    assert request.value == balance - 3 * 21_000 * gas_price
+
+
+def test_native_direct_request_rejects_amount_below_minimum_after_three_gas_reserves():
+    wallet = _wallet()
+    gas_price = 2
+    balance = 1_000_000
+    rpc = _Rpc([hex(gas_price), hex(balance)])
+    entry = {**_direct_entry(wallet.public_address), "target": {"minimum_raw": 874_001}}
+
+    with pytest.raises(ValueError, match="native balance is below Bitget minimum"):
+        _direct_request(entry, wallet=wallet, rpc=rpc, url="https://rpc")
 
 
 @pytest.mark.parametrize(

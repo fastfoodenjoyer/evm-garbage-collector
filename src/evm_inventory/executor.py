@@ -14,6 +14,7 @@ from .transport import Transport
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 ETHEREUM_GAS_LIMIT_WEI = 500_000_000
+GAS_RESERVE_MULTIPLIER = 3
 
 
 class Broadcaster(Protocol):
@@ -63,7 +64,9 @@ class ExecutionRpc:
         return response["result"]
 
 
-def require_native_reserve(*, balance: int, gas_cost: int, multiplier: int = 5) -> int:
+def require_native_reserve(
+    *, balance: int, gas_cost: int, multiplier: int = GAS_RESERVE_MULTIPLIER
+) -> int:
     """Return retained native balance, or refuse a transaction that breaks the reserve."""
 
     if balance < 0 or gas_cost < 0 or multiplier < 1:
