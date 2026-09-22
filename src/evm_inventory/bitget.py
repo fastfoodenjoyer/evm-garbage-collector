@@ -11,6 +11,13 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .bitget_catalog import (
+    BitgetDepositTarget,
+    deposit_targets,
+    fetch_public_coins,
+    validate_live_target,
+)
+
 _COIN_DECIMALS = {"ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18}
 
 
@@ -48,6 +55,49 @@ class BitgetClient:
         if body.get("code") != "00000" or not isinstance(body.get("data"), list):
             raise ValueError("Bitget deposit record request failed")
         return tuple(item for item in body["data"] if isinstance(item, dict))
+
+    def deposit_address(self, *, coin: str, chain: str) -> str:
+        """Read the current authenticated Bitget deposit address for an exact target."""
+
+        path = "/api/v2/spot/wallet/deposit-address?" + urlencode({"coin": coin, "chain": chain})
+        timestamp = str(int(time.time() * 1000))
+        signature = base64.b64encode(
+            hmac.new(
+                self.secret_key.encode(), f"{timestamp}GET{path}".encode(), hashlib.sha256
+            ).digest()
+        ).decode()
+        response = self.http.get(self.endpoint + path, headers={
+            "ACCESS-KEY": self.api_key, "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": self.passphrase,
+            "locale": "en-US", "Content-Type": "application/json",
+        })
+        response.raise_for_status()
+        body = response.json()
+        data = body.get("data")
+        address = data.get("address") if isinstance(data, dict) else None
+        if body.get("code") != "00000" or not isinstance(address, str):
+            raise ValueError("Bitget deposit address request failed")
+        return address
+
+    def revalidate_deposit_target(self, target: dict, *, recipient: str) -> BitgetDepositTarget:
+        """Reload enabled metadata and address immediately before a final deposit."""
+
+        try:
+            planned = BitgetDepositTarget(
+                str(target["coin"]), int(target["chain_id"]), str(target["asset_id"]).lower(),
+                int(target["minimum_raw"]), str(target["chain"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid planned Bitget target") from exc
+        current_address = self.deposit_address(coin=planned.coin, chain=planned.chain)
+        live = validate_live_target(
+            planned,
+            live_targets=deposit_targets(fetch_public_coins(self.http)),
+            user_address=current_address,
+        )
+        if current_address.lower() != recipient.lower():
+            raise ValueError("Bitget deposit address changed since planning")
+        return live
 
     def deposit_status(
         self,

@@ -27,6 +27,15 @@ class BitgetDepositTarget:
     asset_id: str
     minimum_raw: int
     chain: str = ""
+    decimals: int | None = None
+
+    def __post_init__(self) -> None:
+        decimals = self.decimals
+        if decimals is None:
+            decimals = 18 if self.asset_id == "native" else _COIN_DECIMALS.get(self.coin.upper(), 6)
+            object.__setattr__(self, "decimals", decimals)
+        if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 255:
+            raise ValueError("Bitget target decimals must be an integer from 0 through 255")
 
 
 def fetch_public_coins(http_client: httpx.Client | None = None) -> tuple[dict, ...]:
@@ -65,9 +74,38 @@ def deposit_targets(coins: Iterable[dict]) -> tuple[BitgetDepositTarget, ...]:
                 continue
             if minimum_raw > 0:
                 targets.append(
-                    BitgetDepositTarget(coin, chain_id, asset_id, minimum_raw, str(chain["chain"]))
+                    BitgetDepositTarget(
+                        coin,
+                        chain_id,
+                        asset_id,
+                        minimum_raw,
+                        str(chain["chain"]),
+                        decimals,
+                    )
                 )
     return tuple(targets)
+
+
+def validate_live_target(
+    planned: BitgetDepositTarget,
+    *,
+    live_targets: Iterable[BitgetDepositTarget],
+    user_address: str,
+) -> BitgetDepositTarget:
+    """Re-admit a final deposit only against current enabled exchange metadata."""
+
+    if not _valid_address(user_address):
+        raise ValueError("invalid Bitget deposit address")
+    for target in live_targets:
+        if (
+            target.coin == planned.coin
+            and target.chain_id == planned.chain_id
+            and target.asset_id == planned.asset_id
+            and target.chain == planned.chain
+            and target.decimals == planned.decimals
+        ):
+            return target
+    raise ValueError("Bitget deposit target is no longer enabled")
 
 
 def _valid_address(value: str) -> bool:

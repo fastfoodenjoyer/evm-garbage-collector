@@ -14,8 +14,6 @@ RPC_FALLBACKS = {
 
 
 def build_catalog(base, allowlist, inventory, checked_at):
-    if allowlist.get("default_action") != "deny":
-        raise ValueError("allowlist default_action must be deny")
     networks = {network["chain_id"]: network for network in base["networks"]}
     balances = {
         (row["chain_id"], row["asset_id"]): row

@@ -21,6 +21,7 @@ _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _ENV_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
 _RPC_SCHEMES = frozenset({"http", "https"})
 _TOKEN_REVIEW_STATUSES = frozenset({"verified", "pending", "none"})
+_NATIVE_ASSET_ID = "native"
 
 
 def validate_rpc_url(url: str) -> None:
@@ -55,6 +56,42 @@ def _validate_decimals(value: object, field: str = "decimals") -> None:
         isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255
     ):
         raise ConfigError(f"{field} must be an integer from 0 through 255 or null")
+
+
+@dataclass(frozen=True, slots=True)
+class AssetIdentity:
+    """The exact on-chain identity of a fungible asset.
+
+    ``native`` is intentionally the only non-address value permitted for a
+    contract address.  It identifies the chain's native coin, not a wrapped
+    token or a provider-specific zero-address convention.
+    """
+
+    chain_id: int
+    contract_address: str
+    decimals: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.chain_id, bool)
+            or not isinstance(self.chain_id, int)
+            or self.chain_id <= 0
+        ):
+            raise ConfigError("asset chain_id must be a positive integer")
+        _validate_decimals(self.decimals, "asset decimals")
+        if self.decimals is None:
+            raise ConfigError("asset decimals must be an integer from 0 through 255")
+        if self.contract_address == _NATIVE_ASSET_ID:
+            return
+        if not isinstance(self.contract_address, str) or not _ADDRESS_RE.fullmatch(
+            self.contract_address.lower()
+        ):
+            raise ConfigError("asset contract_address must be an EVM address or literal native")
+        object.__setattr__(self, "contract_address", self.contract_address.lower())
+
+    @property
+    def is_native(self) -> bool:
+        return self.contract_address == _NATIVE_ASSET_ID
 
 
 def _validate_provenance(source: str, checked_at: str) -> None:

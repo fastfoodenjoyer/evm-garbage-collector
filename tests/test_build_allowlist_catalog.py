@@ -14,7 +14,6 @@ def test_builds_exact_rpc_catalog_from_allowlist_and_inventory():
         ]
     }
     allowlist = {
-        "default_action": "deny",
         "assets": [
             {"chain_id": 10, "asset_id": "native", "symbol": "ETH"},
             {"chain_id": 10, "asset_id": "0x" + "a" * 40, "symbol": "USDC"},

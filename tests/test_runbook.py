@@ -35,7 +35,7 @@ def test_create_route_plan_denies_asset_absent_from_allowlist(tmp_path):
         + "0x" + "1" * 40 + ",8453,0xdead,10000,NOPE\n"
     )
     allowlist = tmp_path / "allowlist.json"
-    allowlist.write_text('{"default_action":"deny","assets":[]}')
+    allowlist.write_text('{"assets":[]}')
 
     plan = create_route_plan(balances, allowlist_path=allowlist)
 

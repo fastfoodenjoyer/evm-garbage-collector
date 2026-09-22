@@ -1,6 +1,4 @@
 {
-  "version": 1,
-  "default_action": "deny",
   "notes": "Exact chain ID and contract address must match. A symbol or token name alone never authorizes a swap or approval.",
   "assets": [
     {"chain_id": 1, "network": "Ethereum Mainnet", "asset_id": "native", "symbol": "ETH", "action": "swap"},
