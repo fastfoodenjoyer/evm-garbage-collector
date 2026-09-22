@@ -12,6 +12,7 @@ import httpx
 
 from .bitget import BitgetClient
 from .executor import (
+    GAS_RESERVE_MULTIPLIER,
     EthereumGasDeferred,
     ExecutionRpc,
     approve_transaction,
@@ -228,7 +229,7 @@ def _direct_request(
     if asset_id == "native":
         balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
         gas_limit = 21_000
-        amount = balance - 5 * gas_limit * gas_price
+        amount = balance - GAS_RESERVE_MULTIPLIER * gas_limit * gas_price
         if amount < int(target["minimum_raw"]):
             raise ValueError("native balance is below Bitget minimum after gas reserve")
         return TransactionRequest(
