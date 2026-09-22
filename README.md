@@ -8,12 +8,12 @@ sign or broadcast, and it requires `--execute`.
 ```bash
 uv sync
 uv run evm-inventory scan --wallets wallets.txt --db inventory.sqlite --delay-min 1 --delay-max 3
-uv run evm-inventory export --run RUN_ID --db inventory.sqlite --output reports/RUN_ID
+uv run evm-inventory export --db inventory.sqlite --output reports/current
 ```
 
 The CLI automatically loads an optional `.env` file from the current directory. Entries use literal `KEY=value` syntax; comments and an `export` prefix are accepted, and existing environment variables take precedence. Use `--interval` for the minimum request interval, or `--no-discovery` to disable optional Alchemy discovery.
 
-The wallet file contains one public `0x` address per line. `--dry-run` validates the file and reports the planned check count without network requests. Results are resumable with `resume --run RUN_ID`. Optional additional token discovery is enabled only when `ALCHEMY_API_KEY` is present and `--no-discovery` is not supplied; the mandatory native/stablecoin RPC pass does not require it.
+The wallet file contains one public `0x` address per line. `--dry-run` validates the file and reports the planned check count without network requests. Each scan refreshes the database's current inventory. Optional additional token discovery is enabled only when `ALCHEMY_API_KEY` is present and `--no-discovery` is not supplied; the mandatory native/stablecoin RPC pass does not require it.
 
 Create the operation workbook with `uv run evm-inventory workbook-template --output local/wallets.xlsx`. Its `Wallets` sheet has columns for a row number, public address, private key, Bitget deposit address, and proposed actions. The deposit address must be the correct Bitget EVM address for the asset and network selected for that row. `workbook-dry-run` validates the sheet without signing or submitting transactions. Private keys remain in memory only and are never printed or stored in the inventory database.
 
@@ -38,7 +38,7 @@ otherwise evaluate gas.
 
 To broadcast the saved plan, use the separate command below. It processes selected
 workbook ordinals, waits a random 30–180 minutes between wallets, signs only with the matching
-workbook key, verifies the transaction-time 5× native-gas reserve, uses exact ERC-20
+workbook key, verifies the transaction-time 3× native-gas reserve, uses exact ERC-20
 approvals when a Jumper step requires one, waits for the source-chain receipt, and records each action
 in the SQLite journal. It then polls the signed Bitget deposit API for the resulting
 transaction hash. This requires `BITGET_API_KEY`, `BITGET_SECRET_KEY`, and
@@ -67,6 +67,6 @@ See [network and token coverage](docs/coverage.md) for current gaps. The default
 
 Discovery continues when a public RPC is unavailable. Its positive token candidates are saved with their provider-reported raw balance, then verified via RPC. Only successfully verified balances enter `balances.csv`; unverified candidates and errors remain in `inventory.json` and coverage reports. RPC and Alchemy transient failures trigger a five-minute cooldown after bounded retries. Authentication failures stop that endpoint/provider for the current process.
 
-`checks.csv` includes every expected mandatory check, including checks not reached before an interruption. `coverage.csv` separates mandatory coverage, catalog review and discovery status. Progress and the run ID appear on stderr; the final summary is JSON on stdout.
+`checks.csv` includes every expected mandatory check, including checks not reached before an interruption. `coverage.csv` separates mandatory coverage, catalog review and discovery status. Progress appears on stderr; the final summary is JSON on stdout.
 
-A run uses its original catalog snapshot on `resume`. To use updated Alchemy mappings or a changed token catalog, start a new `scan`; old observations remain available under the old run ID. The same database can contain multiple runs. Exporting an interrupted run is safe and does not restart it.
+Each scan uses the supplied catalog and updates the retained current observations in place. Exporting is safe at any time and writes all current, balance-bearing assets. An export directory is managed by the database UUID, so it can be reused only by that same database.
