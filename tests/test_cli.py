@@ -155,20 +155,98 @@ def test_malformed_dotenv_is_sanitized_config_error(tmp_path, monkeypatch):
         _load_dotenv()
 
 
-def test_scan_progress_and_final_summary_are_json_and_stderr(tmp_path, capsys, monkeypatch):
+def test_scan_progress_and_final_summary_are_json_and_stderr_without_run_id(
+    tmp_path, capsys, monkeypatch
+):
     wallets = tmp_path / "wallets.txt"
     wallets.write_text("0x" + "1" * 40 + "\n")
     monkeypatch.setattr(
         "evm_inventory.cli.scan",
-        lambda _st, _run, progress=None: (
+        lambda _st, _scope, progress=None: (
             progress("checking"),
-            {"run_id": "run", "status": "completed"},
+            {"status": "completed"},
         )[1],
     )
     assert main(["scan", "--wallets", str(wallets), "--db", str(tmp_path / "db")]) == 0
     captured = capsys.readouterr()
     assert "checking\n" in captured.err
-    assert json.loads(captured.out)["status"] == "completed"
+    summary = json.loads(captured.out)
+    assert summary["status"] == "completed"
+    assert summary["alchemy_key_present"] is False
+    assert "run_id" not in captured.out
+
+
+def test_export_accepts_current_database_without_run_argument(tmp_path):
+    from evm_inventory.store import Store
+
+    db = tmp_path / "inventory.db"
+    with Store(db) as store:
+        asset = store.upsert_asset(
+            "0x" + "1" * 40,
+            1,
+            "native",
+            metadata={"network_name": "Mainnet", "token_review_status": "verified"},
+        )
+        store.record_asset(asset, {"raw_balance": "1"})
+    assert main(["export", "--db", str(db), "--output", str(tmp_path / "out")]) == 0
+
+
+def test_resume_is_not_a_cli_command():
+    with pytest.raises(SystemExit):
+        main(["resume"])
+
+
+@pytest.mark.parametrize(
+    "command, required_options",
+    (
+        ("scan", ("--wallets", "wallets.txt", "--db", "inventory.db")),
+        ("export", ("--db", "inventory.db", "--output", "out")),
+    ),
+)
+def test_scan_and_export_reject_run_option(command, required_options, capsys):
+    with pytest.raises(SystemExit):
+        main([command, *required_options, "--run", "obsolete"])
+    assert "unrecognized arguments: --run obsolete" in capsys.readouterr().err
+
+
+def test_two_cli_scans_update_one_current_asset_with_stable_created_at(
+    tmp_path, capsys, monkeypatch
+):
+    wallets = tmp_path / "wallets.txt"
+    wallets.write_text("0x" + "1" * 40 + "\n")
+    db = tmp_path / "inventory.db"
+    ticks = iter((10.0, 11.0, 20.0, 21.0))
+    monkeypatch.setattr("evm_inventory.store.time.time", lambda: next(ticks))
+    calls = 0
+
+    def deterministic_scan(store, scope, progress=None):
+        nonlocal calls
+        calls += 1
+        wallet = scope["wallets"][0]
+        asset = store.upsert_asset(
+            wallet,
+            1,
+            "native",
+            metadata={"network_name": "Mainnet", "token_review_status": "verified"},
+        )
+        store.record_asset(asset, {"raw_balance": str(calls), "decimals": 18})
+        return {"status": "completed"}
+
+    monkeypatch.setattr("evm_inventory.cli.scan", deterministic_scan)
+    assert main(["scan", "--wallets", str(wallets), "--db", str(db)]) == 0
+    capsys.readouterr()
+    from evm_inventory.store import Store
+
+    with Store(db, readonly=True) as store:
+        first = store.assets()[0]
+    assert main(["scan", "--wallets", str(wallets), "--db", str(db)]) == 0
+    with Store(db, readonly=True) as store:
+        assets = store.assets()
+    assert len(assets) == 1
+    second = assets[0]
+    assert second["created_at"] == first["created_at"] == 10.0
+    assert second["modified_at"] == 21.0 > first["modified_at"]
+    assert second["result"]["raw_balance"] == "2"
 
 
 def test_keyboard_interrupt_returns_130(tmp_path, capsys, monkeypatch):
