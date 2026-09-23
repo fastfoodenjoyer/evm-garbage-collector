@@ -17,3 +17,5 @@ build/
 dist/
 docs/
 outputs/
+uv.lock
+*.xlsx
