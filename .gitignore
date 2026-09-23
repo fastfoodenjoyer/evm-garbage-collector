@@ -16,3 +16,4 @@ wallets*.txt
 build/
 dist/
 docs/
+outputs/
