@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
+from hashlib import sha256
 from pathlib import Path
 
 import httpx
@@ -41,6 +42,7 @@ from .executor import (
 from .journal import Journal
 from .lifi import (
     LifiClient,
+    LifiError,
     LifiRoute,
     LifiRouteRequest,
     TransactionRequest,
@@ -52,11 +54,16 @@ from .models import AssetIdentity
 from .planner_gas import PlannerGasEstimator
 from .rpc import quantity
 from .transport import Transport
-from .valuation import FeeQuote, QuotePrice
+from .valuation import FeeQuote, QuotePrice, raw_to_decimal
 from .workbook import WalletWorkbookRow
 
 _MAX_PRICE_AGE = timedelta(minutes=5)
+_BRIDGE_STATUS_POLL_SECONDS = 15
 _NATIVE_LIFI_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+
+class GroupLossLimitExceeded(ValueError):
+    """Raised when a fresh dependent route would exceed the configured budget."""
 
 
 def _asset_from_data(value: object) -> AssetIdentity:
@@ -419,12 +426,32 @@ def execute_group_entries(
                 )
             return counts
 
+        def check_dependent_route_loss(position_loss: Decimal) -> None:
+            dependent_projection = _exact_sum(
+                (realized, position_loss, future_loss)
+            )
+            dependent_pct = _exact_percentage(dependent_projection, source_usd)
+            journal.record_group_projection(
+                group["id"],
+                projected_loss_usd=_decimal_string(dependent_projection),
+                projected_loss_pct=_decimal_string(dependent_pct),
+            )
+            if dependent_projection > budget_usd:
+                raise GroupLossLimitExceeded(
+                    "loss_threshold_exceeded_after_intermediate_bridge"
+                )
+
         first_step = steps[0]
         if first_step.get("kind") == "swap_to_native":
             journal.record_position_state(position_id, "swap_submitted")
             try:
                 swap_result = submit_step(
-                    {**fresh, "_journal_position_id": position_id}, first_step
+                    {
+                        **fresh,
+                        "_journal_position_id": position_id,
+                        "_check_group_loss": check_dependent_route_loss,
+                    },
+                    first_step,
                 )
                 if swap_result.get("state") not in {"confirmed", "completed"}:
                     raise ValueError("source swap did not confirm")
@@ -505,7 +532,13 @@ def execute_group_entries(
                     )
                     return counts
                 journal.record_position_state(position_id, "bridge_submitted")
-                bridge_result = submit_step(fresh, replacement)
+                bridge_result = submit_step(
+                    {
+                        **fresh,
+                        "_check_group_loss": check_dependent_route_loss,
+                    },
+                    replacement,
+                )
                 if bridge_result.get("state") not in {"confirmed", "completed"}:
                     raise ValueError("replacement bridge did not confirm")
                 realized = _add_realized(
@@ -514,6 +547,14 @@ def execute_group_entries(
                 journal.record_group_realized_loss(
                     group["id"], realized_loss_usd=_decimal_string(realized)
                 )
+            except GroupLossLimitExceeded as exc:
+                reason = _execution_reason(exc)
+                halt_remaining(
+                    index,
+                    state="manual_review_group_threshold_exceeded",
+                    reason=reason,
+                )
+                return counts
             except Exception as exc:
                 reason = _execution_reason(exc)
                 current = journal.position(position_id)
@@ -546,7 +587,12 @@ def execute_group_entries(
                     else:
                         journal.record_position_state(position_id, "bridge_submitted")
                     result = submit_step(
-                        {**fresh, "_journal_position_id": position_id}, step
+                        {
+                            **fresh,
+                            "_journal_position_id": position_id,
+                            "_check_group_loss": check_dependent_route_loss,
+                        },
+                        step,
                     )
                     if result.get("state") not in {"confirmed", "completed"}:
                         raise ValueError("route step did not confirm")
@@ -556,6 +602,14 @@ def execute_group_entries(
                     journal.record_group_realized_loss(
                         group["id"], realized_loss_usd=_decimal_string(realized)
                     )
+                except GroupLossLimitExceeded as exc:
+                    reason = _execution_reason(exc)
+                    halt_remaining(
+                        index,
+                        state="manual_review_group_threshold_exceeded",
+                        reason=reason,
+                    )
+                    return counts
                 except Exception as exc:
                     reason = _execution_reason(exc)
                     journal.record_position_state(
@@ -913,8 +967,28 @@ def _execute_live_groups(
                     )
 
                 def submit(entry: dict, step: dict) -> dict:
+                    def requote_dependent(
+                        original: dict, asset: AssetIdentity, amount: int
+                    ) -> dict:
+                        return _requote_from_intermediate(
+                            original,
+                            asset,
+                            amount,
+                            wallet=wallet,
+                            rpc=rpc,
+                            rpc_urls=rpc_urls,
+                            jumper=jumper,
+                            bitget=bitget,
+                            gas_estimator=gas_estimator,
+                            now_ms=now_ms,
+                        )
+
                     return _submit_live_step(
-                        entry,
+                        {
+                            **entry,
+                            "_requote_after_intermediate": requote_dependent,
+                            "_sleep": sleep,
+                        },
                         step,
                         wallet=wallet,
                         rpc=rpc,
@@ -979,6 +1053,8 @@ def _preflight_live_entry(
             raise ValueError("requote_required:target_identity_mismatch")
         url = _rpc_url(rpc_urls, asset.chain_id)
         balance = _asset_balance(rpc, url=url, asset=asset, wallet=wallet.public_address)
+        if entry.get("_actual_balance_raw") is not None:
+            balance = min(balance, _raw_amount(entry["_actual_balance_raw"]))
         if balance <= 0:
             raise ValueError("requote_required:insufficient_spendable_balance")
         fresh = {**entry, "raw_balance": str(balance)}
@@ -1183,6 +1259,130 @@ def _refresh_route_step(
     return candidate, fresh_step
 
 
+def _requote_from_intermediate(
+    entry: dict,
+    asset: AssetIdentity,
+    amount: int,
+    *,
+    wallet: WalletWorkbookRow,
+    rpc: ExecutionRpc,
+    rpc_urls: dict[int, str],
+    jumper: LifiClient,
+    bitget: BitgetClient,
+    gas_estimator: PlannerGasEstimator,
+    now_ms: Callable[[], int],
+) -> dict:
+    """Build a fresh, gas-priced route from a correlated intermediate arrival."""
+
+    target = _require_live_target(entry, wallet=wallet, bitget=bitget)
+    dynamic = {
+        **entry,
+        "status": "direct_deposit",
+        "chain_id": asset.chain_id,
+        "asset_id": asset.contract_address,
+        "decimals": asset.decimals,
+        "raw_balance": str(amount),
+        "_actual_asset_id": asset.contract_address,
+        "_actual_balance_raw": str(amount),
+        "quoted_at": now_ms(),
+    }
+    if (
+        asset.chain_id == target.chain_id
+        and asset.contract_address == target.asset_id
+        and asset.decimals == target.decimals
+    ):
+        dynamic["steps"] = [{"kind": "direct_deposit"}]
+        return _preflight_live_entry(
+            dynamic,
+            wallet=wallet,
+            rpc=rpc,
+            rpc_urls=rpc_urls,
+            jumper=jumper,
+            bitget=bitget,
+            gas_estimator=gas_estimator,
+            now_ms=now_ms,
+        )
+
+    request = LifiRouteRequest(
+        from_chain_id=asset.chain_id,
+        to_chain_id=target.chain_id,
+        from_token_address=_lifi_token(asset),
+        to_token_address=_lifi_token(
+            AssetIdentity(target.chain_id, target.asset_id, target.decimals)
+        ),
+        from_amount=str(amount),
+        from_address=wallet.public_address,
+        to_address=wallet.bitget_deposit_address,
+    )
+    now = datetime.fromtimestamp(now_ms() / 1000, UTC)
+    routes = jumper.routes(request)
+    candidates = []
+    for route in routes:
+        try:
+            validate_bridge_route(
+                route,
+                expected_source=asset,
+                expected_destination=AssetIdentity(
+                    target.chain_id, target.asset_id, target.decimals
+                ),
+                recipient=wallet.bitget_deposit_address,
+                input_amount=amount,
+            )
+            prepared = tuple(
+                jumper.step_transaction(raw_step) for raw_step in route.raw_steps
+            )
+            extra_gas = gas_estimator.estimate_prepared_route(
+                route=route,
+                wallet=wallet.public_address,
+                prepared_transactions=prepared,
+            )
+            candidate = candidate_from_route(
+                route,
+                expected_source=asset,
+                expected_destination=AssetIdentity(
+                    target.chain_id, target.asset_id, target.decimals
+                ),
+                expected_input_amount=amount,
+                recipient=wallet.bitget_deposit_address,
+                gas_estimate_complete=extra_gas is not None,
+                now=now,
+                max_price_age=_MAX_PRICE_AGE,
+                wallet_paid_gas=extra_gas or (),
+                replace_route_gas=bool(extra_gas),
+            )
+            _require_valid_candidate(candidate)
+            _require_target_minimum(dynamic, bitget, wallet, candidate)
+        except (ValueError, LifiError):
+            continue
+        candidates.append((route, candidate, prepared))
+    if not candidates:
+        raise ValueError("requote_required:no_eligible_route_after_intermediate_bridge")
+    route, candidate, prepared = min(
+        candidates,
+        key=lambda item: (
+            item[1].loss_pct,
+            item[1].loss_usd,
+            item[0].route_id,
+        ),
+    )
+    route_step = {
+        "kind": "bridge",
+        "route": _route_data(route),
+        "_live_route": route,
+        "_prepared_requests": prepared,
+    }
+    dynamic.update(
+        {
+            "status": "route_ready",
+            "steps": [route_step],
+            "_candidate": candidate,
+            "_step_candidates": {route.route_id: candidate},
+            "valuation": _candidate_valuation(candidate),
+        }
+    )
+    return dynamic
+
+
 def _requote_bridge_after_swap(
     entry: dict,
     amount: int,
@@ -1301,6 +1501,165 @@ def _requote_bridge_after_swap(
     return result
 
 
+def _await_cross_chain_transfer(
+    *,
+    jumper: LifiClient,
+    rpc: ExecutionRpc,
+    rpc_urls: dict[int, str],
+    journal: Journal,
+    position_id: int,
+    step_key: str,
+    tx_hash: str,
+    bridge: str,
+    source: AssetIdentity,
+    destination: AssetIdentity,
+    sender: str,
+    recipient: str,
+    baseline_raw: int | None,
+    sleep: Callable[[float], None],
+) -> int:
+    """Wait for LI.FI's correlated completion and confirm the exact destination asset."""
+
+    saved = journal.latest_step(position_id=position_id, step_key=step_key)
+    step_id = saved["id"] if saved is not None else None
+    if saved is not None:
+        state = str(saved["state"])
+        if state == "submitted":
+            journal.record_step_state(step_id, "confirmed")
+            state = "confirmed"
+        if state == "confirmed":
+            journal.record_step_state(step_id, "awaiting_bridge")
+
+    while True:
+        try:
+            status = jumper.transaction_status(
+                tx_hash=tx_hash,
+                from_chain_id=source.chain_id,
+                to_chain_id=destination.chain_id,
+                bridge=bridge,
+            )
+        except httpx.TransportError:
+            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            continue
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {408, 429, 500, 502, 503, 504}:
+                raise
+            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            continue
+        except TimeoutError:
+            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            continue
+        state = str(status.get("status", "")).upper()
+        substatus = str(status.get("substatus", "")).upper()
+        if state == "NOT_FOUND":
+            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            continue
+        sending = status.get("sending")
+        if not isinstance(sending, dict):
+            raise ValueError("lifi_bridge_status_missing_source_evidence")
+        sending_hash = sending.get("txHash")
+        if not isinstance(sending_hash, str) or sending_hash.lower() != tx_hash.lower():
+            raise ValueError("lifi_bridge_status_source_hash_mismatch")
+        observed_sender = status.get("fromAddress")
+        if isinstance(observed_sender, str) and observed_sender.lower() != sender.lower():
+            raise ValueError("lifi_bridge_status_sender_mismatch")
+        if state == "PENDING":
+            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            continue
+        if state != "DONE" or substatus not in {"COMPLETED", "PARTIAL"}:
+            raise ValueError(f"lifi_bridge_terminal_status:{state}:{substatus}")
+        if not isinstance(observed_sender, str):
+            raise ValueError("lifi_bridge_status_sender_missing")
+        receiving = status.get("receiving")
+        if not isinstance(receiving, dict):
+            raise ValueError("lifi_bridge_status_missing_destination_evidence")
+        if str(status.get("toAddress", "")).lower() != recipient.lower():
+            raise ValueError("lifi_bridge_status_recipient_mismatch")
+
+        receiving_hash = receiving.get("txHash")
+        if not isinstance(receiving_hash, str) or not receiving_hash:
+            raise ValueError("lifi_bridge_status_destination_hash_missing")
+        received_raw = _raw_amount(receiving.get("amount"))
+        token = receiving.get("token")
+        identity_fields = {"address", "chainId", "decimals"}
+        if isinstance(token, dict) and identity_fields.intersection(token):
+            if not identity_fields.issubset(token):
+                raise ValueError("lifi_bridge_status_asset_incomplete")
+            try:
+                observed_asset = AssetIdentity(
+                    int(token["chainId"]),
+                    "native"
+                    if str(token["address"]).lower() == _NATIVE_LIFI_ADDRESS
+                    else str(token["address"]),
+                    int(token["decimals"]),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("lifi_bridge_status_asset_invalid") from exc
+            if observed_asset != destination:
+                raise ValueError("lifi_bridge_status_asset_mismatch")
+
+        if recipient.lower() == sender.lower():
+            if baseline_raw is None:
+                raise ValueError("lifi_bridge_balance_baseline_missing")
+            observed_balance = _asset_balance(
+                rpc,
+                url=_rpc_url(rpc_urls, destination.chain_id),
+                asset=destination,
+                wallet=recipient,
+            )
+            if observed_balance < baseline_raw + received_raw:
+                sleep(_BRIDGE_STATUS_POLL_SECONDS)
+                continue
+
+        if step_id is not None:
+            latest_state = str(journal.step(step_id)["state"])
+            if latest_state == "confirmed":
+                journal.record_step_state(step_id, "awaiting_bridge")
+                latest_state = "awaiting_bridge"
+            if latest_state == "awaiting_bridge":
+                journal.record_step_state(step_id, "credited")
+        return received_raw
+
+
+def _actual_gas_paid_usd(
+    tx_hashes: list[tuple[int, str]],
+    *,
+    rpc: ExecutionRpc,
+    rpc_urls: dict[int, str],
+    jumper: LifiClient,
+) -> Decimal:
+    total = Decimal(0)
+    native_prices: dict[int, QuotePrice] = {}
+    for chain_id, tx_hash in tx_hashes:
+        receipt = rpc.call(
+            _rpc_url(rpc_urls, chain_id), "eth_getTransactionReceipt", [tx_hash]
+        )
+        if not isinstance(receipt, dict):
+            raise ValueError("route_step_receipt_missing")
+        if receipt.get("gasUsed") is None or receipt.get("effectiveGasPrice") is None:
+            raise ValueError("route_step_receipt_gas_cost_missing")
+        gas_raw = (
+            quantity(receipt["gasUsed"])
+            * quantity(receipt["effectiveGasPrice"])
+            + (
+                quantity(receipt["l1Fee"])
+                if receipt.get("l1Fee") is not None
+                else 0
+            )
+        )
+        if gas_raw <= 0:
+            continue
+        price = native_prices.get(chain_id)
+        if price is None:
+            price = _quote_price(jumper, AssetIdentity(chain_id, "native", 18))
+            native_prices[chain_id] = price
+        assert isinstance(price.usd_per_token, Decimal)
+        total = _exact_sum(
+            (total, raw_to_decimal(gas_raw, price.asset) * price.usd_per_token)
+        )
+    return total
+
+
 def _submit_live_step(
     entry: dict,
     step: dict,
@@ -1339,9 +1698,22 @@ def _submit_live_step(
         )
         if str(status or "").lower() != "success":
             raise ValueError("bitget_deposit_not_confirmed")
+        realized_before = _exact_money(
+            entry.get("_realized_loss_before_current_usd", "0"),
+            "realized loss before direct deposit",
+        )
         return {
             "state": "completed",
-            "realized_loss_usd": entry["valuation"]["loss_usd"],
+            "realized_loss_usd": _decimal_string(
+                _exact_sum(
+                    (
+                        realized_before,
+                        _exact_money(
+                            entry["valuation"]["loss_usd"], "direct deposit loss"
+                        ),
+                    )
+                )
+            ),
         }
 
     route_data = step.get("route")
@@ -1361,7 +1733,6 @@ def _submit_live_step(
         if (
             route_step.source is None
             or route_step.destination is None
-            or route_step.source.chain_id != route_step.destination.chain_id
             or route_step.source == route_step.destination
             or route_step.recipient is None
             or route_step.recipient.lower() != wallet.public_address.lower()
@@ -1388,6 +1759,12 @@ def _submit_live_step(
     )
     tx_hash = None
     paid_native_gas = 0
+    confirmed_hashes: list[tuple[int, str]] = []
+    sleep = entry.get("_sleep", time.sleep)
+    realized_before = _exact_money(
+        entry.get("_realized_loss_before_current_usd", "0"),
+        "realized loss before dependent route",
+    )
     for index, (raw_step, normalized, prepared_request) in enumerate(
         zip(live_route.raw_steps, route_steps, prepared_requests, strict=True)
     ):
@@ -1435,6 +1812,12 @@ def _submit_live_step(
                 asset=normalized.destination,
                 wallet=wallet.public_address,
             )
+        is_cross_chain = step_source.chain_id != normalized.destination.chain_id
+        if is_cross_chain and index < len(route_steps) - 1:
+            if output_baseline is None or normalized.to_amount is None:
+                raise ValueError("requote_required:intermediate_bridge_evidence_missing")
+            route_entry["_bridge_balance_baseline_raw"] = str(output_baseline)
+            route_entry["_bridge_expected_delta_raw"] = str(normalized.to_amount)
         tx_hash = _execute_entry(
             entry=route_entry,
             wallet=wallet,
@@ -1446,6 +1829,11 @@ def _submit_live_step(
             position_id=position_id,
             prepared_request=prepared_request,
         )
+        tx_hash_text = str(tx_hash)
+        approval_hash = getattr(tx_hash, "approval_tx_hash", None)
+        if approval_hash:
+            confirmed_hashes.append((step_source.chain_id, str(approval_hash)))
+        confirmed_hashes.append((step_source.chain_id, tx_hash_text))
         if step_source.chain_id == destination.chain_id and destination.is_native:
             receipt = rpc.call(
                 _rpc_url(rpc_urls, step_source.chain_id),
@@ -1457,6 +1845,131 @@ def _submit_live_step(
             paid_native_gas += quantity(receipt.get("gasUsed")) * quantity(
                 receipt.get("effectiveGasPrice")
             )
+
+        if is_cross_chain:
+            recipient = normalized.recipient
+            if recipient is None:
+                raise ValueError("requote_required:cross_chain_recipient_missing")
+            step_key = str(route_entry["_journal_step_key"])
+            received_raw = _await_cross_chain_transfer(
+                jumper=jumper,
+                rpc=rpc,
+                rpc_urls=rpc_urls,
+                journal=journal,
+                position_id=position_id,
+                step_key=step_key,
+                tx_hash=tx_hash_text,
+                bridge=normalized.provider or str(raw_step.get("tool", "")),
+                source=step_source,
+                destination=normalized.destination,
+                sender=wallet.public_address,
+                recipient=recipient,
+                baseline_raw=output_baseline,
+                sleep=sleep,
+            )
+            if index < len(route_steps) - 1:
+                if recipient.lower() != wallet.public_address.lower():
+                    raise ValueError("requote_required:intermediate_recipient_is_not_wallet")
+                journal.record_position_state(
+                    position_id,
+                    journal.position(position_id)["state"],
+                    actual_asset_id=normalized.destination.contract_address,
+                    actual_balance_raw=received_raw,
+                )
+                requote = entry.get("_requote_after_intermediate")
+                if not callable(requote):
+                    raise ValueError("requote_required:dependent_bridge_requote_unavailable")
+                candidate_map = entry.get("_step_candidates", {})
+                candidate = candidate_map.get(route_data["id"])
+                if candidate is None:
+                    candidate = entry.get("_candidate")
+                source_value = getattr(candidate, "source_usd", None)
+                if source_value is None:
+                    raise ValueError("requote_required:route_source_valuation_missing")
+                output_price = _quote_price(jumper, normalized.destination)
+                assert isinstance(output_price.usd_per_token, Decimal)
+                output_value = (
+                    raw_to_decimal(received_raw, normalized.destination)
+                    * output_price.usd_per_token
+                )
+                actual_gas_usd = _actual_gas_paid_usd(
+                    confirmed_hashes,
+                    rpc=rpc,
+                    rpc_urls=rpc_urls,
+                    jumper=jumper,
+                )
+                segment_loss = _exact_sum(
+                    (
+                        max(
+                            Decimal(0),
+                            _exact_money(source_value, "route source value")
+                            - output_value,
+                        ),
+                        actual_gas_usd,
+                    )
+                )
+                accrued_loss = _exact_sum((realized_before, segment_loss))
+                dynamic_entry = requote(entry, normalized.destination, received_raw)
+                if not isinstance(dynamic_entry, dict):
+                    raise ValueError("requote_required:dependent_route_requote_invalid")
+                next_steps = dynamic_entry.get("steps")
+                if not isinstance(next_steps, list) or not next_steps:
+                    raise ValueError("requote_required:dependent_route_steps_missing")
+                next_step = next_steps[0]
+                if not isinstance(next_step, dict):
+                    raise ValueError("requote_required:dependent_route_step_invalid")
+                next_route = next_step.get("route")
+                old_evidence = route_data.get("evidence")
+                new_evidence = next_route.get("evidence") if isinstance(next_route, dict) else None
+                if not isinstance(old_evidence, dict):
+                    raise ValueError("requote_required:dependent_route_evidence_missing")
+                if isinstance(new_evidence, dict) and isinstance(next_route, dict):
+                    new_route_id = str(next_route["id"])
+                    new_payload_hash = str(new_evidence["payload_sha256"])
+                elif next_step.get("kind") == "direct_deposit":
+                    new_route_id = "direct-deposit"
+                    new_payload_hash = sha256(
+                        json.dumps(
+                            next_step, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest()
+                else:
+                    raise ValueError("requote_required:dependent_route_evidence_missing")
+                journal.record_requote_after_bridge(
+                    position_id,
+                    old_route_id=str(route_data["id"]),
+                    old_payload_hash=str(old_evidence["payload_sha256"]),
+                    new_route_id=new_route_id,
+                    new_payload_hash=new_payload_hash,
+                    input_amount_raw=received_raw,
+                    actual_asset_id=normalized.destination.contract_address,
+                )
+                next_loss = _entry_loss(dynamic_entry)
+                group_loss_check = entry.get("_check_group_loss")
+                if callable(group_loss_check):
+                    group_loss_check(_exact_sum((accrued_loss, next_loss)))
+                dynamic_entry = {
+                    **dynamic_entry,
+                    "_realized_loss_before_current_usd": _decimal_string(accrued_loss),
+                    "_requote_after_intermediate": requote,
+                    "_check_group_loss": group_loss_check,
+                    "_sleep": sleep,
+                }
+                return _submit_live_step(
+                    dynamic_entry,
+                    next_step,
+                    wallet=wallet,
+                    rpc=rpc,
+                    rpc_urls=rpc_urls,
+                    jumper=jumper,
+                    bitget=bitget,
+                    journal=journal,
+                    now_ms=now_ms,
+                )
+            if recipient.lower() != wallet.public_address.lower():
+                target = entry.get("target")
+                if isinstance(target, dict) and received_raw < int(target["minimum_raw"]):
+                    raise ValueError("bitget_deposit_below_minimum")
 
         if output_baseline is not None:
             output_balance = _asset_balance(
@@ -1484,7 +1997,9 @@ def _submit_live_step(
         raise ValueError("route preflight valuation is missing")
     result = {
         "state": "confirmed",
-        "realized_loss_usd": _decimal_string(candidate.loss_usd),
+        "realized_loss_usd": _decimal_string(
+            _exact_sum((realized_before, _exact_money(candidate.loss_usd, "route loss")))
+        ),
     }
     if step.get("kind") == "swap_to_native":
         final_native = _asset_balance(
@@ -1591,6 +2106,8 @@ def _execute_entry(
             rpc, url=url, journal=journal, position_id=position_id, step_key=step_key,
             nonce=nonce, calldata=request.data, signed_transaction=raw,
             tx_hash=signed_transaction_hash(raw),
+            balance_baseline_raw=entry.get("_bridge_balance_baseline_raw"),
+            expected_delta_raw=entry.get("_bridge_expected_delta_raw"),
         )
         if tx_hash is None:
             raise AmbiguousBroadcast(signed_transaction_hash(raw))
@@ -1696,6 +2213,8 @@ def _direct_request(
     asset_id = str(entry["asset_id"])
     if asset_id == "native":
         balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
+        if entry.get("_actual_balance_raw") is not None:
+            balance = min(balance, _raw_amount(entry["_actual_balance_raw"]))
         gas_limit = 21_000
         amount = balance - GAS_RESERVE_MULTIPLIER * gas_limit * gas_price
         if amount < int(target["minimum_raw"]):

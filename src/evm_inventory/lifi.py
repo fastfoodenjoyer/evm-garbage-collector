@@ -167,6 +167,7 @@ class LifiClient:
 
     endpoint = "https://api.jumper.xyz/pipeline/v1/advanced/routes"
     token_endpoint = "https://li.quest/v1/token"
+    status_endpoint = "https://li.quest/v1/status"
 
     def __init__(self, http_client: _HttpClient):
         self.http_client = http_client
@@ -241,6 +242,54 @@ class LifiClient:
         if not parsed_price.is_finite() or parsed_price <= 0:
             raise ValueError("LI.FI token price response has an invalid priceUSD")
         return LifiPriceEvidence(asset, price, _utc_timestamp())
+
+    def transaction_status(
+        self,
+        *,
+        tx_hash: str,
+        from_chain_id: int,
+        to_chain_id: int,
+        bridge: str,
+    ) -> dict[str, Any]:
+        """Read the provider-correlated status for one cross-chain transaction."""
+
+        if not isinstance(tx_hash, str) or not tx_hash:
+            raise ValueError("LI.FI transaction hash is invalid")
+        if (
+            isinstance(from_chain_id, bool)
+            or not isinstance(from_chain_id, int)
+            or from_chain_id <= 0
+            or isinstance(to_chain_id, bool)
+            or not isinstance(to_chain_id, int)
+            or to_chain_id <= 0
+        ):
+            raise ValueError("LI.FI status chain identity is invalid")
+        if not isinstance(bridge, str) or not bridge.strip():
+            raise ValueError("LI.FI status bridge identity is invalid")
+        response = self.http_client.get(
+            self.status_endpoint,
+            params={
+                "txHash": tx_hash,
+                "fromChain": from_chain_id,
+                "toChain": to_chain_id,
+                "bridge": bridge,
+            },
+            headers={"x-lifi-integrator": "jumper.exchange"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or not isinstance(body.get("status"), str):
+            raise ValueError("LI.FI transaction status response is malformed")
+        if body["status"].upper() not in {
+            "PENDING",
+            "DONE",
+            "NOT_FOUND",
+            "INVALID",
+            "FAILED",
+        }:
+            raise ValueError("LI.FI transaction status response is unknown")
+        return body
 
     def _price_missing_gas_tokens(self, route: LifiRoute) -> LifiRoute:
         if route.evidence is None:

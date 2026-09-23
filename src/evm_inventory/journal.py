@@ -511,6 +511,45 @@ class Journal:
         self.connection.commit()
         return int(cursor.lastrowid)
 
+    def record_requote_after_bridge(
+        self,
+        position_id: int,
+        *,
+        old_route_id: str,
+        old_payload_hash: str,
+        new_route_id: str,
+        new_payload_hash: str,
+        input_amount_raw: str | int,
+        actual_asset_id: str,
+    ) -> int:
+        """Persist the fresh route selected after an intermediate bridge arrival."""
+
+        self.position(position_id)
+        if not old_route_id or not new_route_id or not actual_asset_id:
+            raise ValueError("dependent requote evidence identity is incomplete")
+        _require_sha256(old_payload_hash, "old payload hash")
+        _require_sha256(new_payload_hash, "new payload hash")
+        amount = _raw_amount_text(input_amount_raw, "dependent requote input amount")
+        if amount == "0":
+            raise ValueError("dependent requote input amount must be positive")
+        cursor = self.connection.execute(
+            """INSERT INTO route_events(
+                position_id, event_type, old_route_id, old_payload_hash,
+                new_route_id, new_payload_hash, input_amount_raw, actual_asset_id
+            ) VALUES (?, 'requote_after_bridge', ?, ?, ?, ?, ?, ?)""",
+            (
+                position_id,
+                old_route_id,
+                old_payload_hash.lower(),
+                new_route_id,
+                new_payload_hash.lower(),
+                amount,
+                actual_asset_id.lower(),
+            ),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
     def position_events(self, position_id: int) -> list[dict]:
         rows = self.connection.execute(
             "SELECT * FROM route_events WHERE position_id=? ORDER BY id DESC",
@@ -592,8 +631,11 @@ class Journal:
         legacy_baseline = _sqlite_integer(baseline)
         legacy_expected = _sqlite_integer(expected)
         self.connection.execute(
-            """UPDATE route_steps SET balance_baseline_raw=?, expected_delta_raw=?,
-               balance_baseline_raw_text=?, expected_delta_raw_text=?,
+            """UPDATE route_steps SET
+               balance_baseline_raw=COALESCE(balance_baseline_raw, ?),
+               expected_delta_raw=COALESCE(expected_delta_raw, ?),
+               balance_baseline_raw_text=COALESCE(balance_baseline_raw_text, ?),
+               expected_delta_raw_text=COALESCE(expected_delta_raw_text, ?),
                updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (legacy_baseline, legacy_expected, baseline, expected, step_id),
         )

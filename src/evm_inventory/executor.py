@@ -219,6 +219,8 @@ def broadcast_durable_transaction(
     calldata: str,
     signed_transaction: str,
     tx_hash: str,
+    balance_baseline_raw: str | int | None = None,
+    expected_delta_raw: str | int | None = None,
 ) -> str | None:
     """Broadcast one previously signed transaction, recovering ambiguous sends.
 
@@ -234,6 +236,12 @@ def broadcast_durable_transaction(
         calldata_digest=sha256(calldata.encode()).hexdigest(),
         signed_payload_digest=sha256(signed_transaction.encode()).hexdigest(),
     )
+    if balance_baseline_raw is not None and expected_delta_raw is not None:
+        journal.record_balance_baseline(
+            intent["id"],
+            balance_raw=balance_baseline_raw,
+            expected_delta_raw=expected_delta_raw,
+        )
     existing_hash = intent.get("tx_hash")
     if existing_hash:
         observed = broadcaster.call(url, "eth_getTransactionByHash", [existing_hash])

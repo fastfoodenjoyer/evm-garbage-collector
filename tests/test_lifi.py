@@ -60,6 +60,30 @@ class HttpClient:
         self.calls.append((url, json, headers, timeout))
         return Response()
 
+    def get(self, url, *, params, headers, timeout):
+        self.calls.append((url, params, headers, timeout))
+        return StatusResponse()
+
+
+class StatusResponse(Response):
+    def json(self):
+        return {
+            "sending": {"txHash": "0x" + "1" * 64},
+            "receiving": {
+                "txHash": "0x" + "2" * 64,
+                "amount": "850",
+                "token": {
+                    "address": DESTINATION_TOKEN,
+                    "chainId": 8453,
+                    "decimals": 0,
+                },
+            },
+            "fromAddress": WALLET,
+            "toAddress": WALLET,
+            "status": "DONE",
+            "substatus": "COMPLETED",
+        }
+
 
 def test_lifi_routes_use_read_only_quote_endpoint_and_parse_costs():
     http = HttpClient()
@@ -84,6 +108,28 @@ def test_lifi_routes_use_read_only_quote_endpoint_and_parse_costs():
     assert routes[0].tools == ("across",)
     assert routes[0].action.source == AssetIdentity(10, SOURCE_TOKEN, 6)
     assert routes[0].action.recipient == WALLET
+
+
+def test_lifi_transaction_status_uses_correlated_hash_and_chain_parameters():
+    http = HttpClient()
+    client = LifiClient(http)
+
+    status = client.transaction_status(
+        tx_hash="0x" + "1" * 64,
+        from_chain_id=10,
+        to_chain_id=8453,
+        bridge="across",
+    )
+
+    assert http.calls[0][0] == "https://li.quest/v1/status"
+    assert http.calls[0][1] == {
+        "txHash": "0x" + "1" * 64,
+        "fromChain": 10,
+        "toChain": 8453,
+        "bridge": "across",
+    }
+    assert status["status"] == "DONE"
+    assert status["receiving"]["amount"] == "850"
 
 
 def test_validated_bridge_quote_requires_exact_identities_and_recipient():

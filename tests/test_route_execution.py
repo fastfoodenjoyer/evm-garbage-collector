@@ -15,6 +15,8 @@ from evm_inventory.live_plan import _route_data
 from evm_inventory.models import AssetIdentity
 from evm_inventory.planner_gas import PlannerGasEstimator
 from evm_inventory.route_execution import (
+    GroupLossLimitExceeded,
+    _await_cross_chain_transfer,
     _execute_entry,
     _preflight_live_entry,
     _submit_live_step,
@@ -324,6 +326,20 @@ def test_submit_executes_every_normalized_lifi_step_with_actual_intermediate_bal
             balances[ASSET_B] = 0
         return f"0x{len(submitted):064x}"
 
+    class Jumper:
+        def transaction_status(self, *, tx_hash, **_kwargs):
+            return {
+                "sending": {"txHash": tx_hash},
+                "receiving": {
+                    "txHash": "0x" + "f" * 64,
+                    "amount": "800",
+                },
+                "fromAddress": WALLET,
+                "toAddress": DEPOSIT,
+                "status": "DONE",
+                "substatus": "COMPLETED",
+            }
+
     monkeypatch.setattr("evm_inventory.route_execution._execute_entry", fake_execute_entry)
     prepared = (
         TransactionRequest(10, "0x" + "1" * 40, "0x1234", 0, 50_000, 1),
@@ -361,7 +377,7 @@ def test_submit_executes_every_normalized_lifi_step_with_actual_intermediate_bal
                     wallet=wallet,
                     rpc=Rpc(),
                     rpc_urls={10: "https://rpc.example", 8453: "https://base.example"},
-                    jumper=object(),
+                    jumper=Jumper(),
                     bitget=object(),
                     journal=journal,
                     now_ms=lambda: int(NOW.timestamp() * 1000),
@@ -374,7 +390,7 @@ def test_submit_executes_every_normalized_lifi_step_with_actual_intermediate_bal
                 wallet=wallet,
                 rpc=Rpc(),
                 rpc_urls={10: "https://rpc.example", 8453: "https://base.example"},
-                jumper=object(),
+                jumper=Jumper(),
                 bitget=object(),
                 journal=journal,
                 now_ms=lambda: int(NOW.timestamp() * 1000),
@@ -389,6 +405,420 @@ def test_submit_executes_every_normalized_lifi_step_with_actual_intermediate_bal
         assert submitted == [(ASSET_A, prepared[0].to), (ASSET_B, prepared[1].to)]
     assert saved_position["actual_asset_id"] == ASSET_B
     assert saved_position["actual_balance_raw"] == str(intermediate_output)
+
+
+@pytest.mark.parametrize("max_position_loss", [Decimal("200"), Decimal("100")])
+def test_submit_requotes_and_continues_after_confirmed_cross_chain_intermediate(
+    tmp_path, monkeypatch, max_position_loss
+):
+    intermediate = AssetIdentity(8453, ASSET_B, 0)
+    destination = AssetIdentity(42161, "0x" + "e" * 40, 0)
+    first = {
+        "id": "first-bridge",
+        "type": "cross",
+        "tool": "bridge-a",
+        "action": {
+            "fromChainId": 10,
+            "toChainId": 8453,
+            "fromToken": {"address": ASSET_A, "decimals": 0},
+            "toToken": {"address": ASSET_B, "decimals": 0},
+            "fromAmount": "1000",
+            "toAddress": WALLET,
+        },
+        "estimate": {"toAmount": "900"},
+    }
+    second = {
+        "id": "stale-second-bridge",
+        "type": "cross",
+        "tool": "bridge-b",
+        "action": {
+            "fromChainId": 8453,
+            "toChainId": 42161,
+            "fromToken": {"address": ASSET_B, "decimals": 0},
+            "toToken": {"address": destination.contract_address, "decimals": 0},
+            "fromAmount": "900",
+            "toAddress": DEPOSIT,
+        },
+        "estimate": {"toAmount": "800"},
+    }
+    route = _route_from_dict(
+        {
+            "id": "cross-chain-dependent",
+            "fromAmount": "1000",
+            "toAmount": "800",
+            "toAmountMin": "790",
+            "priceTimestamp": NOW.isoformat(),
+            "steps": [first, second],
+        }
+    )
+    fresh_second = {
+        **second,
+        "id": "fresh-second-bridge",
+        "action": {**second["action"], "fromAmount": "850"},
+        "estimate": {"toAmount": "790"},
+    }
+    fresh_route = _route_from_dict(
+        {
+            "id": "fresh-dependent-route",
+            "fromAmount": "850",
+            "toAmount": "790",
+            "toAmountMin": "780",
+            "priceTimestamp": NOW.isoformat(),
+            "steps": [fresh_second],
+        }
+    )
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    balances = {(10, ASSET_A): 1000, (8453, ASSET_B): 0}
+    sent = []
+    tx_hashes = ["0x" + "1" * 64, "0x" + "2" * 64]
+
+    class Rpc:
+        def call(self, url, method, params):
+            chain_id = 10 if "l1" in url else 8453 if "base" in url else 42161
+            if method == "eth_call":
+                token = params[0]["to"].lower()
+                value = balances.get((chain_id, token), 0)
+                return "0x" + hex(value)[2:].rjust(64, "0")
+            if method == "eth_getTransactionReceipt":
+                return {"gasUsed": "0x0", "effectiveGasPrice": "0x1"}
+            raise AssertionError(method)
+
+    class Jumper:
+        def __init__(self):
+            self.statuses = [
+                {
+                    "sending": {"txHash": tx_hashes[0]},
+                    "receiving": {
+                        "txHash": "0x" + "3" * 64,
+                        "amount": "850",
+                        "token": {
+                            "address": ASSET_B,
+                            "chainId": 8453,
+                            "decimals": 0,
+                        },
+                    },
+                    "fromAddress": WALLET,
+                    "toAddress": WALLET,
+                    "status": "DONE",
+                    "substatus": "COMPLETED",
+                },
+                {
+                    "sending": {"txHash": tx_hashes[1]},
+                    "receiving": {
+                        "txHash": "0x" + "4" * 64,
+                        "amount": "790",
+                        "token": {
+                            "address": destination.contract_address,
+                            "chainId": 42161,
+                            "decimals": 0,
+                        },
+                    },
+                    "fromAddress": WALLET,
+                    "toAddress": DEPOSIT,
+                    "status": "DONE",
+                    "substatus": "COMPLETED",
+                },
+            ]
+
+        def transaction_status(self, **_kwargs):
+            return self.statuses.pop(0)
+
+        def token_price(self, asset):
+            return LifiPriceEvidence(asset, "1", NOW.isoformat())
+
+    def fake_execute_entry(*, entry, **_kwargs):
+        sent.append((entry["chain_id"], entry["asset_id"], entry["raw_balance"]))
+        if entry["asset_id"].lower() == ASSET_A:
+            balances[(10, ASSET_A)] = 0
+            balances[(8453, ASSET_B)] = 850
+        return tx_hashes[len(sent) - 1]
+
+    initial_candidate = SimpleNamespace(
+        loss_usd=Decimal("20"), source_usd=Decimal("1000")
+    )
+    refreshed_candidate = SimpleNamespace(
+        loss_usd=Decimal("10"), source_usd=Decimal("850")
+    )
+    initial_step = {
+        "kind": "bridge",
+        "route": _route_data(route),
+        "_live_route": route,
+        "_prepared_requests": (
+            TransactionRequest(10, "0x" + "1" * 40, "0x1111", 0, 50_000, 1),
+            TransactionRequest(8453, "0x" + "2" * 40, "0x2222", 0, 50_000, 1),
+        ),
+    }
+    refreshed_step = {
+        "kind": "bridge",
+        "route": _route_data(fresh_route),
+        "_live_route": fresh_route,
+        "_prepared_requests": (
+            TransactionRequest(8453, "0x" + "3" * 40, "0x3333", 0, 50_000, 1),
+        ),
+    }
+    requoted = []
+    projections = []
+
+    def check_group_loss(loss):
+        projections.append(loss)
+        if loss > max_position_loss:
+            raise GroupLossLimitExceeded("loss_threshold_exceeded_after_intermediate_bridge")
+
+    def requote(_entry, asset, amount):
+        requoted.append((asset, amount))
+        return {
+            "status": "route_ready",
+            "wallet": WALLET,
+            "chain_id": asset.chain_id,
+            "asset_id": asset.contract_address,
+            "raw_balance": str(amount),
+            "target": {
+                "coin": "USDC",
+                "chain_id": destination.chain_id,
+                "chain": "Arbitrum",
+                "asset_id": destination.contract_address,
+                "minimum_raw": "1",
+                "decimals": destination.decimals,
+            },
+            "steps": [refreshed_step],
+            "valuation": {"loss_usd": "10"},
+            "_journal_position_id": 1,
+            "_candidate": refreshed_candidate,
+            "_step_candidates": {fresh_route.route_id: refreshed_candidate},
+            "_actual_asset_id": asset.contract_address,
+            "_actual_balance_raw": str(amount),
+            "_requote_after_intermediate": requote,
+            "_sleep": lambda _seconds: None,
+        }
+
+    entry = {
+        "status": "route_ready",
+        "wallet": WALLET,
+        "chain_id": 10,
+        "asset_id": ASSET_A,
+        "raw_balance": "1000",
+        "steps": [initial_step],
+        "_journal_position_id": 1,
+        "_candidate": initial_candidate,
+        "_step_candidates": {route.route_id: initial_candidate},
+        "_requote_after_intermediate": requote,
+        "_check_group_loss": check_group_loss,
+        "_sleep": lambda _seconds: None,
+    }
+
+    monkeypatch.setattr("evm_inventory.route_execution._execute_entry", fake_execute_entry)
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:10:cross-chain", wallet=WALLET
+        )
+        entry["_journal_position_id"] = position["id"]
+        if max_position_loss < Decimal("160"):
+            with pytest.raises(GroupLossLimitExceeded):
+                _submit_live_step(
+                    entry,
+                    initial_step,
+                    wallet=wallet,
+                    rpc=Rpc(),
+                    rpc_urls={
+                        10: "https://l1.example",
+                        8453: "https://base.example",
+                        42161: "https://arb.example",
+                    },
+                    jumper=Jumper(),
+                    bitget=object(),
+                    journal=journal,
+                    now_ms=lambda: int(NOW.timestamp() * 1000),
+                )
+            result = None
+        else:
+            result = _submit_live_step(
+                entry,
+                initial_step,
+                wallet=wallet,
+                rpc=Rpc(),
+                rpc_urls={
+                    10: "https://l1.example",
+                    8453: "https://base.example",
+                    42161: "https://arb.example",
+                },
+                jumper=Jumper(),
+                bitget=object(),
+                journal=journal,
+                now_ms=lambda: int(NOW.timestamp() * 1000),
+            )
+        position_events = journal.position_events(position["id"])
+
+    assert requoted == [(intermediate, 850)]
+    if max_position_loss < Decimal("160"):
+        assert sent == [(10, ASSET_A, "1000")]
+        assert result is None
+    else:
+        assert sent == [(10, ASSET_A, "1000"), (8453, ASSET_B, "850")]
+        assert result == {"state": "confirmed", "realized_loss_usd": "160"}
+    assert projections == [Decimal("160")]
+    assert position_events[0]["event_type"] == "requote_after_bridge"
+    assert position_events[0]["input_amount_raw"] == "850"
+    assert position_events[0]["actual_asset_id"] == ASSET_B
+
+
+def test_cross_chain_wait_polls_pending_and_credits_only_correlated_balance(tmp_path):
+    tx_hash = "0x" + "1" * 64
+    source = AssetIdentity(10, ASSET_A, 0)
+    destination = AssetIdentity(8453, ASSET_B, 0)
+    slept = []
+
+    class Rpc:
+        def call(self, _url, method, _params):
+            assert method == "eth_call"
+            return "0x" + hex(850)[2:].rjust(64, "0")
+
+    class Jumper:
+        def __init__(self):
+            self.statuses = [
+                {
+                    "status": "PENDING",
+                    "substatus": "WAIT_DESTINATION_TRANSACTION",
+                    "sending": {"txHash": tx_hash},
+                },
+                {
+                    "status": "DONE",
+                    "substatus": "COMPLETED",
+                    "sending": {"txHash": tx_hash},
+                    "receiving": {
+                        "txHash": "0x" + "2" * 64,
+                        "amount": "850",
+                        "token": {
+                            "address": ASSET_B,
+                            "chainId": 8453,
+                            "decimals": 0,
+                        },
+                    },
+                    "fromAddress": WALLET,
+                    "toAddress": WALLET,
+                },
+            ]
+
+        def transaction_status(self, **_kwargs):
+            return self.statuses.pop(0)
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:10:await-bridge", wallet=WALLET
+        )
+        intent = journal.record_step_intent(
+            position_id=position["id"],
+            step_key="bridge-route:0",
+            nonce=0,
+            calldata_digest="a" * 64,
+            signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(intent["id"], tx_hash)
+        journal.record_balance_baseline(
+            intent["id"], balance_raw=0, expected_delta_raw=900
+        )
+
+        received = _await_cross_chain_transfer(
+            jumper=Jumper(),
+            rpc=Rpc(),
+            rpc_urls={8453: "https://base.example"},
+            journal=journal,
+            position_id=position["id"],
+            step_key="bridge-route:0",
+            tx_hash=tx_hash,
+            bridge="bridge-a",
+            source=source,
+            destination=destination,
+            sender=WALLET,
+            recipient=WALLET,
+            baseline_raw=0,
+            sleep=slept.append,
+        )
+        saved_step = journal.latest_step(
+            position_id=position["id"], step_key="bridge-route:0"
+        )
+
+    assert received == 850
+    assert slept == [15]
+    assert saved_step["state"] == "credited"
+
+
+def test_direct_final_hop_keeps_losses_from_completed_intermediate_hops(
+    tmp_path, monkeypatch
+):
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    entry = {
+        "status": "direct_deposit",
+        "chain_id": 8453,
+        "asset_id": ASSET_B,
+        "target": {
+            "coin": "USDC",
+            "chain": "Base",
+            "minimum_raw": "1",
+        },
+        "valuation": {"loss_usd": "3"},
+        "_actual_balance_raw": "850",
+        "_realized_loss_before_current_usd": "2",
+        "_direct_transaction": TransactionRequest(
+            8453, DEPOSIT, "0x1234", 0, 21_000, 1
+        ),
+        "_journal_position_id": 1,
+    }
+
+    class Bitget:
+        def wait_for_deposit(self, **_kwargs):
+            return "success"
+
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda **_kwargs: "0x" + "1" * 64,
+    )
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(
+            position_key="wallet:8453:direct-final", wallet=WALLET
+        )
+        entry["_journal_position_id"] = position["id"]
+        result = _submit_live_step(
+            entry,
+            {"kind": "direct_deposit"},
+            wallet=wallet,
+            rpc=object(),
+            rpc_urls={},
+            jumper=object(),
+            bitget=Bitget(),
+            journal=journal,
+            now_ms=lambda: int(NOW.timestamp() * 1000),
+        )
+
+    assert result == {"state": "completed", "realized_loss_usd": "5"}
+
+
+def test_dependent_route_loss_recheck_halts_before_next_signature(tmp_path):
+    entry = _entry(ASSET_A, status="route_ready", loss="1", steps=[{"kind": "bridge"}])
+    submissions = []
+
+    def submit(fresh, _step):
+        submissions.append(fresh["asset_id"])
+        fresh["_check_group_loss"](Decimal("16"))
+        raise AssertionError("the dependent route exceeded its budget")
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        result = execute_group_entries(
+            [entry],
+            journal=journal,
+            max_route_loss_pct=Decimal("15"),
+            preflight=lambda planned: planned,
+            submit_step=submit,
+        )
+        group = journal.group(result["group_id"])
+        position = journal.connection.execute(
+            "SELECT state, reason FROM route_positions"
+        ).fetchone()
+
+    assert submissions == [ASSET_A]
+    assert result["manual_review_group_threshold_exceeded"] == 1
+    assert group["state"] == "manual_review_group_threshold_exceeded"
+    assert position["state"] == "manual_review_group_threshold_exceeded"
+    assert position["reason"] == "loss_threshold_exceeded_after_intermediate_bridge"
 
 
 def _multi_step_route():
