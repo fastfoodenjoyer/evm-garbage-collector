@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -18,7 +19,7 @@ except ImportError:  # pragma: no cover
 class Store:
     """One current inventory, keyed by normalized wallet, chain, and asset."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: str | Path, readonly: bool = False):
         self.path = Path(path)
@@ -45,9 +46,18 @@ class Store:
             if version == 0 and not readonly and self._is_empty_schema():
                 self._setup()
                 version = self.SCHEMA_VERSION
-            if version != self.SCHEMA_VERSION:
+            if version == 2 and not readonly:
+                self._validate_schema(include_defi=False)
+                self._migrate_v2_to_v3()
+                version = 3
+            if version == 3 and not readonly:
+                self._validate_schema(include_defi=True)
+                self._migrate_v3_to_v4()
+                version = 4
+            if version not in ({2, 3, 4} if readonly else {self.SCHEMA_VERSION}):
                 raise ValueError(f"unsupported schema version: {version}")
-            self._validate_schema()
+            self.schema_version = version
+            self._validate_schema(include_defi=version >= 3, include_artifacts=version >= 4)
         except Exception:
             self.close()
             raise
@@ -117,7 +127,7 @@ class Store:
                 value TEXT NOT NULL
             )
             """
-        )
+        ) + self._defi_schema_statements() + self._artifact_schema_statements()
         self.db.execute("BEGIN IMMEDIATE")
         try:
             for statement in statements:
@@ -132,7 +142,85 @@ class Store:
             self.db.rollback()
             raise
 
-    def _validate_schema(self) -> None:
+    @staticmethod
+    def _defi_schema_statements() -> tuple[str, ...]:
+        return (
+            """
+            CREATE TABLE defi_plans (
+                plan_sha256 TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                plan_json TEXT NOT NULL,
+                stored_at REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE defi_positions (
+                plan_sha256 TEXT NOT NULL REFERENCES defi_plans(plan_sha256),
+                ordinal INTEGER NOT NULL,
+                wallet TEXT NOT NULL,
+                chain_id INTEGER,
+                protocol_id TEXT NOT NULL,
+                pool_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                action_id TEXT,
+                entry_json TEXT NOT NULL,
+                PRIMARY KEY(plan_sha256, ordinal)
+            )
+            """,
+            """
+            CREATE TABLE defi_execution_events (
+                id INTEGER PRIMARY KEY,
+                plan_sha256 TEXT NOT NULL REFERENCES defi_plans(plan_sha256),
+                action_id TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                chain_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                observed_at REAL NOT NULL
+            )
+            """,
+        )
+
+    def _migrate_v2_to_v3(self) -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in self._defi_schema_statements():
+                self.db.execute(statement)
+            self.db.execute("PRAGMA user_version = 3")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    @staticmethod
+    def _artifact_schema_statements() -> tuple[str, ...]:
+        return (
+            """
+            CREATE TABLE run_artifacts (
+                kind TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                stored_at REAL NOT NULL,
+                PRIMARY KEY(kind, sha256)
+            )
+            """,
+        )
+
+    def _migrate_v3_to_v4(self) -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in self._artifact_schema_statements():
+                self.db.execute(statement)
+            self.db.execute("PRAGMA user_version = 4")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def _validate_schema(
+        self, *, include_defi: bool = True, include_artifacts: bool = False
+    ) -> None:
         expected_columns = {
             "wallets": {"id", "address"},
             "assets": {
@@ -146,6 +234,20 @@ class Store:
             "passes": {"wallet_id", "chain_id", "block", "created_at", "modified_at"},
             "metadata": {"key", "value"},
         }
+        if include_defi:
+            expected_columns.update({
+                "defi_plans": {"plan_sha256", "created_at", "plan_json", "stored_at"},
+                "defi_positions": {
+                    "plan_sha256", "ordinal", "wallet", "chain_id", "protocol_id",
+                    "pool_id", "status", "reason", "action_id", "entry_json",
+                },
+                "defi_execution_events": {
+                    "id", "plan_sha256", "action_id", "wallet", "chain_id",
+                    "status", "result_json", "observed_at",
+                },
+            })
+        if include_artifacts:
+            expected_columns["run_artifacts"] = {"kind", "sha256", "payload", "stored_at"}
         tables = {
             row[0]
             for row in self.db.execute(
@@ -154,11 +256,11 @@ class Store:
         }
         missing = expected_columns.keys() - tables
         if missing:
-            raise ValueError(f"schema v2 missing required tables: {', '.join(sorted(missing))}")
+            raise ValueError(f"schema missing required tables: {', '.join(sorted(missing))}")
         for table, expected in expected_columns.items():
             columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
             if not expected <= columns:
-                raise ValueError(f"schema v2 has incomplete table: {table}")
+                raise ValueError(f"schema has incomplete table: {table}")
         required_keys = (
             ("wallets", ("address",), "wallet address constraint"),
             (
@@ -176,6 +278,17 @@ class Store:
         for table, columns, description in required_keys:
             if not self._has_unique_key(table, columns):
                 raise ValueError(f"schema v2 missing {description}")
+        if include_defi:
+            for table, columns in (
+                ("defi_plans", ("plan_sha256",)),
+                ("defi_positions", ("plan_sha256", "ordinal")),
+            ):
+                if not self._has_unique_key(table, columns):
+                    raise ValueError(f"schema missing {table} identity constraint")
+        if include_artifacts and not self._has_unique_key(
+            "run_artifacts", ("kind", "sha256")
+        ):
+            raise ValueError("schema missing run artifact identity constraint")
         rows = self.db.execute(
             "SELECT value FROM metadata WHERE key='database_uuid'"
         ).fetchall()
@@ -245,6 +358,147 @@ class Store:
         if row is None:  # pragma: no cover - schema invariant
             raise ValueError("database UUID is missing")
         return str(row[0])
+
+    def save_run_artifact(self, kind: str, payload: bytes) -> str:
+        """Keep a reviewed JSON artifact in the same database as execution state."""
+
+        self._write_guard()
+        if kind not in {"route_plan", "route_quote"}:
+            raise ValueError("invalid run artifact kind")
+        parsed = json.loads(payload)
+        if not isinstance(parsed, dict):
+            raise ValueError("invalid run artifact")
+        text = payload.decode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO run_artifacts(kind, sha256, payload, stored_at) "
+                "VALUES (?, ?, ?, ?)",
+                (kind, digest, text, time.time()),
+            )
+        return digest
+
+    def run_artifact(self, kind: str, payload: bytes) -> str | None:
+        if self.schema_version < 4:
+            return None
+        digest = hashlib.sha256(payload).hexdigest()
+        row = self.db.execute(
+            "SELECT payload FROM run_artifacts WHERE kind=? AND sha256=?",
+            (kind, digest),
+        ).fetchone()
+        return digest if row is not None and row[0].encode("utf-8") == payload else None
+
+    def run_artifact_bytes(self, kind: str, digest: str) -> bytes | None:
+        if self.schema_version < 4:
+            return None
+        row = self.db.execute(
+            "SELECT payload FROM run_artifacts WHERE kind=? AND sha256=?",
+            (kind, digest),
+        ).fetchone()
+        return row[0].encode("utf-8") if row else None
+
+    def save_defi_plan(self, plan_sha256: str, plan_bytes: bytes) -> None:
+        """Save the exact reviewed plan and every position in the inventory database."""
+
+        self._write_guard()
+        if hashlib.sha256(plan_bytes).hexdigest() != plan_sha256:
+            raise ValueError("DeFi plan digest does not match content")
+        plan = json.loads(plan_bytes)
+        if not isinstance(plan, dict) or plan.get("schema") != "rabby-defi-withdraw-v1":
+            raise ValueError("invalid DeFi plan")
+        entries = plan.get("entries")
+        if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+            raise ValueError("invalid DeFi plan positions")
+        created_at = plan.get("created_at")
+        if isinstance(created_at, bool) or not isinstance(created_at, int):
+            raise ValueError("invalid DeFi plan timestamp")
+        payload = plan_bytes.decode("utf-8")
+        with self.db:
+            existing = self.db.execute(
+                "SELECT plan_json FROM defi_plans WHERE plan_sha256=?", (plan_sha256,)
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload:
+                    raise ValueError("conflicting stored DeFi plan")
+                return
+            self.db.execute(
+                "INSERT INTO defi_plans(plan_sha256, created_at, plan_json, stored_at) "
+                "VALUES (?, ?, ?, ?)",
+                (plan_sha256, created_at, payload, time.time()),
+            )
+            for ordinal, entry in enumerate(entries):
+                self.db.execute(
+                    """INSERT INTO defi_positions(
+                        plan_sha256, ordinal, wallet, chain_id, protocol_id, pool_id,
+                        status, reason, action_id, entry_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        plan_sha256, ordinal, str(entry.get("wallet", "")).lower(),
+                        entry.get("chain_id"), str(entry.get("protocol_id", "")),
+                        str(entry.get("pool_id", "")), str(entry.get("status", "")),
+                        entry.get("reason"), entry.get("action_id"), self._json(entry),
+                    ),
+                )
+
+    def defi_plan(self, plan_sha256: str) -> bytes | None:
+        if self.schema_version < 3:
+            return None
+        row = self.db.execute(
+            "SELECT plan_json FROM defi_plans WHERE plan_sha256=?", (plan_sha256,)
+        ).fetchone()
+        return row[0].encode("utf-8") if row else None
+
+    def defi_positions(self, plan_sha256: str) -> list[dict[str, Any]]:
+        if self.schema_version < 3:
+            return []
+        rows = self.db.execute(
+            "SELECT entry_json FROM defi_positions WHERE plan_sha256=? ORDER BY ordinal",
+            (plan_sha256,),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def record_defi_execution(
+        self, plan_sha256: str, action_id: str, result: dict[str, Any]
+    ) -> None:
+        self._write_guard()
+        rows = self.db.execute(
+            """SELECT wallet, chain_id FROM defi_positions
+               WHERE plan_sha256=? AND action_id=? AND status='ready'""",
+            (plan_sha256, action_id),
+        ).fetchall()
+        if len(rows) != 1 or result.get("action_id") != action_id:
+            raise ValueError("DeFi execution does not match a stored ready action")
+        status = result.get("status")
+        if status not in {"preview", "withdrawn", "manual_review"}:
+            raise ValueError("invalid DeFi execution status")
+        with self.db:
+            self.db.execute(
+                """INSERT INTO defi_execution_events(
+                    plan_sha256, action_id, wallet, chain_id, status, result_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan_sha256, action_id, rows[0]["wallet"], rows[0]["chain_id"],
+                    status, self._json(result), time.time(),
+                ),
+            )
+
+    def defi_execution_events(self, plan_sha256: str) -> list[dict[str, Any]]:
+        if self.schema_version < 3:
+            return []
+        rows = self.db.execute(
+            """SELECT action_id, wallet, chain_id, status, result_json, observed_at
+               FROM defi_execution_events WHERE plan_sha256=? ORDER BY id""",
+            (plan_sha256,),
+        ).fetchall()
+        return [
+            {
+                "action_id": row["action_id"], "wallet": row["wallet"],
+                "chain_id": row["chain_id"], "status": row["status"],
+                "result": json.loads(row["result_json"]),
+                "observed_at": float(row["observed_at"]),
+            }
+            for row in rows
+        ]
 
     def upsert_asset(
         self,

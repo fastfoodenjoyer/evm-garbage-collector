@@ -1,3 +1,5 @@
+import hashlib
+import json
 import multiprocessing
 import sqlite3
 from pathlib import Path
@@ -101,6 +103,102 @@ def test_database_uuid_is_stable_across_reopen(tmp_path):
         database_uuid = store.database_uuid()
     with Store(db) as store:
         assert store.database_uuid() == database_uuid
+
+
+def test_defi_plan_and_execution_events_are_persisted_without_keys(tmp_path):
+    db = tmp_path / "db"
+    action_id = "a" * 64
+    plan = {
+        "schema": "rabby-defi-withdraw-v1", "created_at": 100,
+        "entries": [{
+            "wallet": "0xabc", "chain_id": 1, "protocol_id": "vault",
+            "pool_id": "pool", "position_index": "", "status": "ready",
+            "reason": "", "action_id": action_id, "action": {"func": "withdraw()"},
+        }],
+        "summary": {"ready": 1, "manual_review": 0},
+    }
+    plan_bytes = (json.dumps(plan) + "\n").encode()
+    digest = hashlib.sha256(plan_bytes).hexdigest()
+    with Store(db) as store:
+        store.save_defi_plan(digest, plan_bytes)
+        store.record_defi_execution(
+            digest, action_id, {
+                "status": "manual_review", "action_id": action_id,
+                "tx_hash": "0x" + "b" * 64,
+            }
+        )
+    with Store(db, readonly=True) as store:
+        assert store.defi_plan(digest) == plan_bytes
+        assert store.defi_positions(digest)[0]["action_id"] == action_id
+        assert store.defi_execution_events(digest)[0]["result"]["tx_hash"] == "0x" + "b" * 64
+    assert "private_key" not in db.read_bytes().decode(errors="ignore")
+
+
+def test_v2_inventory_is_migrated_without_losing_assets(tmp_path):
+    db = tmp_path / "db"
+    with Store(db) as store:
+        original_uuid = store.database_uuid()
+        store.upsert_asset("0xabc", 1, "native")
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE run_artifacts")
+        conn.execute("DROP TABLE defi_execution_events")
+        conn.execute("DROP TABLE defi_positions")
+        conn.execute("DROP TABLE defi_plans")
+        conn.execute("PRAGMA user_version=2")
+        conn.commit()
+    with Store(db) as store:
+        assert store.database_uuid() == original_uuid
+        assert len(store.assets()) == 1
+        assert store.defi_positions("0" * 64) == []
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == Store.SCHEMA_VERSION
+
+
+def test_route_artifact_is_kept_in_the_inventory_database(tmp_path):
+    db = tmp_path / "inventory.sqlite"
+    payload = b'{"entries":[]}\n'
+    with Store(db) as store:
+        digest = store.save_run_artifact("route_plan", payload)
+        assert store.run_artifact("route_plan", payload) == digest
+    with Store(db, readonly=True) as store:
+        assert store.run_artifact_bytes("route_plan", digest) == payload
+
+
+def test_v3_database_gains_run_artifacts_without_losing_defi(tmp_path):
+    db = tmp_path / "inventory.sqlite"
+    plan = {"schema": "rabby-defi-withdraw-v1", "created_at": 100, "entries": []}
+    payload = json.dumps(plan).encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    with Store(db) as store:
+        store.save_defi_plan(digest, payload)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE run_artifacts")
+        conn.execute("PRAGMA user_version=3")
+        conn.commit()
+    with Store(db) as store:
+        assert store.defi_plan(digest) == payload
+        assert store.save_run_artifact("route_plan", b'{"entries":[]}')
+
+
+def test_inventory_and_transaction_journal_share_one_sqlite_file(tmp_path):
+    from evm_inventory.journal import Journal
+
+    db = tmp_path / "inventory.sqlite"
+    with Store(db) as store:
+        store.upsert_asset("0xabc", 1, "native")
+        store.save_run_artifact("route_plan", b'{"entries":[]}')
+    with Journal(db) as journal:
+        position = journal.get_or_create_position(position_key="route:abc", wallet="0xabc")
+        journal.record_step_intent(
+            position_id=position["id"], step_key="swap", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+    with Store(db, readonly=True) as store:
+        assert len(store.assets()) == 1
+        assert store.run_artifact("route_plan", b'{"entries":[]}')
+    with Journal(db, readonly=True) as journal:
+        assert journal.route_step_state_counts() == {"planned": 1}
+    assert list(tmp_path.glob("*.sqlite")) == [db]
 
 
 def test_populated_zero_version_database_is_rejected_without_modification(tmp_path):

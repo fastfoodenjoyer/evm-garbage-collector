@@ -693,11 +693,15 @@ def reconcile_bridge_observation(
 def resume_routes_read_only(*, journal_path: Path) -> dict[str, object]:
     """Return durable route status without loading credentials or performing I/O."""
 
-    with Journal(journal_path) as journal:
-        step_counts = journal.route_step_state_counts()
-        position_counts = journal.route_position_state_counts()
-        group_counts = journal.route_group_state_counts()
-        reasons = journal.route_reason_counts()
+    with Journal(journal_path, readonly=True) as journal:
+        if journal.has_route_tables():
+            step_counts = journal.route_step_state_counts()
+            position_counts = journal.route_position_state_counts()
+            group_counts = journal.route_group_state_counts()
+            reasons = journal.route_reason_counts()
+        else:
+            step_counts = position_counts = group_counts = {}
+            reasons = []
     return {
         "status": "read_only",
         "groups": group_counts,

@@ -8,7 +8,7 @@ from hashlib import sha256
 from typing import Protocol
 
 from eth_account import Account
-from eth_utils import keccak
+from eth_utils import keccak, to_checksum_address
 
 from .lifi import TransactionRequest
 from .rpc import RpcError, quantity, uint256
@@ -155,6 +155,8 @@ def sign_transaction(
 
     if not _ADDRESS_RE.fullmatch(expected_sender):
         raise ValueError("invalid expected sender")
+    if not isinstance(request.to, str) or not _ADDRESS_RE.fullmatch(request.to):
+        raise ValueError("invalid transaction recipient")
     if nonce < 0:
         raise ValueError("invalid nonce")
     account = Account.from_key(private_key)
@@ -164,7 +166,7 @@ def sign_transaction(
         {
             "chainId": request.chain_id,
             "nonce": nonce,
-            "to": request.to,
+            "to": to_checksum_address(request.to),
             "value": request.value,
             "data": request.data,
             "gas": request.gas_limit,

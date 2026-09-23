@@ -9,6 +9,7 @@ __pycache__/
 *.sqlite*
 reports/
 local/
+out/
 .idea/
 .DS_Store
 wallets*.txt

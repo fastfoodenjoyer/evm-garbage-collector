@@ -1,6 +1,6 @@
 # EVM Inventory and Bitget Consolidation
 
-CLI для инвентаризации EVM-кошельков, подготовки маршрутов к депозиту на Bitget и их явного выполнения. По умолчанию команды только читают данные и создают файлы; подпись и отправка транзакций возможны исключительно с флагом `--execute`.
+CLI для инвентаризации EVM-кошельков, подготовки маршрутов к депозиту на Bitget и их явного выполнения. Все рабочие команды используют один локальный SQLite-файл через `--db`. Подпись и отправка транзакций возможны исключительно с флагом `--execute`.
 
 > Внимание: `execute-routes --execute` может перемещать средства. Сначала соберите инвентарь и сформируйте план, затем проверьте его JSON и только после этого запускайте выполнение.
 
@@ -20,7 +20,7 @@ cp .env.example .env
 | `BITGET_API_KEY`, `BITGET_SECRET_KEY`, `BITGET_PASSPHRASE` | Получение живого каталога депозитов и выполнение маршрутов. |
 | `MAX_ROUTE_LOSS_PCT` | Максимальная суммарная потеря на кошелёк и исходную сеть; по умолчанию `15`, допустимый диапазон `(0, 100]`. |
 
-Приватные ключи берутся из workbook только на время выполнения и не записываются в отчёты, план или журнал.
+Приватные ключи берутся из workbook только на время выполнения и не записываются в отчёты, план или базу.
 
 ## Режимы работы
 
@@ -47,7 +47,7 @@ uv run evm-inventory scan \
   --db out/inventory.sqlite
 ```
 
-Инвентарь сохраняется в SQLite. Перед планированием убедитесь, что нужные сети и токены имеют полное покрытие: отсутствие цены, RPC-ответа или discovery не считается нулевым балансом.
+Инвентарь, планы и состояние выполнения сохраняются в одном файле `out/inventory.sqlite`. Перед планированием убедитесь, что нужные сети и токены имеют полное покрытие: отсутствие цены, RPC-ответа или discovery не считается нулевым балансом.
 
 Для выгрузки уже собранного JSON в плоский CSV:
 
@@ -83,6 +83,7 @@ uv run evm-inventory workbook-dry-run \
 uv run evm-inventory quote-routes \
   --balances out/inventory-export/balances.csv \
   --workbook input/wallets.xlsx \
+  --db out/inventory.sqlite \
   --output out/routes-plan.json \
   --wallet-ranges 5 \
   --quote-floor 0.01
@@ -95,8 +96,9 @@ uv run evm-inventory quote-routes \
 ```bash
 uv run evm-inventory route-plan \
   --balances out/inventory-export/balances.csv \
+  --db out/inventory.sqlite \
   --output out/offline-plan.json \
-  --quote-floor-raw 0.01
+  --quote-floor-raw 100
 ```
 
 #### Правила планировщика
@@ -108,7 +110,7 @@ uv run evm-inventory route-plan \
 - Балансы с действиями `deny` или `review`, пылевые суммы и строки без адреса депозита не увеличивают знаменатель группы и не допускаются к отправке.
 - Допустимое направление и провайдер заранее не задаются в конфигурации: LI.FI-котировка принимается только после структурной проверки маршрута и точного совпадения идентичности активов.
 - Если свежая проверка маршрута, цены, газа, целевого минимума Bitget или бюджета группы не проходит, позиция получает `manual_review`, а оставшиеся отправки этой группы останавливаются.
-- Для последовательности `swap_to_native → bridge` исполнитель измеряет фактический результат swap, повторно котирует bridge с фактического native-баланса и сохраняет старый и новый маршрут в journal. Неоднозначный результат отправки не приводит к слепому повтору транзакции.
+- Для последовательности `swap_to_native → bridge` исполнитель измеряет фактический результат swap, повторно котирует bridge с фактического native-баланса и сохраняет старый и новый маршрут в общей базе. Неоднозначный результат отправки не приводит к слепому повтору транзакции.
 - Если перед финальным шагом нужен переход в другую сеть, исполнитель опрашивает LI.FI `/status` до подтверждённого прихода, сверяет получателя, токен и фактический баланс, затем повторно котирует оставшийся путь. Перед следующей подписью он заново проверяет цену, газ, минимум Bitget и общий лимит потерь группы; статус `PENDING` обрабатывается автоматически.
 
 Список `assets` в `config/swap-allowlist.json` по-прежнему задаёт действия для точных пар `chain_id` и `asset_id`; одного символа для допуска актива недостаточно.
@@ -122,7 +124,7 @@ uv run evm-inventory execute-routes \
   --plan out/routes-plan.json \
   --workbook input/wallets.xlsx \
   --catalog src/evm_inventory/data/catalog.json \
-  --journal out/execution-journal.sqlite
+  --db out/inventory.sqlite
 ```
 
 Только после проверки добавьте `--execute`:
@@ -132,21 +134,21 @@ uv run evm-inventory execute-routes \
   --plan out/routes-plan.json \
   --workbook input/wallets.xlsx \
   --catalog src/evm_inventory/data/catalog.json \
-  --journal out/execution-journal.sqlite \
+  --db out/inventory.sqlite \
   --wallet-ranges 5 \
   --execute
 ```
 
-Исполнитель хранит намерение, nonce и хеш транзакции в journal до и после broadcast. При неоднозначном RPC-ответе он восстанавливает состояние по nonce/хешу вместо слепой повторной отправки. Причина ошибки сохраняется в journal рядом со статусом маршрута.
+Исполнитель хранит намерение, nonce и хеш транзакции в той же базе до и после broadcast. При неоднозначном RPC-ответе он восстанавливает состояние по nonce/хешу вместо слепой повторной отправки. Причина ошибки сохраняется там же рядом со статусом маршрута.
 
 ### 6. Посмотреть состояние выполнения и восстановить контекст
 
 ```bash
 uv run evm-inventory resume-routes \
-  --journal out/execution-journal.json
+  --db out/inventory.sqlite
 ```
 
-Команда только читает journal и выводит счётчики групп, позиций и транзакционных шагов, а также причины ручной проверки. Она не загружает workbook или ключи, не делает RPC-запросов, не меняет journal и не отправляет повторные транзакции. Это первый шаг после прерывания или ошибки выполнения; состояния `source_asset_converted_bridge_pending`, `requote_required` и `manual_review_after_swap` требуют ручного разбора.
+Команда только читает общую базу и выводит счётчики групп, позиций и транзакционных шагов, а также причины ручной проверки. Она не загружает workbook или ключи, не делает RPC-запросов, не меняет базу и не отправляет повторные транзакции. Это первый шаг после прерывания или ошибки выполнения; состояния `source_asset_converted_bridge_pending`, `requote_required` и `manual_review_after_swap` требуют ручного разбора.
 
 ### Сквозной запуск
 
@@ -154,17 +156,67 @@ uv run evm-inventory resume-routes \
 uv run evm-inventory scan --wallets input/wallets.txt --db out/inventory.sqlite
 uv run evm-inventory export --db out/inventory.sqlite --output out/inventory-export
 uv run evm-inventory quote-routes --balances out/inventory-export/balances.csv \
-  --workbook input/wallets.xlsx --output out/routes-plan.json --wallet-ranges 5
+  --workbook input/wallets.xlsx --db out/inventory.sqlite \
+  --output out/routes-plan.json --wallet-ranges 5
 ```
 
-Проверьте JSON-план: конкретную сеть и актив Bitget, адрес получателя, сумму, шаги и групповой `loss_pct`. Затем выполните выбранные диапазоны только с явным `--execute` и после завершения или прерывания прочитайте journal:
+Проверьте JSON-план: конкретную сеть и актив Bitget, адрес получателя, сумму, шаги и групповой `loss_pct`. Затем выполните выбранные диапазоны только с явным `--execute` и после завершения или прерывания прочитайте состояние общей базы:
 
 ```bash
 uv run evm-inventory execute-routes --plan out/routes-plan.json \
   --workbook input/wallets.xlsx --catalog src/evm_inventory/data/catalog.json \
-  --journal out/execution-journal.sqlite --wallet-ranges 5 --execute
-uv run evm-inventory resume-routes --journal out/execution-journal.sqlite
+  --db out/inventory.sqlite --wallet-ranges 5 --execute
+uv run evm-inventory resume-routes --db out/inventory.sqlite
 ```
+
+## Вывод средств из DeFi через действия Rabby
+
+Rabby возвращает для части DeFi-позиций готовые `withdraw_actions`. Для каждого кошелька заполните колонку `Прокси Rabby` в XLSX: URL вида `http://user:pass@host:port`, `https://user:pass@host:port` или `socks5://user:pass@host:port`. Команды `quote-defi` и `execute-defi` обращаются к Rabby только через прокси соответствующего кошелька; при пустом или неверном прокси команда останавливается. Прокси и приватные ключи не записываются в план или базу. Поддерживаются простые прямые выводы; позиции с долгом, proxy-контрактом, очередью вывода, неоднозначным действием или неподдержанной функцией получают `manual_review`.
+
+```bash
+uv run evm-inventory quote-defi \
+  --wallets input/wallets.txt \
+  --workbook input/wallets.xlsx \
+  --db out/inventory.sqlite \
+  --output out/defi-plan.json
+```
+
+Команда выводит `plan_sha256`. В `defi-plan.json` найдите нужную строку со статусом `ready`, проверьте сеть, протокол, адрес контракта, `func`, `str_params`, получателя и при необходимости `need_approve`. Скопируйте её `action_id`. План действует 15 минут. Выполняется **ровно одно** выбранное действие:
+
+```bash
+uv run evm-inventory execute-defi \
+  --plan out/defi-plan.json \
+  --plan-sha256 <plan_sha256> \
+  --action-id <action_id> \
+  --workbook input/wallets.xlsx \
+  --db out/inventory.sqlite \
+  --max-gas-wei 1000000000000000
+```
+
+Без `--execute` команда только обновляет данные Rabby, проверяет RPC и показывает необходимый газ. Если для действия нужна новая транзакция `approve`, выполнение останавливается с сообщением о необходимости отдельного разрешения. Для подписи и отправки подготовленного вывода повторите проверенную команду с `--execute`.
+
+Все позиции, действия и результаты Rabby сохраняются в той же базе (`--db`), что и инвентарь, планы маршрутов и состояние их выполнения. JSON остаётся файлом для просмотра и подтверждения SHA-256. Намерение отправки, nonce и хеш транзакции также находятся в этой базе для восстановления после сбоя. Существующая база инвентаря версии 2 или 3 автоматически обновляется до версии 4 при записи.
+
+Перед подписью действие заново сверяется с Rabby, проверяются контракт, получатель, allowance, сеть и лимит газа. После подтверждения `removeLiquidity` результат `withdrawn` выдаётся только тогда, когда логи самой транзакции подтверждают получение обоих токенов не меньше указанных в действии минимумов. Для блокировки veSTG на BNB Chain дополнительно сверяются события `Withdraw` и перевод STG на тот же кошелёк с точно совпадающей суммой. Для остальных методов подтверждённая транзакция получает `manual_review`: Rabby не всегда сообщает точный выходной актив и минимальный результат. Повторный запуск с тем же `--db` наблюдает уже отправленную транзакцию и не подписывает новую. Комиссия Rabby за сам вызов вывода в опубликованном коде не указана; возможны газ и комиссии самого протокола.
+
+После вывода запустите обычный `scan` и `quote-routes`, чтобы обработать полученные на кошелёк токены.
+
+Для пакетного вывода из уже сохранённого в общей базе плана используйте `python -m evm_inventory.defi_batch init`, затем `run` с тем же `--db` и `--run-id`. При `init` можно задать два независимых интервала в секундах:
+
+```bash
+uv run python -m evm_inventory.defi_batch init \
+  --db out/inventory.sqlite --workbook local/wallets.xlsx \
+  --seed-plan out/defi-plan-1-50.json --run-id defi-first-50 \
+  --output-dir out/defi-batch-first-50 \
+  --between-wallet-delay-min-seconds 1200 \
+  --between-wallet-delay-max-seconds 6000 \
+  --within-wallet-delay-min-seconds 60 \
+  --within-wallet-delay-max-seconds 300
+uv run python -m evm_inventory.defi_batch run \
+  --db out/inventory.sqlite --run-id defi-first-50
+```
+
+По умолчанию задержка между транзакциями разных кошельков составляет 20–100 минут, а между транзакциями одного кошелька — 1–5 минут. Пауза проверяется перед новой отправкой; запросы к Rabby и RPC для просмотра и оценки газа её не расходуют. Параметры запуска и сроки хранятся в общей SQLite-базе, поэтому после перезапуска очередь продолжает работать с теми же настройками.
 
 ## Что проверять перед боевым прогоном
 
@@ -172,8 +224,8 @@ uv run evm-inventory resume-routes --journal out/execution-journal.sqlite
 2. В `routes-plan.json` нет `manual_review`, `unknown` или неподтверждённых действий.
 3. Сумма, комиссия, газовый резерв, сеть назначения и адрес депозита экономически приемлемы для каждого маршрута.
 4. Для каждого маршрута проверьте точную цель Bitget, получателя, идентичности активов и структурные данные котировки LI.FI.
-5. Journal сохранён в устойчивом месте и перед повторным запуском проверен через `resume-routes`.
+5. Общая база сохранена в устойчивом месте и перед повторным запуском проверена через `resume-routes`.
 
 ## Безопасность
 
-Не добавляйте `.env`, workbook с приватными ключами, планы с чувствительными данными и execution journal в Git. Используйте отдельный тестовый кошелёк перед первым боевым запуском и ограничивайте `--wallet-ranges`, пока не убедитесь в поведении на одном кошельке.
+Не добавляйте `.env`, workbook с приватными ключами, планы с чувствительными данными и локальную базу в Git. Используйте отдельный тестовый кошелёк перед первым боевым запуском и ограничивайте `--wallet-ranges`, пока не убедитесь в поведении на одном кошельке.

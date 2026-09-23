@@ -108,9 +108,14 @@ _STEP_TRANSITIONS = {
 
 
 class Journal:
-    def __init__(self, path: Path):
-        self.connection = sqlite3.connect(path)
+    def __init__(self, path: Path, *, readonly: bool = False):
+        self.connection = (
+            sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            if readonly else sqlite3.connect(path)
+        )
         self.connection.row_factory = sqlite3.Row
+        if readonly:
+            return
         self.connection.execute("""
             CREATE TABLE IF NOT EXISTS operations (
               id INTEGER PRIMARY KEY, wallet TEXT NOT NULL, action TEXT NOT NULL,
@@ -234,6 +239,14 @@ class Journal:
 
     def __exit__(self, *_):
         self.connection.close()
+
+    def has_route_tables(self) -> bool:
+        names = {
+            row[0] for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        return {"route_groups", "route_positions", "route_steps", "route_events"} <= names
 
     def create_operation(self, *, wallet: str, action: str) -> int:
         cursor = self.connection.execute(

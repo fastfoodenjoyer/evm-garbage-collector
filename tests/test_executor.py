@@ -44,6 +44,23 @@ def test_sign_transaction_uses_expected_private_key_and_chain():
     assert raw.startswith("0x")
 
 
+def test_sign_transaction_accepts_normalized_contract_address_with_letters():
+    key = "0x" + "1" * 64
+    sender = Account.from_key(key).address
+    request = TransactionRequest(
+        chain_id=56,
+        to="0xd4888870c8686c748232719051b677791dbda26d",
+        data="0x3ccfd60b",
+        value=0,
+        gas_limit=100_000,
+        gas_price_wei=100_000_000,
+    )
+
+    raw = sign_transaction(request, private_key=key, expected_sender=sender, nonce=0)
+
+    assert raw.startswith("0x")
+
+
 def test_sign_transaction_rejects_wrong_sender():
     request = TransactionRequest(10, "0x" + "2" * 40, "0x", 0, 21_000, 1)
 

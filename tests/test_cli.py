@@ -6,6 +6,7 @@ import pytest
 
 from evm_inventory.cli import _execution_rpc_urls, main
 from evm_inventory.models import ConfigError
+from evm_inventory.store import Store
 
 
 def test_workbook_commands_create_template_and_write_dry_run(tmp_path, capsys):
@@ -32,10 +33,16 @@ def test_route_plan_writes_transaction_free_runbook(tmp_path, capsys):
     )
     output = tmp_path / "runbook.json"
 
-    assert main(["route-plan", "--balances", str(balances), "--output", str(output)]) == 0
+    db = tmp_path / "inventory.sqlite"
+    assert main([
+        "route-plan", "--balances", str(balances), "--output", str(output),
+        "--db", str(db),
+    ]) == 0
 
     assert json.loads(capsys.readouterr().out)["status"] == "planned"
     assert json.loads(output.read_text())["summary"]["dust"] == 1
+    with Store(db, readonly=True) as store:
+        assert store.run_artifact("route_plan", output.read_bytes()) is not None
 
 
 def test_dry_run_no_db(tmp_path, capsys):
@@ -198,8 +205,10 @@ def test_export_accepts_current_database_without_run_argument(tmp_path):
 def test_resume_routes_prints_key_free_durable_status(tmp_path, capsys):
     from evm_inventory.journal import Journal
 
-    journal_path = tmp_path / "journal.sqlite"
-    with Journal(journal_path) as journal:
+    db = tmp_path / "inventory.sqlite"
+    with Store(db):
+        pass
+    with Journal(db) as journal:
         group = journal.get_or_create_group(
             group_key="wallet:10:plan", wallet="0x" + "1" * 40,
             source_chain_id=10, loss_budget_pct="15", source_usd="100",
@@ -225,7 +234,7 @@ def test_resume_routes_prints_key_free_durable_status(tmp_path, capsys):
         journal.record_receipt(step["id"], status="confirmed", finality_block=123)
         journal.record_timeout_report(step["id"], "no_correlated_arrival")
 
-    assert main(["resume-routes", "--journal", str(journal_path)]) == 0
+    assert main(["resume-routes", "--db", str(db)]) == 0
 
     captured = capsys.readouterr()
     result = json.loads(captured.out)
@@ -240,6 +249,18 @@ def test_resume_routes_prints_key_free_durable_status(tmp_path, capsys):
         "pending": 0,
     }
     assert "private" not in captured.out.lower()
+
+
+def test_resume_routes_on_inventory_without_transactions_is_read_only(tmp_path, capsys):
+    db = tmp_path / "inventory.sqlite"
+    with Store(db):
+        pass
+    assert main(["resume-routes", "--db", str(db)]) == 0
+    assert json.loads(capsys.readouterr().out)["steps"] == {}
+    with Store(db, readonly=True) as store:
+        assert store.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='route_steps'"
+        ).fetchone() is None
 
 
 @pytest.mark.parametrize(
@@ -354,6 +375,8 @@ def test_quote_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeypat
             str(tmp_path / "wallets.xlsx"),
             "--output",
             str(tmp_path / "plan.json"),
+            "--db",
+            str(tmp_path / "inventory.sqlite"),
         ]
     ) == 0
 
@@ -397,10 +420,11 @@ def test_execute_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeyp
             str(tmp_path / "wallets.xlsx"),
             "--catalog",
             str(tmp_path / "catalog.json"),
-            "--journal",
-            str(tmp_path / "journal.sqlite"),
+            "--db",
+            str(tmp_path / "inventory.sqlite"),
         ]
     ) == 0
 
     assert calls["max_route_loss_pct"] == Decimal("8.5")
+    assert calls["journal_path"] == tmp_path / "inventory.sqlite"
     capsys.readouterr()

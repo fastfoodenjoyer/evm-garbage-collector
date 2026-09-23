@@ -6,6 +6,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
@@ -19,6 +20,7 @@ WORKSHEET_HEADERS = (
     "Приватный ключ",
     "Адрес депозита Bitget",
     "Предлагаемые действия",
+    "Прокси Rabby",
 )
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -32,6 +34,32 @@ class WalletWorkbookRow:
     public_address: str
     private_key: str = field(repr=False)
     bitget_deposit_address: str
+    rabby_proxy: str = field(default="", repr=False)
+
+
+def _rabby_proxy(value: object, *, row_number: int, required: bool) -> str:
+    if value is None or value == "":
+        if required:
+            raise ConfigError(f"row {row_number}: Rabby proxy is required")
+        return ""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ConfigError(f"row {row_number}: invalid Rabby proxy")
+    proxy = value
+    try:
+        parsed = urlsplit(proxy)
+        valid = (
+            parsed.scheme in {"http", "https", "socks5"}
+            and bool(parsed.hostname)
+            and parsed.port is not None
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(f"row {row_number}: invalid Rabby proxy")
+    return proxy
 
 
 def parse_ordinal_ranges(spec: str | None) -> tuple[tuple[int, int], ...] | None:
@@ -93,7 +121,9 @@ def create_wallet_template(path: Path) -> None:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="1F4E78")
     sheet.freeze_panes = "A2"
-    for column, width in zip(("A", "B", "C", "D", "E"), (8, 46, 72, 46, 72), strict=True):
+    for column, width in zip(
+        ("A", "B", "C", "D", "E", "F"), (8, 46, 72, 46, 72, 52), strict=True
+    ):
         sheet.column_dimensions[column].width = width
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
@@ -109,6 +139,7 @@ def load_wallet_workbook(
     path: Path,
     *,
     require_deposit_address: bool = True,
+    require_rabby_proxy: bool = False,
     ordinal_ranges: tuple[tuple[int, int], ...] | None = None,
 ) -> tuple[WalletWorkbookRow, ...]:
     """Read and validate operator input without persisting private keys."""
@@ -121,8 +152,11 @@ def load_wallet_workbook(
         raise ConfigError(f"workbook must contain a {WORKSHEET_NAME!r} sheet")
     sheet = workbook[WORKSHEET_NAME]
     headers = tuple(cell.value for cell in sheet[1])
-    if headers != WORKSHEET_HEADERS:
+    if headers != WORKSHEET_HEADERS and not (
+        not require_rabby_proxy and headers == WORKSHEET_HEADERS[:-1]
+    ):
         raise ConfigError("workbook headers do not match the wallet template")
+    has_proxy_column = headers == WORKSHEET_HEADERS
 
     rows: list[WalletWorkbookRow] = []
     seen_ordinals: set[int] = set()
@@ -154,6 +188,11 @@ def load_wallet_workbook(
                 if require_deposit_address or values[3]
                 else ""
             )
+            rabby_proxy = _rabby_proxy(
+                values[5] if has_proxy_column and len(values) > 5 else None,
+                row_number=row_number,
+                required=require_rabby_proxy,
+            )
             if not _ADDRESS_RE.fullmatch(public_address):
                 raise ConfigError(f"row {row_number}: invalid public EVM address")
             if not _PRIVATE_KEY_RE.fullmatch(private_key):
@@ -173,6 +212,7 @@ def load_wallet_workbook(
                     public_address=public_address,
                     private_key=private_key,
                     bitget_deposit_address=deposit_address,
+                    rabby_proxy=rabby_proxy,
                 )
             )
         except ConfigError as exc:
