@@ -29,6 +29,70 @@ def test_client_rejects_malformed_payload():
         client.positions(WALLET)
 
 
+@pytest.mark.parametrize("endpoint", ["chain_ids", "positions"])
+def test_rabby_retries_three_429_cycles_with_exponential_waits(endpoint, capsys):
+    calls = []
+    waits = []
+
+    def respond(request):
+        calls.append(request.url.path)
+        if len(calls) <= 3:
+            return httpx.Response(429, json={"message": "too many requests"})
+        if request.url.path == "/v1/chain/list":
+            return httpx.Response(200, json=[{"id": "eth", "community_id": 1}])
+        return httpx.Response(200, json=[])
+
+    client = RabbyClient(
+        httpx.Client(transport=httpx.MockTransport(respond)), sleep=waits.append,
+    )
+    result = client.chain_ids() if endpoint == "chain_ids" else client.positions(WALLET)
+
+    assert result == ({"eth": 1} if endpoint == "chain_ids" else [])
+    assert len(calls) == 4
+    assert waits == [5, 10, 20]
+    assert capsys.readouterr().err.count('"event": "rabby_rate_limited"') == 3
+
+
+def test_rabby_honors_retry_after_and_keeps_all_failed_attempts():
+    calls = []
+    waits = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            429, headers={"Retry-After": "30"}, json={"message": "too many requests"},
+        )
+
+    client = RabbyClient(
+        httpx.Client(transport=httpx.MockTransport(respond)), sleep=waits.append,
+    )
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.chain_ids()
+
+    assert len(calls) == 4
+    assert waits == [30, 60, 120]
+    assert len(error.value.diagnostic["attempts"]) == 4
+    assert all(attempt["response_body"] == '{"message":"too many requests"}'
+               for attempt in error.value.diagnostic["attempts"])
+
+
+def test_rabby_does_not_retry_non_429_errors():
+    waits = []
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(403, json={"message": "forbidden"})
+
+    client = RabbyClient(
+        httpx.Client(transport=httpx.MockTransport(respond)), sleep=waits.append,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        client.positions(WALLET)
+    assert len(calls) == 1
+    assert waits == []
+
+
 def test_encode_withdraw_uses_first_abi_signature_and_wallet_recipient():
     action = {
         "type": "withdraw",

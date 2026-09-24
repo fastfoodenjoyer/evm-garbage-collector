@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import re
+import sys
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 from eth_abi import encode
 from eth_utils import function_signature_to_4byte_selector
+
+from .diagnostics import redact_data, redact_text
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _FUNCTION = re.compile(r"^(?:function )?([A-Za-z][A-Za-z0-9_]*)\(([^()]*)\)(?:\([^()]*\))?$")
@@ -41,25 +47,74 @@ class EncodedAction:
 class RabbyClient:
     """Public-address reads from the API used by Rabby's published SDK."""
 
-    def __init__(self, client: httpx.Client, *, base_url: str = "https://api.rabby.io"):
+    def __init__(
+        self, client: httpx.Client, *, base_url: str = "https://api.rabby.io",
+        sleep=time.sleep,
+    ):
         self.client = client
         self.base_url = base_url.rstrip("/")
+        self.sleep = sleep
+
+    @staticmethod
+    def _retry_after_seconds(header: str | None) -> float:
+        if not header:
+            return 0
+        try:
+            return max(0, float(header))
+        except ValueError:
+            try:
+                instant = parsedate_to_datetime(header)
+                if instant.tzinfo is None:
+                    instant = instant.replace(tzinfo=UTC)
+                return max(0, (instant - datetime.now(UTC)).total_seconds())
+            except (ValueError, TypeError):
+                return 0
+
+    def _get(self, path: str, *, params: dict[str, str] | None = None) -> httpx.Response:
+        attempts: list[dict[str, Any]] = []
+        for attempt in range(4):
+            response = self.client.get(
+                self.base_url + path, params=params, timeout=30,
+            )
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response
+            detail = {
+                "attempt": attempt + 1, "endpoint": path,
+                "http_status": response.status_code,
+                "response_headers": redact_data(dict(response.headers)),
+                "response_body": redact_text(response.text),
+            }
+            attempts.append(detail)
+            wait_seconds = (
+                max(5, self._retry_after_seconds(response.headers.get("Retry-After")))
+                * 2**attempt
+                if attempt < 3 else None
+            )
+            print(json.dumps({
+                "event": "rabby_rate_limited", **detail,
+                "retry_in_seconds": wait_seconds, "max_attempts": 4,
+            }, ensure_ascii=False), file=sys.stderr, flush=True)
+            if wait_seconds is None:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    exc.diagnostic = {"attempts": attempts}
+                    raise
+            self.sleep(wait_seconds)
+        raise AssertionError("unreachable")
 
     def positions(self, wallet: str) -> list[dict[str, Any]]:
         if not _ADDRESS.fullmatch(wallet):
             raise ValueError("invalid wallet address")
-        response = self.client.get(
-            self.base_url + "/v1/user/complex_protocol_list", params={"id": wallet}, timeout=30
-        )
-        response.raise_for_status()
+        response = self._get("/v1/user/complex_protocol_list", params={"id": wallet})
         data = response.json()
         if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
             raise ValueError("Rabby returned an invalid protocol list")
         return data
 
     def chain_ids(self) -> dict[str, int]:
-        response = self.client.get(self.base_url + "/v1/chain/list", timeout=30)
-        response.raise_for_status()
+        response = self._get("/v1/chain/list")
         data = response.json()
         if not isinstance(data, list):
             raise ValueError("Rabby returned an invalid chain list")

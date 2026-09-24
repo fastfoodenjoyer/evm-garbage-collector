@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import httpx
+import pytest
 from openpyxl import load_workbook
 
 from evm_inventory.defi_batch import (
@@ -251,6 +252,55 @@ def test_cli_external_api_failure_keeps_safe_error_type(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["detail"] == result.detail
 
 
+def test_rabby_429_is_classified_as_rate_limit_after_client_retries(monkeypatch, capsys):
+    request = httpx.Request("GET", "https://api.rabby.io/v1/chain/list")
+    response = httpx.Response(429, request=request, json={"message": "too many requests"})
+
+    def fail(**kwargs):
+        raise httpx.HTTPStatusError("too many requests", request=request, response=response)
+
+    monkeypatch.setattr("evm_inventory.defi_batch.quote_defi", fail)
+    result = _run_operation(BatchOperation(
+        kind="quote-defi", ordinal=3, wallets_path=Path("wallet-3.txt"),
+        workbook_path=Path("wallets.xlsx"), db_path=Path("db.sqlite"),
+        output_path=Path("plan-3.json"),
+    ))
+
+    assert result.returncode == 4
+    assert result.reason == "http_429"
+    assert "too many requests" in result.detail
+    assert json.loads(capsys.readouterr().out)["reason"] == "http_429"
+
+
+def test_quote_429_requeues_wallet_without_skipping(tmp_path):
+    workbook, plan, db = _inputs(tmp_path)
+    initialize_batch(
+        db_path=db, workbook_path=workbook, seed_plan_path=plan,
+        run_id="first-three", wallet_count=3, output_dir=tmp_path / "batch", now=1000,
+    )
+    with sqlite3.connect(db) as conn:
+        ordinal = conn.execute(
+            "SELECT ordinal FROM defi_batch_wallets "
+            "WHERE run_id='first-three' AND queue_index=0"
+        ).fetchone()[0]
+    calls = []
+
+    def invoke(operation):
+        calls.append(operation)
+        return CommandResult(4, None, "http_429", detail="Rabby HTTP 429 after 4 attempts")
+
+    assert process_wallet(db, "first-three", ordinal, invoke=invoke, now=1000) == "retry"
+    assert len(calls) == 1
+    with sqlite3.connect(db) as conn:
+        wallet = conn.execute(
+            "SELECT status,attempts,due_at,last_error FROM defi_batch_wallets "
+            "WHERE run_id='first-three' AND ordinal=?", (ordinal,),
+        ).fetchone()
+        action_count = conn.execute("SELECT count(*) FROM defi_batch_actions").fetchone()[0]
+    assert wallet == ("active", 1, 2800, "http_429")
+    assert action_count == 0
+
+
 def test_verified_stargate_receipt_has_human_readable_withdrawal_size():
     entry = {"chain_id": 56, "action": {"str_params": []}}
     result = {
@@ -413,6 +463,50 @@ def test_process_wallet_does_not_sign_when_preview_fails(tmp_path):
             "SELECT status FROM defi_batch_actions WHERE run_id='first-three'"
         ).fetchone()[0]
     assert status == "skipped"
+
+
+@pytest.mark.parametrize("stage", ["preview", "execute"])
+def test_exhausted_rabby_429_never_marks_action_skipped(tmp_path, stage):
+    workbook, plan, db = _inputs(tmp_path)
+    initialize_batch(
+        db_path=db, workbook_path=workbook, seed_plan_path=plan,
+        run_id="first-three", wallet_count=3, output_dir=tmp_path / "batch", now=1000,
+    )
+    with sqlite3.connect(db) as conn:
+        ordinal, wallet = conn.execute(
+            "SELECT ordinal, wallet FROM defi_batch_wallets "
+            "WHERE run_id='first-three' AND queue_index=0"
+        ).fetchone()
+    calls = []
+
+    def invoke(operation):
+        calls.append(operation)
+        if operation.kind == "quote-defi":
+            payload = {"schema": "rabby-defi-withdraw-v1", "entries": [{
+                "wallet": wallet, "status": "ready", "action_id": "a" * 64,
+                "chain_id": 1, "protocol_name": "Test Pool", "net_usd_value": 2,
+                "action": {"func": "redeem(uint256)()", "str_params": ["42"]},
+            }]}
+            data = (json.dumps(payload) + "\n").encode()
+            operation.output_path.write_bytes(data)
+            return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
+        if stage == "execute" and not operation.execute:
+            return CommandResult(0, {"status": "preview"})
+        return CommandResult(4, None, "http_429", detail="Rabby HTTP 429 after 4 attempts")
+
+    assert process_wallet(
+        db, "first-three", ordinal, invoke=invoke,
+        native_balance=lambda _chain, _wallet: ("ETH", 100), now=1000,
+    ) == "manual_review"
+    assert len(calls) == (2 if stage == "preview" else 3)
+    assert calls[-1].execute == (stage == "execute")
+    with sqlite3.connect(db) as conn:
+        action = conn.execute("SELECT status,reason FROM defi_batch_actions").fetchone()
+        outcome = conn.execute(
+            "SELECT status,reason,error_detail FROM defi_batch_outcomes"
+        ).fetchone()
+    assert action == ("manual_review", "http_429")
+    assert outcome == ("manual_review", "http_429", "Rabby HTTP 429 after 4 attempts")
 
 
 def test_gas_estimate_failure_retries_immediately_and_records_final_failure(tmp_path, monkeypatch):

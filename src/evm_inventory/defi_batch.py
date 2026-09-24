@@ -548,6 +548,8 @@ def _run_operation(operation: BatchOperation) -> CommandResult:
     except Exception as exc:
         message = str(exc)
         reason = (
+            "http_429" if isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code == 429 else
             "stale_plan" if message.startswith("DeFi plan is stale") else
             "gas_estimate_rpc_error" if re.fullmatch(r"estimate_gas_[a-zA-Z0-9_]+", message)
             else "ethereum_gas_deferred" if message.startswith("ethereum_gas_deferred:")
@@ -617,7 +619,7 @@ def _invoke_read_only(
 
     for attempt in range(3):
         result = invoke(operation)
-        if result.returncode != 4:
+        if result.returncode != 4 or result.reason == "http_429":
             return result
         if attempt < 2:
             time.sleep(attempt + 1)
@@ -762,6 +764,10 @@ def process_wallet(
                 (quote.reason, run_id, ordinal),
             )
             connection.commit()
+            if quote.reason == "http_429":
+                if _retry_wallet(connection, run_id, ordinal, now=now,
+                                 reason=quote.reason) == "retry":
+                    return "retry"
             seed = connection.execute(
                 "SELECT plan_json FROM defi_plans WHERE plan_sha256=?",
                 (run["seed_plan_sha256"],),
@@ -819,14 +825,17 @@ def process_wallet(
                 invoke, _execute_operation(run, action, ordinal=ordinal, execute=False),
             )
             if preview.returncode:
-                _set_action(connection, run_id, ordinal, action, status="skipped",
+                status = "manual_review" if preview.reason == "http_429" else "skipped"
+                _set_action(connection, run_id, ordinal, action, status=status,
                             now=now, reason=preview.reason)
                 after_symbol, after = native_balance(entry["chain_id"], wallet["wallet"])
-                _record_outcome(connection, run_id, ordinal, entry, status="skipped",
+                _record_outcome(connection, run_id, ordinal, entry, status=status,
                                 reason=preview.reason, tx_hash=None,
                                 native_symbol=symbol or after_symbol, native_before_wei=before,
                                 native_after_wei=after, now=time.time(),
                                 error_detail=preview.detail)
+                if status == "manual_review":
+                    return "manual_review"
                 continue
             if not preview.payload or preview.payload.get("status") != "preview":
                 detail = _log_batch_anomaly(
@@ -859,7 +868,8 @@ def process_wallet(
             execute_operation = _execute_operation(run, action, ordinal=ordinal, execute=True)
             result = _invoke_execute(invoke, execute_operation)
             for attempt in range(2):
-                if (result.returncode != 4 or result.reason == "gas_estimate_rpc_error"
+                if (result.returncode != 4 or result.reason in {
+                        "gas_estimate_rpc_error", "http_429"}
                         or _journal_has_step(connection, wallet["wallet"], action_id)):
                     break
                 time.sleep(attempt + 1)
@@ -882,10 +892,10 @@ def process_wallet(
                                            tx_hash, now=time.time())
                         return _retry_wallet(connection, run_id, ordinal, now=now,
                                              reason=result.reason, unresolved_action=True)
-                    status = ("manual_review" if _journal_has_step(
-                        connection, wallet["wallet"], action_id) else "skipped")
-                    reason = ("unresolved_intent" if status == "manual_review"
-                              else result.reason)
+                    unresolved = _journal_has_step(connection, wallet["wallet"], action_id)
+                    status = ("manual_review" if unresolved or result.reason == "http_429"
+                              else "skipped")
+                    reason = "unresolved_intent" if unresolved else result.reason
                     _set_action(connection, run_id, ordinal, action, status=status,
                                 now=now, reason=reason)
                     after_symbol, after = native_balance(entry["chain_id"], wallet["wallet"])
