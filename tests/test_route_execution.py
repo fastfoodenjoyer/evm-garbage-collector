@@ -268,9 +268,18 @@ def test_generated_native_gas_reserve_cannot_use_preexisting_wallet_balance(
     signed = []
 
     class Rpc:
-        def call(self, _url, method, _params):
+        def call(self, _url, method, params):
             if method == "eth_getBalance":
                 return hex(10_000)
+            if (method == "eth_call"
+                    and params[0].get("to") == "0x420000000000000000000000000000000000000f"):
+                return "0x" + f"{1:064x}"
+            if method == "eth_estimateGas":
+                return "0x5208"
+            if method == "eth_getBlockByNumber":
+                return {"number": "0x1"}
+            if method == "eth_gasPrice":
+                return "0x1"
             raise AssertionError(method)
 
     monkeypatch.setattr(

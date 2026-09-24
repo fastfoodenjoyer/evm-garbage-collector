@@ -7,6 +7,7 @@ import os
 import random
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
@@ -39,6 +40,7 @@ from .executor import (
     token_allowance,
     wait_for_receipt,
 )
+from .fee_planner import FeePlanner, native_asset_identity
 from .journal import Journal
 from .lifi import (
     LifiClient,
@@ -1067,9 +1069,9 @@ def _preflight_live_entry(
             raise ValueError("requote_required:below_target_minimum")
         if balance < target.minimum_raw and not asset.is_native:
             raise ValueError("requote_required:below_target_minimum")
-        native = AssetIdentity(asset.chain_id, "native", 18)
+        native = native_asset_identity(asset.chain_id)
         fee = _gas_fee_quote(
-            request.gas_limit * request.gas_price_wei, native, jumper
+            request.max_total_fee_wei, native, jumper
         )
         price = _token_quote_price(jumper, asset)
         candidate = candidate_from_values(
@@ -1404,7 +1406,7 @@ def _requote_bridge_after_swap(
         raise ValueError("requote_required:planned_bridge_missing")
     route_data = planned_bridge["route"]
     target_identity = _asset_from_data(route_data["evidence"]["destination"])
-    source = AssetIdentity(int(entry["chain_id"]), "native", 18)
+    source = native_asset_identity(int(entry["chain_id"]))
     if amount <= 0:
         raise ValueError("requote_required:empty_swap_output")
     live_target = _require_live_target(entry, wallet=wallet, bitget=bitget)
@@ -1655,7 +1657,7 @@ def _actual_gas_paid_usd(
             continue
         price = native_prices.get(chain_id)
         if price is None:
-            price = _quote_price(jumper, AssetIdentity(chain_id, "native", 18))
+            price = _quote_price(jumper, native_asset_identity(chain_id))
             native_prices[chain_id] = price
         assert isinstance(price.usd_per_token, Decimal)
         total = _exact_sum(
@@ -1846,8 +1848,14 @@ def _submit_live_step(
             )
             if not isinstance(receipt, dict):
                 raise ValueError("route_step_receipt_missing")
-            paid_native_gas += quantity(receipt.get("gasUsed")) * quantity(
-                receipt.get("effectiveGasPrice")
+            paid_native_gas += (
+                quantity(receipt.get("gasUsed"))
+                * quantity(receipt.get("effectiveGasPrice"))
+                + (
+                    quantity(receipt["l1Fee"])
+                    if receipt.get("l1Fee") is not None
+                    else 0
+                )
             )
 
         if is_cross_chain:
@@ -2057,6 +2065,7 @@ def _execute_entry(
         if recovered is not None:
             wait_for_receipt(rpc, url=url, tx_hash=recovered)
             return ExecutedTransactionHash(recovered, None)
+    request = FeePlanner(rpc).plan(url, request, sender=wallet.public_address)
     require_ethereum_planned_gas_price_valid(request)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     generated_native_cap = (
@@ -2073,7 +2082,7 @@ def _execute_entry(
         reserve_balance = balance - request.value
     require_native_reserve(
         balance=reserve_balance,
-        gas_cost=request.gas_limit * request.gas_price_wei,
+        gas_cost=request.max_total_fee_wei,
     )
     asset_id = str(entry["asset_id"])
     approval_tx_hash = None
@@ -2213,19 +2222,20 @@ def _direct_request(
 ) -> TransactionRequest:
     target = entry["target"]
     chain_id = int(entry["chain_id"])
-    gas_price = _quantity(rpc.call(url, "eth_gasPrice", []))
     asset_id = str(entry["asset_id"])
     if asset_id == "native":
         balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
         if entry.get("_actual_balance_raw") is not None:
             balance = min(balance, _raw_amount(entry["_actual_balance_raw"]))
-        gas_limit = 21_000
-        amount = balance - GAS_RESERVE_MULTIPLIER * gas_limit * gas_price
+        quote = FeePlanner(rpc).plan(
+            url,
+            TransactionRequest(chain_id, wallet.bitget_deposit_address, "0x", 0, 0, 0),
+            sender=wallet.public_address,
+        )
+        amount = balance - GAS_RESERVE_MULTIPLIER * quote.max_total_fee_wei
         if amount < int(target["minimum_raw"]):
             raise ValueError("native balance is below Bitget minimum after gas reserve")
-        return TransactionRequest(
-            chain_id, wallet.bitget_deposit_address, "0x", amount, gas_limit, gas_price
-        )
+        return replace(quote, value=amount)
     amount = int(entry["raw_balance"])
     if entry["status"] == "post_bridge_deposit":
         amount = _wait_for_staged_balance(
@@ -2239,14 +2249,7 @@ def _direct_request(
             raise ValueError("staged USDC is below Bitget minimum")
     recipient = wallet.bitget_deposit_address[2:].lower().rjust(64, "0")
     data = "0xa9059cbb" + recipient + hex(amount)[2:].rjust(64, "0")
-    gas_limit = _quantity(
-        rpc.call(
-            url,
-            "eth_estimateGas",
-            [{"from": wallet.public_address, "to": asset_id, "data": data}],
-        )
-    )
-    return TransactionRequest(chain_id, asset_id, data, 0, gas_limit, gas_price)
+    return TransactionRequest(chain_id, asset_id, data, 0, 0, 0)
 
 
 def _approve_if_needed(
@@ -2299,11 +2302,12 @@ def _approve_if_needed(
         token=asset_id,
         spender=spender,
         amount=amount,
-        gas_price_wei=request.gas_price_wei,
+        gas_price_wei=0,
     )
+    approval = FeePlanner(rpc).plan(url, approval, sender=wallet.public_address)
     require_ethereum_planned_gas_price_valid(approval)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
-    require_native_reserve(balance=balance, gas_cost=approval.gas_limit * approval.gas_price_wei)
+    require_native_reserve(balance=balance, gas_cost=approval.max_total_fee_wei)
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
     require_ethereum_gas_below_limit(rpc, url=url, request=approval)
     raw = sign_transaction(

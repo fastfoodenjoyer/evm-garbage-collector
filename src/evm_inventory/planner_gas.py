@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from .executor import approve_transaction, token_allowance
+from .fee_planner import FeePlanner, native_asset_identity
 from .lifi import LifiClient, LifiRoute, TransactionRequest
 from .models import AssetIdentity
 from .rpc import RpcReader, quantity
@@ -187,15 +188,32 @@ class PlannerGasEstimator:
         return tuple(result)
 
     def _priced_estimate(self, chain_id: int, url: str, transaction: dict) -> FeeQuote:
-        gas = quantity(self.rpc.call(url, "eth_estimateGas", [transaction, "latest"]))
-        gas_price = quantity(self.rpc.call(url, "eth_gasPrice", []))
-        native = AssetIdentity(chain_id, "native", 18)
+        sender = transaction.get("from")
+        recipient = transaction.get("to")
+        data = transaction.get("data", "0x")
+        if (
+            not isinstance(sender, str)
+            or not isinstance(recipient, str)
+            or not isinstance(data, str)
+        ):
+            raise ValueError("gas estimate transaction is incomplete")
+        value = transaction.get("value", "0x0")
+        if isinstance(value, str):
+            value = quantity(value)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("gas estimate transaction value is invalid")
+        planned = FeePlanner(self.rpc).plan(
+            url,
+            TransactionRequest(chain_id, recipient, data, value, 0, 0),
+            sender=sender,
+        )
+        native = native_asset_identity(chain_id)
         evidence = self.price_client.token_price(native)
         if evidence.asset != native or evidence.price_usd is None:
             raise ValueError("native gas-token price is unavailable")
         observed = _timestamp(evidence.timestamp)
         price = QuotePrice(native, evidence.price_usd, observed)
-        return FeeQuote(gas * gas_price, price)
+        return FeeQuote(planned.max_total_fee_wei, price)
 
     def _url(self, chain_id: int) -> str:
         url = self.rpc_urls.get(chain_id)

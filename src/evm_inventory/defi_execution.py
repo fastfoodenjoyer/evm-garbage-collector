@@ -29,6 +29,7 @@ from .executor import (
     token_allowance,
     wait_for_receipt,
 )
+from .fee_planner import FeePlanner
 from .journal import Journal
 from .lifi import TransactionRequest
 from .rabby import (
@@ -40,7 +41,6 @@ from .rabby import (
     encode_action,
 )
 from .rpc import RpcError, quantity, uint256
-from .transport import RequestError
 from .workbook import WalletWorkbookRow
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -170,9 +170,6 @@ def prepare_defi_action(
         ]))
         if deposit != int(current["action"]["str_params"][2]):
             raise ValueError("Fuel deposit balance differs from Rabby withdrawal amount")
-    gas_price = quantity(rpc.call(rpc_url, "eth_gasPrice", []))
-    if gas_price <= 0:
-        raise ValueError("invalid RPC gas price")
     if action.approval_token:
         allowance = token_allowance(
             rpc,
@@ -183,12 +180,11 @@ def prepare_defi_action(
         )
         if allowance < action.approval_amount:
             raise ValueError("DeFi action needs a separate approval before withdrawal")
-    request = _estimated_request(
-        rpc,
+    request = FeePlanner(rpc).plan(
         rpc_url,
-        wallet,
-        TransactionRequest(chain_id, action.to, action.data, 0, 0, gas_price),
-        gas_price,
+        TransactionRequest(chain_id, action.to, action.data, 0, 0, 0),
+        sender=wallet,
+        max_total_fee_wei=max_gas_wei,
     )
     rpc.call(
         rpc_url,
@@ -198,44 +194,13 @@ def prepare_defi_action(
             "latest",
         ],
     )
-    gas_cost = request.gas_limit * request.gas_price_wei
-    if gas_cost > max_gas_wei:
-        raise ValueError(
-            "estimated DeFi transaction exceeds gas cap: "
-            f"gas_limit={request.gas_limit};gas_price_wei={request.gas_price_wei};"
-            f"gas_cost_wei={gas_cost};max_gas_wei={max_gas_wei}"
-        )
+    gas_cost = request.max_total_fee_wei
     balance = quantity(rpc.call(rpc_url, "eth_getBalance", [wallet, "latest"]))
     require_native_reserve(balance=balance, gas_cost=gas_cost)
     tokens = tuple(current.get("output_token_ids") or ())
     if not tokens:
         raise ValueError("no verifiable withdrawal output token")
     return PreparedExit(current, request, action, gas_cost)
-
-
-def _estimated_request(
-    rpc: Rpc, rpc_url: str, wallet: str, request: TransactionRequest, gas_price: int
-) -> TransactionRequest:
-    try:
-        estimate = quantity(
-            rpc.call(
-                rpc_url,
-                "eth_estimateGas",
-                [{"from": wallet, "to": request.to, "data": request.data, "value": "0x0"}],
-            )
-        )
-    except RequestError as exc:
-        raise RpcError(f"estimate_gas_{exc.code}") from exc
-    if estimate <= 0:
-        raise ValueError(f"invalid DeFi gas estimate: estimate={estimate}")
-    return TransactionRequest(
-        request.chain_id,
-        request.to,
-        request.data,
-        0,
-        estimate * 12 // 10 + 1,
-        gas_price,
-    )
 
 
 def execute_defi_action(
@@ -281,6 +246,7 @@ def execute_defi_action(
             "action_id": action_id,
             "approval_required": False,
             "estimated_gas_wei": prepared.gas_cost_wei,
+            "fee_quote": _fee_quote_detail(prepared.request),
             "contract": prepared.action.to,
         }
     journal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,7 +272,9 @@ def execute_defi_action(
             assert tx_hash is not None
             receipt = wait_for_receipt(rpc, url=rpc_url, tx_hash=tx_hash)
             _record_defi_receipt(journal, existing["id"], receipt)
-            return _withdrawal_result(selected, action_id, tx_hash, receipt)
+            result = _withdrawal_result(selected, action_id, tx_hash, receipt)
+            result["fee_quote"] = _fee_quote_detail(None, receipt)
+            return result
         prepared = prepare_defi_action(
             plan_bytes,
             plan_sha256=plan_sha256,
@@ -320,7 +288,7 @@ def execute_defi_action(
         )
         if selected["chain_id"] != prepared.entry["chain_id"]:
             raise ValueError("DeFi chain changed")
-        tx_hash = _submit_durable(
+        tx_hash, submitted_request = _submit_durable(
             prepared.request,
             wallet_row=wallet_row,
             rpc=rpc,
@@ -333,7 +301,59 @@ def execute_defi_action(
         step = journal.latest_step(position_id=position_id, step_key="defi_withdraw")
         assert step is not None
         _record_defi_receipt(journal, step["id"], receipt)
-        return _withdrawal_result(selected, action_id, tx_hash, receipt)
+        result = _withdrawal_result(selected, action_id, tx_hash, receipt)
+        result["fee_quote"] = _fee_quote_detail(submitted_request, receipt)
+        return result
+
+
+def _fee_quote_detail(
+    request: TransactionRequest | None, receipt: dict[str, Any] | None = None
+) -> dict[str, str | int | None]:
+    actual_fee = None
+    gas_used = None
+    effective_gas_price = None
+    actual_l1_fee = None
+    if receipt is not None and receipt.get("gasUsed") is not None:
+        gas_used = quantity(receipt["gasUsed"])
+        if receipt.get("effectiveGasPrice") is not None:
+            effective_gas_price = quantity(receipt["effectiveGasPrice"])
+            actual_l1_fee = (
+                quantity(receipt["l1Fee"]) if receipt.get("l1Fee") is not None else 0
+            )
+            actual_fee = str(gas_used * effective_gas_price + actual_l1_fee)
+    return {
+        "gas_estimate": request.gas_estimate if request else None,
+        "gas_limit": request.gas_limit if request else None,
+        "gas_price_wei": str(request.gas_price_wei) if request and request.gas_price_wei else None,
+        "max_fee_per_gas_wei": (
+            str(request.max_fee_per_gas_wei)
+            if request and request.max_fee_per_gas_wei is not None else None
+        ),
+        "max_priority_fee_per_gas_wei": (
+            str(request.max_priority_fee_per_gas_wei)
+            if request and request.max_priority_fee_per_gas_wei is not None else None
+        ),
+        "base_fee_per_gas_wei": (
+            str(request.base_fee_per_gas_wei)
+            if request and request.base_fee_per_gas_wei is not None else None
+        ),
+        "additional_fee_wei": str(request.additional_fee_wei) if request else None,
+        "estimated_max_total_fee_wei": str(request.max_total_fee_wei) if request else None,
+        "fee_cap_wei": (
+            str(request.max_total_fee_cap_wei)
+            if request and request.max_total_fee_cap_wei
+            else None
+        ),
+        "quote_method": request.fee_quote_method if request else None,
+        "quote_fallback_reason": request.fee_quote_fallback_reason if request else None,
+        "quote_block_number": request.fee_quote_block_number if request else None,
+        "actual_gas_used": gas_used,
+        "actual_effective_gas_price_wei": (
+            str(effective_gas_price) if effective_gas_price is not None else None
+        ),
+        "actual_l1_fee_wei": str(actual_l1_fee) if actual_l1_fee is not None else None,
+        "actual_total_fee_wei": actual_fee,
+    }
 
 
 def _record_defi_receipt(journal: Journal, step_id: int, receipt: dict[str, Any]) -> None:
@@ -511,17 +531,20 @@ def _submit_durable(
     journal: Journal,
     position_id: int,
     step_key: str,
-) -> str:
+) -> tuple[str, TransactionRequest]:
     recovered = recover_durable_broadcast(
         rpc, url=rpc_url, journal=journal, position_id=position_id, step_key=step_key
     )
     if recovered is not None:
         wait_for_receipt(rpc, url=rpc_url, tx_hash=recovered)
-        return recovered
+        return recovered, request
     if journal.latest_step(position_id=position_id, step_key=step_key) is not None:
         raise ValueError("unresolved prior DeFi intent; inspect journal before retrying")
+    request = FeePlanner(rpc).plan(
+        rpc_url, request, sender=wallet_row.public_address
+    )
     balance = quantity(rpc.call(rpc_url, "eth_getBalance", [wallet_row.public_address, "latest"]))
-    require_native_reserve(balance=balance, gas_cost=request.gas_limit * request.gas_price_wei)
+    require_native_reserve(balance=balance, gas_cost=request.max_total_fee_wei)
     require_ethereum_gas_below_limit(rpc, url=rpc_url, request=request)
     nonce = pending_nonce(rpc, url=rpc_url, wallet=wallet_row.public_address)
     raw = sign_transaction(
@@ -545,4 +568,4 @@ def _submit_durable(
     if observed is None:
         raise AmbiguousBroadcast(tx_hash)
     wait_for_receipt(rpc, url=rpc_url, tx_hash=observed)
-    return observed
+    return observed, request

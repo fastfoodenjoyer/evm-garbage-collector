@@ -159,7 +159,28 @@ class TransactionRequest:
     data: str
     value: int
     gas_limit: int
-    gas_price_wei: int
+    gas_price_wei: int | None
+    max_fee_per_gas_wei: int | None = None
+    max_priority_fee_per_gas_wei: int | None = None
+    additional_fee_wei: int = 0
+    fee_quote_method: str | None = None
+    fee_quote_fallback_reason: str | None = None
+    max_total_fee_cap_wei: int | None = None
+    gas_estimate: int | None = None
+    fee_quote_block_number: int | None = None
+    base_fee_per_gas_wei: int | None = None
+
+    @property
+    def maximum_fee_per_gas_wei(self) -> int:
+        if self.max_fee_per_gas_wei is not None:
+            return self.max_fee_per_gas_wei
+        if self.gas_price_wei is None:
+            raise ValueError("transaction fee quote is missing")
+        return self.gas_price_wei
+
+    @property
+    def max_total_fee_wei(self) -> int:
+        return self.gas_limit * self.maximum_fee_per_gas_wei + self.additional_fee_wei
 
 
 class LifiClient:

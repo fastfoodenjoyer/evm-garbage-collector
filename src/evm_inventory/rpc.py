@@ -44,6 +44,8 @@ class RpcReader:
             "eth_call",
             "eth_estimateGas",
             "eth_gasPrice",
+            "eth_feeHistory",
+            "eth_maxPriorityFeePerGas",
         }:
             raise RpcError("method_not_allowed")
         ident = next(self.ids)

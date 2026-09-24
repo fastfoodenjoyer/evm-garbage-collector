@@ -48,6 +48,9 @@ class ExecutionRpc:
         "eth_chainId",
         "eth_estimateGas",
         "eth_gasPrice",
+        "eth_feeHistory",
+        "eth_maxPriorityFeePerGas",
+        "eth_getBlockByNumber",
         "eth_getBalance",
         "eth_getTransactionCount",
         "eth_getTransactionReceipt",
@@ -137,10 +140,10 @@ def require_ethereum_gas_below_limit(
             f"value_wei={rpc_gas_price};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
         )
     require_ethereum_planned_gas_price_valid(request)
-    if request.gas_price_wei >= ETHEREUM_GAS_LIMIT_WEI:
+    if request.maximum_fee_per_gas_wei >= ETHEREUM_GAS_LIMIT_WEI:
         raise EthereumGasDeferred(
             "ethereum_gas_deferred:source=plan;"
-            f"value_wei={request.gas_price_wei};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
+            f"value_wei={request.maximum_fee_per_gas_wei};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
         )
 
 
@@ -150,9 +153,20 @@ def require_ethereum_planned_gas_price_valid(request: TransactionRequest) -> Non
     if request.chain_id != 1:
         return
     if (
-        isinstance(request.gas_price_wei, bool)
-        or not isinstance(request.gas_price_wei, int)
-        or request.gas_price_wei < 0
+        (request.gas_price_wei is not None and (
+            isinstance(request.gas_price_wei, bool)
+            or not isinstance(request.gas_price_wei, int)
+            or request.gas_price_wei < 0
+        ))
+        or (request.max_fee_per_gas_wei is None) != (
+            request.max_priority_fee_per_gas_wei is None
+        )
+        or (request.max_fee_per_gas_wei is not None and (
+            request.gas_price_wei is not None
+            or request.max_fee_per_gas_wei < request.max_priority_fee_per_gas_wei
+            or request.max_priority_fee_per_gas_wei < 0
+        ))
+        or (request.max_fee_per_gas_wei is None and request.gas_price_wei is None)
     ):
         raise EthereumGasDeferred(
             "ethereum_gas_deferred:source=plan_error;threshold_wei=500000000"
@@ -177,17 +191,22 @@ def sign_transaction(
     account = Account.from_key(private_key)
     if account.address.lower() != expected_sender.lower():
         raise ValueError("private key does not match expected sender")
-    signed = account.sign_transaction(
-        {
-            "chainId": request.chain_id,
-            "nonce": nonce,
-            "to": to_checksum_address(request.to),
-            "value": request.value,
-            "data": request.data,
-            "gas": request.gas_limit,
-            "gasPrice": request.gas_price_wei,
-        }
-    )
+    transaction = {
+        "chainId": request.chain_id,
+        "nonce": nonce,
+        "to": to_checksum_address(request.to),
+        "value": request.value,
+        "data": request.data,
+        "gas": request.gas_limit,
+    }
+    if request.max_fee_per_gas_wei is not None:
+        transaction.update(
+            maxFeePerGas=request.max_fee_per_gas_wei,
+            maxPriorityFeePerGas=request.max_priority_fee_per_gas_wei,
+        )
+    else:
+        transaction["gasPrice"] = request.gas_price_wei
+    signed = account.sign_transaction(transaction)
     return "0x" + signed.raw_transaction.hex()
 
 

@@ -65,10 +65,14 @@ class Rpc:
 
     def call(self, url, method, params):
         self.calls.append(method)
+        if (method == "eth_call"
+                and params[0].get("to") == "0x420000000000000000000000000000000000000f"):
+            return "0x" + f"{1:064x}"
         return {
             "eth_chainId": "0x2105",
             "eth_gasPrice": "0x1",
             "eth_estimateGas": "0x186a0",
+            "eth_getBlockByNumber": {"number": "0x1"},
             "eth_call": "0x",
             "eth_getBalance": "0x100000000",
         }[method]
@@ -358,6 +362,8 @@ def test_withdraw_is_journaled_and_a_second_run_only_observes_it(tmp_path, monke
         def call(self, url, method, params):
             self.calls.append(method)
             if method == "eth_call":
+                if params[0].get("to") == "0x420000000000000000000000000000000000000f":
+                    return "0x" + f"{1:064x}"
                 return (
                     "0x" + f"{self.token_balance:064x}"
                     if params[0]["data"].startswith("0x70a08231")

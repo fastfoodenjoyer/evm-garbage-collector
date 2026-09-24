@@ -1,4 +1,5 @@
 import time
+from dataclasses import replace
 
 import pytest
 from eth_account import Account
@@ -12,6 +13,7 @@ from evm_inventory.executor import (
     sign_transaction,
     signed_transaction_hash,
 )
+from evm_inventory.fee_planner import FeePlanner
 from evm_inventory.journal import Journal
 from evm_inventory.lifi import TransactionRequest
 from evm_inventory.route_execution import (
@@ -25,6 +27,25 @@ from evm_inventory.route_execution import (
 )
 from evm_inventory.rpc import RpcError
 from evm_inventory.workbook import WalletWorkbookRow
+
+
+@pytest.fixture(autouse=True)
+def planned_fee_quote_for_route_tests(monkeypatch):
+    """Keep these route-state tests focused; fee quote behavior has dedicated tests."""
+
+    def plan(_self, _url, request, *, sender, max_total_fee_wei=None):
+        del sender
+        gas_price = request.gas_price_wei or 2
+        return replace(
+            request,
+            gas_limit=request.gas_limit or 21_000,
+            gas_price_wei=gas_price,
+            max_fee_per_gas_wei=None,
+            max_priority_fee_per_gas_wei=None,
+            max_total_fee_cap_wei=max_total_fee_wei or request.max_total_fee_cap_wei,
+        )
+
+    monkeypatch.setattr(FeePlanner, "plan", plan)
 
 
 def test_sign_transaction_uses_expected_private_key_and_chain():
@@ -42,6 +63,26 @@ def test_sign_transaction_uses_expected_private_key_and_chain():
     raw = sign_transaction(request, private_key=key, expected_sender=sender, nonce=4)
 
     assert raw.startswith("0x")
+
+
+def test_sign_transaction_supports_eip1559_fee_fields():
+    key = "0x" + "1" * 64
+    sender = Account.from_key(key).address
+    request = TransactionRequest(
+        chain_id=10,
+        to="0x" + "2" * 40,
+        data="0x12345678",
+        value=9,
+        gas_limit=50_000,
+        gas_price_wei=None,
+        max_fee_per_gas_wei=40,
+        max_priority_fee_per_gas_wei=3,
+    )
+
+    raw = sign_transaction(request, private_key=key, expected_sender=sender, nonce=7)
+
+    assert raw.startswith("0x02")
+    assert Account.recover_transaction(raw).lower() == sender.lower()
 
 
 def test_sign_transaction_accepts_normalized_contract_address_with_letters():
@@ -287,19 +328,19 @@ def test_native_direct_request_retains_three_gas_reserves():
     wallet = _wallet()
     gas_price = 2
     balance = 1_000_000
-    rpc = _Rpc([hex(gas_price), hex(balance)])
+    rpc = _Rpc([hex(balance), "0x5208", {"number": "0x1"}, hex(gas_price)])
     entry = {**_direct_entry(wallet.public_address), "target": {"minimum_raw": 874_000}}
 
     request = _direct_request(entry, wallet=wallet, rpc=rpc, url="https://rpc")
 
-    assert request.value == balance - 3 * 21_000 * gas_price
+    assert request.value == balance - 3 * request.max_total_fee_wei
 
 
 def test_native_direct_request_rejects_amount_below_minimum_after_three_gas_reserves():
     wallet = _wallet()
     gas_price = 2
     balance = 1_000_000
-    rpc = _Rpc([hex(gas_price), hex(balance)])
+    rpc = _Rpc([hex(balance), "0x5208", {"number": "0x1"}, hex(gas_price)])
     entry = {**_direct_entry(wallet.public_address), "target": {"minimum_raw": 874_001}}
 
     with pytest.raises(ValueError, match="native balance is below Bitget minimum"):
@@ -356,7 +397,7 @@ def test_ethereum_guard_does_not_probe_non_ethereum_requests():
 
 def test_direct_deposit_is_guarded_before_signing(monkeypatch):
     wallet = _wallet()
-    rpc = _Rpc(["0x1", "0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500"])
+    rpc = _Rpc(["0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500"])
     signed = []
     monkeypatch.setattr(
         "evm_inventory.route_execution.sign_transaction",
@@ -380,7 +421,7 @@ def test_direct_deposit_is_guarded_before_signing(monkeypatch):
 @pytest.mark.parametrize("chain_id", ["not-a-quantity", "0x2"])
 def test_direct_deposit_rejects_bad_ethereum_chain_identity_before_signing(monkeypatch, chain_id):
     wallet = _wallet()
-    rpc = _Rpc(["0x1", "0x100000", "0x100000", "0x0", chain_id])
+    rpc = _Rpc(["0x100000", "0x100000", "0x0", chain_id])
     signed = []
     monkeypatch.setattr(
         "evm_inventory.route_execution.sign_transaction",
@@ -665,8 +706,8 @@ def test_batch_continues_after_real_initial_gas_deferral_without_first_signature
     wallet = _wallet()
     rpc = _Rpc(
         [
-            "0x1", "0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500",  # deferred first
-            "0x1", "0x100000", "0x100000", "0x1", "0x1", "0x1",  # accepted second
+            "0x100000", "0x100000", "0x0", "0x1", "0x1dcd6500",  # deferred first
+            "0x100000", "0x100000", "0x0", "0x1", "0x1",  # accepted second
             lambda: signed_transaction_hash(raw_transactions[0]), {"status": "0x1"},
         ]
     )

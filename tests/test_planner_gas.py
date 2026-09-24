@@ -21,7 +21,11 @@ class Rpc:
             return "0x5208"
         if method == "eth_gasPrice":
             return "0x3b9aca00"
+        if method == "eth_getBlockByNumber":
+            return {"number": "0x1"}
         if method == "eth_call":
+            if params[0].get("to") == "0x420000000000000000000000000000000000000f":
+                return "0x" + f"{1:064x}"
             return "0x" + "0" * 64
         raise AssertionError(method)
 
@@ -49,7 +53,7 @@ def test_planner_gas_estimator_quotes_direct_erc20_transfer():
     )
 
     assert estimates is not None and len(estimates) == 1
-    assert estimates[0].raw_amount == 21_000 * 1_000_000_000
+    assert estimates[0].raw_amount == 25_201 * 1_000_000_000 + 1
     request = rpc.calls[0][2][0]
     assert request["from"] == WALLET
     assert request["to"] == TOKEN
@@ -100,17 +104,22 @@ def test_planner_gas_estimator_prices_required_approval():
     )
 
     assert estimates is not None and len(estimates) == 2
-    assert all(item.raw_amount == 21_000 * 1_000_000_000 for item in estimates)
     assert [method for _url, method, _params in rpc.calls] == [
         "eth_estimateGas",
+        "eth_getBlockByNumber",
         "eth_gasPrice",
         "eth_call",
+        "eth_call",
         "eth_estimateGas",
+        "eth_getBlockByNumber",
         "eth_gasPrice",
+        "eth_call",
     ]
-    route_transaction = rpc.calls[0][2][0]
+    assert all(item.raw_amount == 25_201 * 1_000_000_000 + 1 for item in estimates)
+    estimate_calls = [call for call in rpc.calls if call[1] == "eth_estimateGas"]
+    route_transaction = estimate_calls[0][2][0]
     assert route_transaction["to"] == "0x" + "d" * 40
-    approval = rpc.calls[3][2][0]
+    approval = estimate_calls[1][2][0]
     assert approval["to"] == TOKEN
     assert approval["data"].startswith("0x095ea7b3")
     assert approval["data"][34:74] == SPENDER[2:]

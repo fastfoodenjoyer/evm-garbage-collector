@@ -109,6 +109,7 @@ def _ensure_tables(connection: sqlite3.Connection) -> None:
             status TEXT NOT NULL,
             reason TEXT,
             error_detail TEXT,
+            fee_detail TEXT,
             tx_hash TEXT,
             observed_at REAL NOT NULL,
             UNIQUE(run_id, ordinal, action_id, status)
@@ -146,6 +147,8 @@ def _ensure_tables(connection: sqlite3.Connection) -> None:
     }
     if "error_detail" not in outcome_columns:
         connection.execute("ALTER TABLE defi_batch_outcomes ADD COLUMN error_detail TEXT")
+    if "fee_detail" not in outcome_columns:
+        connection.execute("ALTER TABLE defi_batch_outcomes ADD COLUMN fee_detail TEXT")
     for row in connection.execute(
         "SELECT t.tx_hash, t.observed_at, r.within_wallet_delay_min_seconds AS minimum, "
         "r.within_wallet_delay_max_seconds AS maximum FROM defi_batch_transactions t "
@@ -431,18 +434,20 @@ def _record_outcome(
         "native_before_wei": str(native_before_wei) if native_before_wei is not None else None,
         "native_after_wei": str(native_after_wei) if native_after_wei is not None else None,
         "status": status, "reason": reason, "error_detail": error_detail,
+        "fee_detail": json.dumps(result.get("fee_quote"), sort_keys=True)
+        if result and isinstance(result.get("fee_quote"), dict) else None,
         "tx_hash": tx_hash, "at": now,
     }
     connection.execute(
         "INSERT OR IGNORE INTO defi_batch_outcomes "
         "(run_id, ordinal, action_id, protocol_name, chain_id, withdrawal_size, "
         "estimated_usd, native_symbol, native_before_wei, native_after_wei, "
-        "status, reason, error_detail, tx_hash, observed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "status, reason, error_detail, fee_detail, tx_hash, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (run_id, ordinal, entry.get("action_id"), event["protocol"], entry.get("chain_id"),
          event["size"], event["estimated_usd"], native_symbol,
          event["native_before_wei"], event["native_after_wei"], status, reason,
-         error_detail, tx_hash, now),
+         error_detail, event["fee_detail"], tx_hash, now),
     )
     connection.commit()
     print(json.dumps(event, ensure_ascii=False), flush=True)

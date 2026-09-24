@@ -25,6 +25,7 @@ from .consolidation import (
     combine_candidates,
     select_candidate,
 )
+from .fee_planner import native_asset_identity
 from .lifi import LifiClient, LifiPriceEvidence, LifiRoute, LifiRouteRequest
 from .models import AssetIdentity, ConfigError
 from .planner_gas import PlannerGasEstimator
@@ -365,7 +366,7 @@ def _route_choices(
                     failed.append(choice.candidate)
         return routes_by_target, failed
 
-    native = AssetIdentity(item.asset.chain_id, "native", 18)
+    native = native_asset_identity(item.asset.chain_id)
     swap_routes = _request_routes(
         client,
         item.asset,
