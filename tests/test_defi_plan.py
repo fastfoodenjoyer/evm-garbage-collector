@@ -110,3 +110,18 @@ def test_fuel_native_eth_position_can_be_planned():
     row = plan["entries"][0]
     assert row["status"] == "ready"
     assert row["output_token_ids"] == ["eth"]
+
+
+def test_native_output_is_derived_from_rabby_without_protocol_identity():
+    market = "0x" + "5" * 40
+    rabby = Rabby()
+    item = position(pool=market, action={
+        "type": "withdraw", "contract_id": market,
+        "func": "withdraw(address,address,uint240)()",
+        "str_params": ["0x" + "0" * 40, WALLET, "1023"],
+    })
+    item["detail"]["supply_token_list"] = [{"id": "eth", "amount": 0.000001}]
+    rabby.data = [protocol(item, protocol_id="other_native_market")]
+    plan = create_defi_plan([WALLET], rabby, supported_chain_ids={1}, now_seconds=100)
+    assert plan["entries"][0]["status"] == "ready"
+    assert plan["entries"][0]["output_token_ids"] == ["eth"]

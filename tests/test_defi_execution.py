@@ -223,7 +223,7 @@ def test_withdrawal_requiring_approval_is_a_separate_stage():
         )
 
 
-def test_liquidity_receipt_proves_both_minimum_outputs():
+def test_multiple_rabby_outputs_require_matching_receipt_and_balance_gains():
     from evm_inventory.defi_execution import _TRANSFER_TOPIC
 
     other = "0x" + "4" * 40
@@ -231,7 +231,7 @@ def test_liquidity_receipt_proves_both_minimum_outputs():
         "func": "removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)",
         "str_params": [TOKEN, other, "100", "5", "7", WALLET, "9999"],
     }
-    entry = {"wallet": WALLET, "action": action}
+    entry = {"wallet": WALLET, "action": action, "output_token_ids": [TOKEN, other]}
     recipient = "0x" + WALLET[2:].rjust(64, "0")
 
     def transfer(token, amount, to=recipient):
@@ -241,17 +241,86 @@ def test_liquidity_receipt_proves_both_minimum_outputs():
             "data": "0x" + f"{amount:064x}",
         }
 
-    receipt = {"status": "0x1", "logs": [transfer(TOKEN, 5), transfer(other, 7)]}
-    assert _withdrawal_result(entry, "a" * 64, "0x" + "b" * 64, receipt)["status"] == "withdrawn"
+    class BalanceRpc:
+        def call(self, url, method, params):
+            assert method == "eth_call"
+            if params[0]["data"] in {"0x313ce567", "0x95d89b41"}:
+                return "0x"
+            amounts = {TOKEN: 5, other: 7}
+            return "0x" + f"{(amounts[params[0]['to']] if params[1] == '0x64' else 0):064x}"
+
+    receipt = {"status": "0x1", "blockNumber": "0x64",
+               "logs": [transfer(TOKEN, 5), transfer(other, 7)]}
+    rpc = BalanceRpc()
+    def verify():
+        return _withdrawal_result(
+            entry, "a" * 64, "0x" + "b" * 64, receipt,
+            rpc=rpc, rpc_url="https://rpc.test",
+        )
+    result = verify()
+    assert result["status"] == "withdrawn"
+    assert result["received_assets"] == [
+        {"token_id": TOKEN, "raw": "5"}, {"token_id": other, "raw": "7"},
+    ]
     receipt["logs"] = [transfer(TOKEN, 5), transfer(other, 1)]
-    result = _withdrawal_result(entry, "a" * 64, "0x" + "b" * 64, receipt)
+    result = verify()
     assert result["status"] == "manual_review"
+    assert result["reason"] == "output_balance_receipt_mismatch"
+    assert json.loads(result["verification_detail"])["receipt_flow_raw"] == "1"
     receipt["logs"] = [transfer(TOKEN, 5), transfer(other, 7, "0x" + "0" * 64)]
-    result = _withdrawal_result(entry, "a" * 64, "0x" + "b" * 64, receipt)
+    result = verify()
     assert result["status"] == "manual_review"
 
 
-def test_stargate_locked_withdrawal_is_verified_from_its_receipt():
+def test_rabby_output_token_is_verified_by_receipt_and_balance_change():
+    from eth_abi import encode
+    from eth_utils import keccak
+
+    token = "0x4200000000000000000000000000000000000006"
+    market = "0x" + "4" * 40
+    raw_received = 105277904533522
+    entry = {
+        "wallet": WALLET,
+        "output_token_ids": [token],
+        "action": {
+            "func": "redeem(uint256,address,address)()",
+            "contract_id": market,
+            "str_params": ["99445032919093", WALLET, WALLET],
+        },
+    }
+    transfer = {
+        "address": token,
+        "topics": [
+            "0x" + keccak(text="Transfer(address,address,uint256)").hex(),
+            "0x" + market[2:].rjust(64, "0"),
+            "0x" + WALLET[2:].rjust(64, "0"),
+        ],
+        "data": "0x" + f"{raw_received:064x}",
+    }
+    receipt = {"status": "0x1", "blockNumber": "0x64", "logs": [transfer]}
+
+    class BalanceRpc:
+        def call(self, url, method, params):
+            assert method == "eth_call"
+            assert params[0]["to"] == token
+            if params[0]["data"] == "0x313ce567":
+                return "0x" + f"{18:064x}"
+            if params[0]["data"] == "0x95d89b41":
+                return "0x" + encode(["string"], ["WETH"]).hex()
+            return "0x" + f"{(raw_received if params[1] == '0x64' else 0):064x}"
+
+    result = _withdrawal_result(
+        entry, "a" * 64, "0x" + "b" * 64, receipt,
+        rpc=BalanceRpc(), rpc_url="https://rpc.test",
+    )
+    assert result["status"] == "withdrawn"
+    assert result["received_token_id"] == token
+    assert result["received_raw"] == str(raw_received)
+    assert result["received_assets"][0]["amount"] == "0.000105277904533522"
+    assert result["received_assets"][0]["symbol"] == "WETH"
+
+
+def test_token_receipt_requires_actual_wallet_balance_gain():
     from eth_utils import keccak
 
     escrow = "0xd4888870c8686c748232719051b677791dbda26d"
@@ -270,24 +339,29 @@ def test_stargate_locked_withdrawal_is_verified_from_its_receipt():
                    escrow_topic, wallet_topic],
         "data": "0x" + f"{amount:064x}",
     }
-    withdraw = {
-        "address": escrow,
-        "topics": ["0x" + keccak(text="Withdraw(address,uint256,uint256)").hex(),
-                   wallet_topic],
-        "data": "0x" + amount.to_bytes(32, "big").hex() + (1).to_bytes(32, "big").hex(),
-    }
-    receipt = {"status": "0x1", "logs": [transfer, withdraw]}
-    result = _withdrawal_result(entry, "a" * 64, "0x" + "b" * 64, receipt)
+    class BalanceRpc:
+        def __init__(self, after):
+            self.after = after
+
+        def call(self, url, method, params):
+            assert method == "eth_call"
+            return "0x" + f"{(self.after if params[1] == '0x64' else 0):064x}"
+
+    receipt = {"status": "0x1", "blockNumber": "0x64", "logs": [transfer]}
+    result = _withdrawal_result(
+        entry, "a" * 64, "0x" + "b" * 64, receipt,
+        rpc=BalanceRpc(amount), rpc_url="https://rpc.test",
+    )
     assert result["status"] == "withdrawn"
     assert result["received_raw"] == str(amount)
-    receipt["logs"] = [transfer]
-    result = _withdrawal_result(entry, "a" * 64, "0x" + "b" * 64, receipt)
+    result = _withdrawal_result(
+        entry, "a" * 64, "0x" + "b" * 64, receipt,
+        rpc=BalanceRpc(0), rpc_url="https://rpc.test",
+    )
     assert result["status"] == "manual_review"
 
 
-def test_fuel_native_withdraw_requires_exact_event_and_deposit_balance():
-    from eth_utils import keccak
-
+def test_native_output_uses_balance_gain_after_transaction_fee():
     fuel = "0x19b5cc75846bf6286d599ec116536a333c4c2c14"
     amount = 1023000000000000
     action = {
@@ -309,16 +383,10 @@ def test_fuel_native_withdraw_requires_exact_event_and_deposit_balance():
         def positions(self, wallet):
             return [{"id": "fuel", "chain": "eth", "portfolio_item_list": [item]}]
 
-    class FuelRpc(Rpc):
-        def __init__(self, balance):
-            super().__init__()
-            self.balance = balance
-
+    class NativeChainRpc(Rpc):
         def call(self, url, method, params):
             if method == "eth_chainId":
                 return "0x1"
-            if method == "eth_call" and params[0]["data"].startswith("0xd4fac45d"):
-                return "0x" + f"{self.balance:064x}"
             return super().call(url, method, params)
 
     rabby = FuelRabby()
@@ -327,23 +395,32 @@ def test_fuel_native_withdraw_requires_exact_event_and_deposit_balance():
     digest = hashlib.sha256(raw).hexdigest()
     action_id = plan["entries"][0]["action_id"]
     prepared = prepare_defi_action(raw, plan_sha256=digest, action_id=action_id,
-        wallet=WALLET, rabby=rabby, rpc=FuelRpc(amount), rpc_url="https://rpc.test",
+        wallet=WALLET, rabby=rabby, rpc=NativeChainRpc(), rpc_url="https://rpc.test",
         max_gas_wei=1_000_000, now_seconds=101)
     assert prepared.entry["output_token_ids"] == ["eth"]
-    with pytest.raises(ValueError, match="deposit balance"):
-        prepare_defi_action(raw, plan_sha256=digest, action_id=action_id,
-            wallet=WALLET, rabby=rabby, rpc=FuelRpc(amount - 1), rpc_url="https://rpc.test",
-            max_gas_wei=1_000_000, now_seconds=101)
-    topic = "0x" + keccak(text="Withdraw(address,address,address,uint240,uint16)").hex()
-    wallet_topic = "0x" + WALLET[2:].rjust(64, "0")
-    log = {"address": fuel, "topics": [topic, wallet_topic, wallet_topic, "0x" + "0" * 64],
-           "data": "0x" + f"{amount:064x}" + "0" * 64}
+    class NativeRpc(NativeChainRpc):
+        def __init__(self, received):
+            super().__init__()
+            self.received = received
+
+        def call(self, url, method, params):
+            if method == "eth_getBalance" and params[1] in {"0x63", "0x64"}:
+                before = 10**18
+                balance = before if params[1] == "0x63" else before + self.received - 100000
+                return hex(balance)
+            if method == "eth_getTransactionByHash":
+                return {"from": WALLET, "value": "0x0"}
+            return super().call(url, method, params)
+
+    receipt = {"status": "0x1", "blockNumber": "0x64", "gasUsed": "0x186a0",
+               "effectiveGasPrice": "0x1", "logs": []}
     entry = prepared.entry
-    good = _withdrawal_result(entry, action_id, "0x" + "b" * 64, {"logs": [log]})
+    good = _withdrawal_result(entry, action_id, "0x" + "b" * 64, receipt,
+                              rpc=NativeRpc(amount), rpc_url="https://rpc.test")
     assert good["status"] == "withdrawn"
     assert good["received_raw"] == str(amount)
-    bad = _withdrawal_result(entry, action_id, "0x" + "b" * 64,
-        {"logs": [{**log, "data": "0x" + f"{amount - 1:064x}" + "0" * 64}]})
+    bad = _withdrawal_result(entry, action_id, "0x" + "b" * 64, receipt,
+                             rpc=NativeRpc(0), rpc_url="https://rpc.test")
     assert bad["status"] == "manual_review"
 
 
@@ -364,6 +441,8 @@ def test_withdraw_is_journaled_and_a_second_run_only_observes_it(tmp_path, monke
             if method == "eth_call":
                 if params[0].get("to") == "0x420000000000000000000000000000000000000f":
                     return "0x" + f"{1:064x}"
+                if params[0]["data"].startswith("0x70a08231") and params[1] == "0x63":
+                    return "0x" + "0" * 64
                 return (
                     "0x" + f"{self.token_balance:064x}"
                     if params[0]["data"].startswith("0x70a08231")
@@ -377,7 +456,13 @@ def test_withdraw_is_journaled_and_a_second_run_only_observes_it(tmp_path, monke
                 self.token_balance = 10
                 return self.tx_hash
             if method == "eth_getTransactionReceipt":
-                return {"status": "0x1"}
+                topic = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
+                return {"status": "0x1", "blockNumber": "0x64", "logs": [{
+                    "address": TOKEN,
+                    "topics": [topic, "0x" + ROUTER[2:].rjust(64, "0"),
+                               "0x" + WALLET[2:].rjust(64, "0")],
+                    "data": "0x" + f"{10:064x}",
+                }]}
             if method == "eth_getTransactionByHash":
                 return {"hash": self.tx_hash}
             return super().call(url, method, params)
@@ -396,8 +481,8 @@ def test_withdraw_is_journaled_and_a_second_run_only_observes_it(tmp_path, monke
         "execute": True,
     }
     first = execute_defi_action(raw, **kwargs, now_seconds=101)
-    assert first["status"] == "manual_review"
-    assert first["reason"] == "output_not_verifiable_from_action"
+    assert first["status"] == "withdrawn"
+    assert first["received_raw"] == "10"
     assert rpc.send_count == 1
     with Journal(db) as journal:
         position = journal.get_or_create_position(
@@ -406,8 +491,8 @@ def test_withdraw_is_journaled_and_a_second_run_only_observes_it(tmp_path, monke
         step = journal.latest_step(position_id=position["id"], step_key="defi_withdraw")
         assert step["state"] == "confirmed"
     second = execute_defi_action(raw, **kwargs, now_seconds=1001)
-    assert second["status"] == "manual_review"
-    assert second["reason"] == first["reason"]
+    assert second["status"] == "withdrawn"
+    assert second["received_raw"] == first["received_raw"]
     assert second["tx_hash"] == first["tx_hash"]
     assert rpc.send_count == 1
     with Store(db, readonly=True) as store:

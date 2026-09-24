@@ -149,7 +149,7 @@ def test_encode_rejects_spender_different_from_call_target():
         encode_action(action, wallet=WALLET)
 
 
-def test_fuel_native_withdraw_is_restricted_to_its_contract_token_and_owner():
+def test_native_withdraw_requires_native_token_and_wallet_recipient():
     action = {
         "type": "withdraw", "contract_id": FUEL,
         "func": "withdraw(address,address,uint240)()",
@@ -159,8 +159,8 @@ def test_fuel_native_withdraw_is_restricted_to_its_contract_token_and_owner():
     assert encoded.to == FUEL
     assert encoded.data.startswith("0x7bdbd122")
     assert encoded.data.endswith(f"{1023000000000000:064x}")
+    assert encode_action({**action, "contract_id": ROUTER}, wallet=WALLET).to == ROUTER
     for unsafe in (
-        {**action, "contract_id": ROUTER},
         {**action, "str_params": [TOKEN, WALLET, "1023000000000000"]},
         {**action, "str_params": ["0x" + "0" * 40, ROUTER, "1023000000000000"]},
     ):

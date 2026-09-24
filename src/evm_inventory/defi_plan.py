@@ -10,7 +10,7 @@ from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
-from .rabby import FUEL_NATIVE_WITHDRAW, FUEL_PREDEPOSITS, ZERO_ADDRESS, encode_action
+from .rabby import encode_action
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -144,15 +144,6 @@ def _positive(value: object) -> bool:
 
 def _output_tokens(item: dict[str, Any], action: dict[str, Any] | None) -> list[str]:
     supplied = (item.get("detail") or {}).get("supply_token_list", [])
-    if action and (
-        action.get("contract_id", "").lower() == FUEL_PREDEPOSITS
-        and str(action.get("func", "")).startswith(FUEL_NATIVE_WITHDRAW)
-        and (action.get("str_params") or [None])[0] == ZERO_ADDRESS
-        and any(
-            token.get("id") == "eth" for token in supplied if isinstance(token, dict)
-        )
-    ):
-        return ["eth"]
     if action and str(action.get("func", "")).startswith("removeLiquidity("):
         candidates = (action.get("str_params") or [])[:2]
     else:
@@ -165,6 +156,6 @@ def _output_tokens(item: dict[str, Any], action: dict[str, Any] | None) -> list[
         {
             token.lower()
             for token in candidates
-            if isinstance(token, str) and _ADDRESS.fullmatch(token)
+            if isinstance(token, str) and (token.lower() == "eth" or _ADDRESS.fullmatch(token))
         }
     )

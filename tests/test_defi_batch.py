@@ -301,23 +301,31 @@ def test_quote_429_requeues_wallet_without_skipping(tmp_path):
     assert action_count == 0
 
 
-def test_verified_stargate_receipt_has_human_readable_withdrawal_size():
-    entry = {"chain_id": 56, "action": {"str_params": []}}
+def test_verified_outputs_report_each_token_without_protocol_rules():
+    entry = {"action": {"str_params": []}}
     result = {
-        "received_raw": "1500000000000000000",
-        "received_token_id": "0xb0d502e938ed5f4df2e681fe6e419ff29631d62b",
+        "received_assets": [
+            {"token_id": "0x" + "1" * 40, "raw": "15", "amount": "0.15", "symbol": "AAA"},
+            {"token_id": "0x" + "2" * 40, "raw": "20"},
+        ],
     }
-    assert _size_description(entry, result) == "1.5 STG (received: 1500000000000000000 raw units)"
+    assert _size_description(entry, result) == (
+        "received 0.15 AAA (15 raw units of 0x" + "1" * 40 + ")"
+        + ", 20 raw units of 0x" + "2" * 40
+    )
 
 
-def test_fuel_size_omits_wallet_address():
+def test_requested_size_omits_wallet_address():
     entry = {
         "protocol_id": "fuel", "chain_id": 1,
         "action": {"func": "withdraw(address,address,uint240)()", "str_params": [
             "0x" + "0" * 40, "0x" + "a" * 40, "1000000000000000",
         ]},
     }
-    assert _size_description(entry) == "0.001 ETH requested (1000000000000000 raw wei)"
+    assert _size_description(entry) == (
+        "withdraw(address,address,uint240)() raw parameters: "
+        "[address], [address], 1000000000000000"
+    )
 
 
 def test_process_wallet_quotes_previews_then_executes_and_records_result(tmp_path):
@@ -598,7 +606,8 @@ def test_execution_safety_failure_records_protocol_size_and_balances(tmp_path):
             "FROM defi_batch_outcomes"
         ).fetchone()
     assert action == ("manual_review", "ethereum_gas_deferred")
-    assert outcome == ("Fuel", "0.001 ETH requested (1000000000000000 raw wei)",
+    assert outcome == ("Fuel", "withdraw(address,address,uint240)() raw parameters: "
+                       "[address], [address], 1000000000000000",
                        "100", "100", "ethereum_gas_deferred",
                        "ethereum_gas_deferred:source=rpc;value_wei=851018418;threshold_wei=500000000")
 

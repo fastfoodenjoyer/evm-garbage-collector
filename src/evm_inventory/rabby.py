@@ -19,9 +19,8 @@ from .diagnostics import redact_data, redact_text
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _FUNCTION = re.compile(r"^(?:function )?([A-Za-z][A-Za-z0-9_]*)\(([^()]*)\)(?:\([^()]*\))?$")
-FUEL_PREDEPOSITS = "0x19b5cc75846bf6286d599ec116536a333c4c2c14"
 ZERO_ADDRESS = "0x" + "0" * 40
-FUEL_NATIVE_WITHDRAW = "withdraw(address,address,uint240)"
+NATIVE_WITHDRAW = "withdraw(address,address,uint240)"
 _SUPPORTED = {
     "withdraw()": ((), ()),
     "withdraw(uint256)": ((), (0,)),
@@ -30,7 +29,7 @@ _SUPPORTED = {
     "redeem(uint256)": ((), (0,)),
     "redeem(uint256,address,address)": ((1, 2), (0,)),
     "removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)": ((5,), (2, 3, 4)),
-    FUEL_NATIVE_WITHDRAW: ((1,), (2,)),
+    NATIVE_WITHDRAW: ((1,), (2,)),
 }
 
 
@@ -153,8 +152,6 @@ def encode_action(action: object, *, wallet: str, now_seconds: int | None = None
     signature = f"{match.group(1)}({','.join(types)})"
     if signature not in _SUPPORTED:
         raise ValueError("unsupported Rabby action method")
-    if signature == FUEL_NATIVE_WITHDRAW and target.lower() != FUEL_PREDEPOSITS:
-        raise ValueError("unsupported Fuel withdrawal contract")
     recipient_indices, positive_indices = _SUPPORTED[signature]
     raw_params = action.get("str_params")
     if not isinstance(raw_params, list) or len(raw_params) != len(types):
@@ -180,16 +177,16 @@ def encode_action(action: object, *, wallet: str, now_seconds: int | None = None
     for index in positive_indices:
         if values[index] <= 0:
             raise ValueError("Rabby withdrawal amount or minimum must be positive")
-    if signature == FUEL_NATIVE_WITHDRAW and values[0].lower() != ZERO_ADDRESS:
-        raise ValueError("Fuel withdrawal must use native ETH")
+    if signature == NATIVE_WITHDRAW and values[0].lower() != ZERO_ADDRESS:
+        raise ValueError("native withdrawal must use the zero token address")
     if match.group(1) == "removeLiquidity":
         if values[3] <= 0 or values[4] <= 0:
             raise ValueError("Rabby liquidity minimum must be positive")
         if values[6] <= (now_seconds if now_seconds is not None else int(time.time())):
             raise ValueError("Rabby liquidity deadline expired")
     approval = action.get("need_approve") or {}
-    if signature == FUEL_NATIVE_WITHDRAW and approval:
-        raise ValueError("Fuel native withdrawal must not require approval")
+    if signature == NATIVE_WITHDRAW and approval:
+        raise ValueError("native withdrawal must not require approval")
     if not isinstance(approval, dict):
         raise ValueError("invalid Rabby approval")
     token = approval.get("token_id")

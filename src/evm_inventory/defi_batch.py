@@ -17,7 +17,6 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -390,24 +389,24 @@ def _native_snapshot(chain_id: int, wallet: str) -> tuple[str | None, int | None
 
 
 def _size_description(entry: dict[str, Any], result: dict[str, Any] | None = None) -> str:
+    if result and isinstance(result.get("received_assets"), list):
+        parts = [
+            (f"{asset['amount']} {asset['symbol']} "
+             f"({asset['raw']} raw units of {asset['token_id']})"
+             if isinstance(asset.get("amount"), str)
+             and isinstance(asset.get("symbol"), str)
+             else f"{asset['raw']} raw units of {asset['token_id']}")
+            for asset in result["received_assets"]
+            if isinstance(asset, dict) and isinstance(asset.get("raw"), str)
+            and isinstance(asset.get("token_id"), str)
+        ]
+        if parts:
+            return "received " + ", ".join(parts)
     if result and isinstance(result.get("received_raw"), str):
-        raw = result["received_raw"]
-        token = str(result.get("received_token_id", ""))
-        if raw.isdecimal() and (
-            (entry.get("chain_id") == 56
-             and token.lower() == "0xb0d502e938ed5f4df2e681fe6e419ff29631d62b")
-            or (entry.get("chain_id") == 1 and token.lower() == "eth")
-        ):
-            symbol = "STG" if token.lower() != "eth" else "ETH"
-            amount = Decimal(raw) / Decimal(10**18)
-            return f"{amount} {symbol} (received: {raw} raw units)"
-        return f"received {raw} raw units of {token or 'unknown token'}"
+        return (f"received {result['received_raw']} raw units of "
+                f"{result.get('received_token_id') or 'unknown token'}")
     action = entry.get("action") or {}
     params = action.get("str_params") or []
-    if (entry.get("protocol_id") == "fuel" and entry.get("chain_id") == 1
-            and len(params) == 3 and str(params[2]).isdecimal()):
-        raw = str(params[2])
-        return f"{Decimal(raw) / Decimal(10**18)} ETH requested ({raw} raw wei)"
     if not params:
         return "amount unavailable"
     safe_params = [
@@ -433,7 +432,10 @@ def _record_outcome(
         "native_symbol": native_symbol,
         "native_before_wei": str(native_before_wei) if native_before_wei is not None else None,
         "native_after_wei": str(native_after_wei) if native_after_wei is not None else None,
-        "status": status, "reason": reason, "error_detail": error_detail,
+        "status": status, "reason": reason,
+        "error_detail": error_detail or (
+            result.get("verification_detail") if result else None
+        ),
         "fee_detail": json.dumps(result.get("fee_quote"), sort_keys=True)
         if result and isinstance(result.get("fee_quote"), dict) else None,
         "tx_hash": tx_hash, "at": now,
@@ -447,7 +449,7 @@ def _record_outcome(
         (run_id, ordinal, entry.get("action_id"), event["protocol"], entry.get("chain_id"),
          event["size"], event["estimated_usd"], native_symbol,
          event["native_before_wei"], event["native_after_wei"], status, reason,
-         error_detail, event["fee_detail"], tx_hash, now),
+         event["error_detail"], event["fee_detail"], tx_hash, now),
     )
     connection.commit()
     print(json.dumps(event, ensure_ascii=False), flush=True)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Protocol
 
@@ -11,11 +13,13 @@ from eth_account import Account
 from eth_utils import keccak, to_checksum_address
 
 from .lifi import TransactionRequest
+from .models import ConfigError
 from .rpc import RpcError, quantity, uint256
 from .transport import Transport
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-ETHEREUM_GAS_LIMIT_WEI = 500_000_000
+DEFAULT_ETHEREUM_GAS_PRICE_LIMIT_GWEI = Decimal("1")
+WEI_PER_GWEI = 1_000_000_000
 GAS_RESERVE_MULTIPLIER = 3
 
 
@@ -117,34 +121,67 @@ def require_ethereum_gas_below_limit(
 
     if request.chain_id != 1:
         return
+    gas_limit_wei = _ethereum_gas_price_limit_wei()
     try:
         endpoint_chain_id = quantity(broadcaster.call(url, "eth_chainId", []))
     except Exception as exc:
         raise EthereumGasDeferred(
-            "ethereum_gas_deferred:source=chain_probe_error;threshold_wei=500000000"
+            "ethereum_gas_deferred:source=chain_probe_error;"
+            f"threshold_wei={gas_limit_wei}"
         ) from exc
     if endpoint_chain_id != 1:
         raise EthereumGasDeferred(
             "ethereum_gas_deferred:source=chain_id;"
-            f"value_wei={endpoint_chain_id};threshold_wei=500000000"
+            f"value_wei={endpoint_chain_id};threshold_wei={gas_limit_wei}"
         )
     try:
         rpc_gas_price = quantity(broadcaster.call(url, "eth_gasPrice", []))
     except Exception as exc:
         raise EthereumGasDeferred(
-            "ethereum_gas_deferred:source=rpc_probe_error;threshold_wei=500000000"
+            "ethereum_gas_deferred:source=rpc_probe_error;"
+            f"threshold_wei={gas_limit_wei}"
         ) from exc
-    if rpc_gas_price >= ETHEREUM_GAS_LIMIT_WEI:
+    if rpc_gas_price >= gas_limit_wei:
         raise EthereumGasDeferred(
             "ethereum_gas_deferred:source=rpc;"
-            f"value_wei={rpc_gas_price};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
+            f"value_wei={rpc_gas_price};threshold_wei={gas_limit_wei}"
         )
     require_ethereum_planned_gas_price_valid(request)
-    if request.maximum_fee_per_gas_wei >= ETHEREUM_GAS_LIMIT_WEI:
+    if request.maximum_fee_per_gas_wei >= gas_limit_wei:
         raise EthereumGasDeferred(
             "ethereum_gas_deferred:source=plan;"
-            f"value_wei={request.maximum_fee_per_gas_wei};threshold_wei={ETHEREUM_GAS_LIMIT_WEI}"
+            f"value_wei={request.maximum_fee_per_gas_wei};threshold_wei={gas_limit_wei}"
         )
+
+
+def _ethereum_gas_price_limit_wei() -> int:
+    """Read the Ethereum fee ceiling from the environment, expressed in gwei."""
+
+    raw_value = os.environ.get("ETHEREUM_GAS_PRICE_LIMIT_GWEI")
+    if raw_value is None:
+        value = DEFAULT_ETHEREUM_GAS_PRICE_LIMIT_GWEI
+    else:
+        try:
+            value = Decimal(raw_value.strip())
+        except (InvalidOperation, AttributeError) as exc:
+            raise ConfigError(
+                "ETHEREUM_GAS_PRICE_LIMIT_GWEI must be a positive decimal gwei value"
+            ) from exc
+    if not value.is_finite() or value <= 0:
+        raise ConfigError(
+            "ETHEREUM_GAS_PRICE_LIMIT_GWEI must be positive with at most 9 decimal places"
+        )
+    try:
+        scaled = value * WEI_PER_GWEI
+        if scaled != scaled.to_integral_value():
+            raise ConfigError(
+                "ETHEREUM_GAS_PRICE_LIMIT_GWEI must be positive with at most 9 decimal places"
+            )
+    except InvalidOperation as exc:
+        raise ConfigError(
+            "ETHEREUM_GAS_PRICE_LIMIT_GWEI must be positive with at most 9 decimal places"
+        ) from exc
+    return int(scaled)
 
 
 def require_ethereum_planned_gas_price_valid(request: TransactionRequest) -> None:
@@ -169,7 +206,8 @@ def require_ethereum_planned_gas_price_valid(request: TransactionRequest) -> Non
         or (request.max_fee_per_gas_wei is None and request.gas_price_wei is None)
     ):
         raise EthereumGasDeferred(
-            "ethereum_gas_deferred:source=plan_error;threshold_wei=500000000"
+            "ethereum_gas_deferred:source=plan_error;"
+            f"threshold_wei={_ethereum_gas_price_limit_wei()}"
         )
 
 

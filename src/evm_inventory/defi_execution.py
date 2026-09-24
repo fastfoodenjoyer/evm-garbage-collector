@@ -10,13 +10,16 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
-from eth_abi import encode
-from eth_utils import function_signature_to_4byte_selector, keccak
+from eth_abi import decode
+from eth_abi.exceptions import DecodingError
+from eth_utils import keccak
 
 from .defi_plan import create_defi_plan
+from .diagnostics import exception_diagnostic
 from .executor import (
     AmbiguousBroadcast,
     broadcast_durable_transaction,
@@ -32,23 +35,13 @@ from .executor import (
 from .fee_planner import FeePlanner
 from .journal import Journal
 from .lifi import TransactionRequest
-from .rabby import (
-    FUEL_NATIVE_WITHDRAW,
-    FUEL_PREDEPOSITS,
-    ZERO_ADDRESS,
-    EncodedAction,
-    RabbyClient,
-    encode_action,
-)
-from .rpc import RpcError, quantity, uint256
+from .rabby import EncodedAction, RabbyClient, encode_action
+from .rpc import balance_of_data, quantity, uint256
+from .transport import RequestError
 from .workbook import WalletWorkbookRow
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TRANSFER_TOPIC = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
-_WITHDRAW_TOPIC = "0x" + keccak(text="Withdraw(address,uint256,uint256)").hex()
-_STARGATE_BSC_ESCROW = "0xd4888870c8686c748232719051b677791dbda26d"
-_STARGATE_BSC_TOKEN = "0xb0d502e938ed5f4df2e681fe6e419ff29631d62b"
-_FUEL_WITHDRAW_TOPIC = "0x" + keccak(text="Withdraw(address,address,address,uint240,uint16)").hex()
 
 
 @contextmanager
@@ -160,16 +153,6 @@ def prepare_defi_action(
     action = encode_action(current["action"], wallet=wallet, now_seconds=now_seconds)
     if quantity(rpc.call(rpc_url, "eth_chainId", [])) != chain_id:
         raise ValueError("RPC chain does not match DeFi action chain")
-    if _is_fuel_native_exit(current):
-        call_data = "0x" + (
-            function_signature_to_4byte_selector("getBalance(address,address)")
-            + encode(["address", "address"], [wallet, ZERO_ADDRESS])
-        ).hex()
-        deposit = uint256(rpc.call(rpc_url, "eth_call", [
-            {"to": FUEL_PREDEPOSITS, "data": call_data}, "latest"
-        ]))
-        if deposit != int(current["action"]["str_params"][2]):
-            raise ValueError("Fuel deposit balance differs from Rabby withdrawal amount")
     if action.approval_token:
         allowance = token_allowance(
             rpc,
@@ -272,7 +255,9 @@ def execute_defi_action(
             assert tx_hash is not None
             receipt = wait_for_receipt(rpc, url=rpc_url, tx_hash=tx_hash)
             _record_defi_receipt(journal, existing["id"], receipt)
-            result = _withdrawal_result(selected, action_id, tx_hash, receipt)
+            result = _withdrawal_result(
+                selected, action_id, tx_hash, receipt, rpc=rpc, rpc_url=rpc_url,
+            )
             result["fee_quote"] = _fee_quote_detail(None, receipt)
             return result
         prepared = prepare_defi_action(
@@ -301,7 +286,9 @@ def execute_defi_action(
         step = journal.latest_step(position_id=position_id, step_key="defi_withdraw")
         assert step is not None
         _record_defi_receipt(journal, step["id"], receipt)
-        result = _withdrawal_result(selected, action_id, tx_hash, receipt)
+        result = _withdrawal_result(
+            selected, action_id, tx_hash, receipt, rpc=rpc, rpc_url=rpc_url,
+        )
         result["fee_quote"] = _fee_quote_detail(submitted_request, receipt)
         return result
 
@@ -363,163 +350,134 @@ def _record_defi_receipt(journal: Journal, step_id: int, receipt: dict[str, Any]
     )
 
 
-def _stargate_withdrawn_raw(entry: dict[str, Any], receipt: dict[str, Any]) -> int | None:
-    """Match the escrow's Withdraw event to the STG transfer in this transaction."""
+def _withdrawal_result(
+    entry: dict[str, Any], action_id: str, tx_hash: str, receipt: dict[str, Any],
+    *, rpc: Rpc, rpc_url: str,
+) -> dict[str, Any]:
+    """Verify Rabby's output assets against this transaction and block balances."""
 
-    action = entry["action"]
-    if not (
-        entry.get("chain_id") == 56
-        and entry.get("protocol_id") == "bsc_stargate"
-        and str(entry.get("pool_id", "")).lower() == _STARGATE_BSC_ESCROW
-        and str(action.get("contract_id", "")).lower() == _STARGATE_BSC_ESCROW
-        and action.get("func") in {"withdraw()", "withdraw()()"}
-        and entry.get("output_token_ids") == [_STARGATE_BSC_TOKEN]
-    ):
-        return None
+    result: dict[str, Any] = {"action_id": action_id, "tx_hash": tx_hash}
+    tokens = entry.get("output_token_ids")
+    block_hex = receipt.get("blockNumber")
+    try:
+        block = quantity(block_hex)
+        if (
+            quantity(receipt.get("status")) != 1 or block < 1
+            or not isinstance(tokens, list) or not tokens
+            or not isinstance(entry.get("wallet"), str)
+        ):
+            raise ValueError("invalid withdrawal verification input")
+        wallet = entry["wallet"].lower()
+        received: list[dict[str, str]] = []
+        for token_id in tokens:
+            if not isinstance(token_id, str):
+                raise ValueError("invalid output token")
+            token = token_id.lower()
+            before = _asset_balance(rpc, rpc_url, wallet, token, block - 1)
+            after = _asset_balance(rpc, rpc_url, wallet, token, block)
+            gain = after - before
+            if token == "eth":
+                tx = rpc.call(rpc_url, "eth_getTransactionByHash", [tx_hash])
+                if not isinstance(tx, dict) or str(tx.get("from", "")).lower() != wallet:
+                    raise ValueError("native output transaction sender mismatch")
+                gas_used = quantity(receipt.get("gasUsed"))
+                gas_price = quantity(receipt.get("effectiveGasPrice"))
+                l1_fee = quantity(receipt["l1Fee"]) if receipt.get("l1Fee") else 0
+                gain += gas_used * gas_price + l1_fee + quantity(tx.get("value"))
+            else:
+                flow = _receipt_token_flow(receipt, wallet, token)
+                if gain != flow:
+                    result.update(
+                        status="manual_review", reason="output_balance_receipt_mismatch",
+                        verification_detail=json.dumps({
+                            "token_id": token, "balance_before_raw": str(before),
+                            "balance_after_raw": str(after),
+                            "receipt_flow_raw": str(flow),
+                        }, sort_keys=True),
+                    )
+                    return result
+            if gain <= 0:
+                result.update(
+                    status="manual_review", reason="output_not_received",
+                    verification_detail=json.dumps({
+                        "token_id": token, "balance_before_raw": str(before),
+                        "balance_after_raw": str(after), "adjusted_gain_raw": str(gain),
+                    }, sort_keys=True),
+                )
+                return result
+            asset = {"token_id": token, "raw": str(gain)}
+            asset.update(_asset_metadata(rpc, rpc_url, token, block, gain))
+            received.append(asset)
+    except (KeyError, TypeError, ValueError, RequestError) as exc:
+        result.update(status="manual_review", reason="output_balance_unavailable",
+                      verification_detail=json.dumps(exception_diagnostic(exc),
+                                                     ensure_ascii=False))
+        return result
+    result.update(status="withdrawn", received_assets=received)
+    if len(received) == 1:
+        result.update(received_token_id=received[0]["token_id"],
+                      received_raw=received[0]["raw"])
+    return result
+
+
+def _asset_balance(rpc: Rpc, url: str, wallet: str, token: str, block: int) -> int:
+    if token == "eth":
+        return quantity(rpc.call(url, "eth_getBalance", [wallet, hex(block)]))
+    return uint256(rpc.call(url, "eth_call", [
+        {"to": token, "data": balance_of_data(wallet)}, hex(block),
+    ]))
+
+
+def _asset_metadata(rpc: Rpc, url: str, token: str, block: int, raw: int) -> dict[str, str]:
+    if token == "eth":
+        return {"amount": f"{Decimal(raw) / Decimal(10**18):f}", "symbol": "ETH"}
+    metadata: dict[str, str] = {}
+    try:
+        decimals = uint256(rpc.call(url, "eth_call", [
+            {"to": token, "data": "0x313ce567"}, hex(block),
+        ]))
+        if decimals <= 36:
+            metadata["amount"] = f"{Decimal(raw) / Decimal(10**decimals):f}"
+    except (RequestError, ValueError, TypeError):
+        pass
+    try:
+        encoded = rpc.call(url, "eth_call", [
+            {"to": token, "data": "0x95d89b41"}, hex(block),
+        ])
+        if isinstance(encoded, str) and encoded.startswith("0x"):
+            data = bytes.fromhex(encoded[2:])
+            try:
+                symbol = decode(["string"], data)[0]
+            except (DecodingError, ValueError, TypeError):
+                symbol = decode(["bytes32"], data)[0].rstrip(b"\x00").decode("ascii")
+            if isinstance(symbol, str) and 0 < len(symbol) <= 32 and symbol.isprintable():
+                metadata["symbol"] = symbol
+    except (DecodingError, RequestError, ValueError, TypeError, UnicodeError):
+        pass
+    return metadata
+
+
+def _receipt_token_flow(receipt: dict[str, Any], wallet: str, token: str) -> int:
     logs = receipt.get("logs")
     if not isinstance(logs, list):
-        return None
-    wallet_topic = "0x" + entry["wallet"][2:].lower().rjust(64, "0")
-    escrow_topic = "0x" + _STARGATE_BSC_ESCROW[2:].rjust(64, "0")
-    withdrawn: list[int] = []
-    received: list[int] = []
+        raise ValueError("transaction receipt has no logs")
+    wallet_topic = "0x" + wallet[2:].rjust(64, "0")
+    flow = 0
     for log in logs:
-        if not isinstance(log, dict):
+        if not isinstance(log, dict) or str(log.get("address", "")).lower() != token:
             continue
         topics = log.get("topics")
-        data = log.get("data")
-        if not isinstance(topics, list) or not isinstance(data, str) or not topics:
+        if (
+            not isinstance(topics, list) or len(topics) != 3
+            or str(topics[0]).lower() != _TRANSFER_TOPIC
+        ):
             continue
-        token = str(log.get("address", "")).lower()
-        if (
-            token == _STARGATE_BSC_ESCROW
-            and len(topics) == 2
-            and str(topics[0]).lower() == _WITHDRAW_TOPIC
-            and str(topics[1]).lower() == wallet_topic
-            and re.fullmatch(r"0x[0-9a-fA-F]{128}", data)
-        ):
-            withdrawn.append(uint256(data[:66]))
-        if (
-            token == _STARGATE_BSC_TOKEN
-            and len(topics) == 3
-            and str(topics[0]).lower() == _TRANSFER_TOPIC
-            and str(topics[1]).lower() == escrow_topic
-            and str(topics[2]).lower() == wallet_topic
-        ):
-            try:
-                received.append(uint256(data))
-            except (TypeError, ValueError, RpcError):
-                continue
-    if len(withdrawn) == len(received) == 1 and withdrawn[0] > 0 and withdrawn[0] == received[0]:
-        return received[0]
-    return None
-
-
-def _is_fuel_native_exit(entry: dict[str, Any]) -> bool:
-    action = entry.get("action") or {}
-    params = action.get("str_params") or []
-    return (
-        entry.get("chain_id") == 1
-        and entry.get("protocol_id") == "fuel"
-        and str(entry.get("pool_id", "")).lower() == FUEL_PREDEPOSITS
-        and entry.get("output_token_ids") == ["eth"]
-        and str(action.get("contract_id", "")).lower() == FUEL_PREDEPOSITS
-        and str(action.get("func", "")).startswith(FUEL_NATIVE_WITHDRAW)
-        and len(params) == 3
-        and str(params[0]).lower() == ZERO_ADDRESS
-        and str(params[1]).lower() == entry.get("wallet")
-        and str(params[2]).isdecimal()
-        and int(params[2]) > 0
-    )
-
-
-def _fuel_withdrawn_raw(entry: dict[str, Any], receipt: dict[str, Any]) -> int | None:
-    logs = receipt.get("logs")
-    if not isinstance(logs, list):
-        return None
-    wallet_topic = "0x" + entry["wallet"][2:].lower().rjust(64, "0")
-    zero_topic = "0x" + "0" * 64
-    expected = int(entry["action"]["str_params"][2])
-    matching = []
-    for log in logs:
-        if not isinstance(log, dict) or str(log.get("address", "")).lower() != FUEL_PREDEPOSITS:
-            continue
-        topics, data = log.get("topics"), log.get("data")
-        if (
-            isinstance(topics, list)
-            and len(topics) == 4
-            and [str(topic).lower() for topic in topics]
-            == [_FUEL_WITHDRAW_TOPIC, wallet_topic, wallet_topic, zero_topic]
-            and isinstance(data, str)
-            and re.fullmatch(r"0x[0-9a-fA-F]{128}", data)
-            and int(data[66:], 16) == 0
-        ):
-            matching.append(int(data[2:66], 16))
-    return expected if matching == [expected] else None
-
-
-def _withdrawal_result(
-    entry: dict[str, Any], action_id: str, tx_hash: str, receipt: dict[str, Any]
-) -> dict[str, Any]:
-    """Only claim delivered assets when the receipt proves action-specific minima."""
-
-    action = entry["action"]
-    if _is_fuel_native_exit(entry):
-        fuel_amount = _fuel_withdrawn_raw(entry, receipt)
-        if fuel_amount is not None:
-            return {
-                "status": "withdrawn", "action_id": action_id, "tx_hash": tx_hash,
-                "received_token_id": "eth", "received_raw": str(fuel_amount),
-            }
-        return {
-            "status": "manual_review", "action_id": action_id, "tx_hash": tx_hash,
-            "reason": "output_below_minimum_or_unverified",
-        }
-    stargate_amount = _stargate_withdrawn_raw(entry, receipt)
-    if stargate_amount is not None:
-        return {
-            "status": "withdrawn", "action_id": action_id, "tx_hash": tx_hash,
-            "received_token_id": _STARGATE_BSC_TOKEN, "received_raw": str(stargate_amount),
-        }
-    if not str(action.get("func", "")).startswith("removeLiquidity("):
-        reason = "output_not_verifiable_from_action"
-    else:
-        params = action["str_params"]
-        minimums = {params[0].lower(): int(params[3]), params[1].lower(): int(params[4])}
-        if len(minimums) != 2:
-            reason = "output_not_verifiable_from_action"
-        else:
-            received = dict.fromkeys(minimums, 0)
-            logs = receipt.get("logs")
-            if isinstance(logs, list):
-                recipient = "0x" + entry["wallet"][2:].lower().rjust(64, "0")
-                for log in logs:
-                    if not isinstance(log, dict):
-                        continue
-                    topics = log.get("topics")
-                    token = str(log.get("address", "")).lower()
-                    if (
-                        token in received
-                        and isinstance(topics, list)
-                        and len(topics) >= 3
-                        and str(topics[0]).lower() == _TRANSFER_TOPIC
-                        and str(topics[2]).lower() == recipient
-                    ):
-                        try:
-                            received[token] += uint256(log.get("data"))
-                        except (TypeError, ValueError, RpcError):
-                            continue
-            reason = (
-                None
-                if all(received[token] >= minimums[token] for token in minimums)
-                else "output_below_minimum_or_unverified"
-            )
-    result = {"action_id": action_id, "tx_hash": tx_hash}
-    if reason is None:
-        result["status"] = "withdrawn"
-    else:
-        result.update(status="manual_review", reason=reason)
-    return result
+        amount = uint256(log.get("data"))
+        if str(topics[2]).lower() == wallet_topic:
+            flow += amount
+        if str(topics[1]).lower() == wallet_topic:
+            flow -= amount
+    return flow
 
 
 def _submit_durable(
