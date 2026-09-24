@@ -167,6 +167,7 @@ def initialize_batch(
     seed_plan_path: Path,
     run_id: str,
     wallet_count: int = 50,
+    wallet_ordinals: str | None = None,
     gas_cap_wei: int = 10**15,
     delay_min_seconds: int = 1200,
     delay_max_seconds: int = 6000,
@@ -189,9 +190,11 @@ def initialize_batch(
         workbook_path,
         require_deposit_address=False,
         require_rabby_proxy=True,
-        ordinal_ranges=parse_ordinal_ranges(f"1-{wallet_count}"),
+        ordinal_ranges=parse_ordinal_ranges(
+            wallet_ordinals if wallet_ordinals else f"1-{wallet_count}"
+        ),
     )
-    if len(rows) != wallet_count:
+    if not rows or (wallet_ordinals is None and len(rows) != wallet_count):
         raise ValueError("wallet workbook does not contain the requested ordinal range")
     plan_bytes = seed_plan_path.read_bytes()
     digest = hashlib.sha256(plan_bytes).hexdigest()
@@ -1050,6 +1053,10 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--run-id", required=True)
     init.add_argument("--output-dir", required=True)
     init.add_argument("--wallet-count", type=int, default=50)
+    init.add_argument(
+        "--wallet-ordinals",
+        help="specific workbook ordinals, e.g. 3,8-10,13-14; overrides --wallet-count",
+    )
     init.add_argument("--gas-cap-wei", type=int, default=10**15)
     init.add_argument("--between-wallet-delay-min-seconds", "--delay-min-seconds",
                       dest="delay_min_seconds", type=int, default=1200)
@@ -1070,6 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
                 db_path=Path(args.db), workbook_path=Path(args.workbook),
                 seed_plan_path=Path(args.seed_plan), run_id=args.run_id,
                 wallet_count=args.wallet_count, gas_cap_wei=args.gas_cap_wei,
+                wallet_ordinals=args.wallet_ordinals,
                 delay_min_seconds=args.delay_min_seconds,
                 delay_max_seconds=args.delay_max_seconds,
                 within_wallet_delay_min_seconds=args.within_wallet_delay_min_seconds,
