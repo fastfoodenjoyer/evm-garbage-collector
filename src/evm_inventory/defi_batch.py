@@ -6,11 +6,12 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 import random
 import re
 import secrets
 import sqlite3
-import subprocess
+import stat
 import sys
 import time
 from collections import Counter
@@ -20,8 +21,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .cli import _execution_rpc_urls, _load_dotenv
 from .config import load_catalog
+from .defi_operations import execute_defi, quote_defi
+from .diagnostics import exception_diagnostic, redact_data, redact_text
+from .executor import AmbiguousBroadcast
+from .models import ConfigError
 from .rpc import RpcReader, quantity
 from .store import Store
 from .transport import RequestError, Transport
@@ -101,6 +108,7 @@ def _ensure_tables(connection: sqlite3.Connection) -> None:
             native_after_wei TEXT,
             status TEXT NOT NULL,
             reason TEXT,
+            error_detail TEXT,
             tx_hash TEXT,
             observed_at REAL NOT NULL,
             UNIQUE(run_id, ordinal, action_id, status)
@@ -133,6 +141,11 @@ def _ensure_tables(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE defi_batch_transactions ADD COLUMN same_wallet_not_before REAL"
         )
+    outcome_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(defi_batch_outcomes)")
+    }
+    if "error_detail" not in outcome_columns:
+        connection.execute("ALTER TABLE defi_batch_outcomes ADD COLUMN error_detail TEXT")
     for row in connection.execute(
         "SELECT t.tx_hash, t.observed_at, r.within_wallet_delay_min_seconds AS minimum, "
         "r.within_wallet_delay_max_seconds AS maximum FROM defi_batch_transactions t "
@@ -404,6 +417,7 @@ def _record_outcome(
     native_symbol: str | None, native_before_wei: int | None,
     native_after_wei: int | None, now: float,
     result: dict[str, Any] | None = None,
+    error_detail: str | None = None,
 ) -> None:
     event = {
         "event": "withdrawal_outcome", "run_id": run_id, "ordinal": ordinal,
@@ -413,16 +427,19 @@ def _record_outcome(
         "native_symbol": native_symbol,
         "native_before_wei": str(native_before_wei) if native_before_wei is not None else None,
         "native_after_wei": str(native_after_wei) if native_after_wei is not None else None,
-        "status": status, "reason": reason, "tx_hash": tx_hash, "at": now,
+        "status": status, "reason": reason, "error_detail": error_detail,
+        "tx_hash": tx_hash, "at": now,
     }
     connection.execute(
         "INSERT OR IGNORE INTO defi_batch_outcomes "
         "(run_id, ordinal, action_id, protocol_name, chain_id, withdrawal_size, "
         "estimated_usd, native_symbol, native_before_wei, native_after_wei, "
-        "status, reason, tx_hash, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "status, reason, error_detail, tx_hash, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (run_id, ordinal, entry.get("action_id"), event["protocol"], entry.get("chain_id"),
          event["size"], event["estimated_usd"], native_symbol,
-         event["native_before_wei"], event["native_after_wei"], status, reason, tx_hash, now),
+         event["native_before_wei"], event["native_after_wei"], status, reason,
+         error_detail, tx_hash, now),
     )
     connection.commit()
     print(json.dumps(event, ensure_ascii=False), flush=True)
@@ -433,46 +450,120 @@ class CommandResult:
     returncode: int
     payload: dict[str, Any] | None
     reason: str = ""
+    detail: str | None = None
 
 
-def _run_cli(command: list[str]) -> CommandResult:
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600, check=False)
-    except subprocess.TimeoutExpired:
-        return CommandResult(4, None, "timeout")
-    if result.returncode:
-        reason = "stale_plan" if "DeFi plan is stale" in result.stderr else (
-            "gas_estimate_rpc_error" if "estimate_gas_" in result.stderr else (
-                "ethereum_gas_deferred" if "ethereum_gas_deferred:" in result.stderr
-                else ("transient" if result.returncode == 4 else "safety")
-            )
+@dataclass(frozen=True)
+class BatchOperation:
+    kind: str
+    ordinal: int
+    workbook_path: Path
+    db_path: Path
+    wallets_path: Path | None = None
+    output_path: Path | None = None
+    plan_path: Path | None = None
+    plan_sha256: str | None = None
+    action_id: str | None = None
+    max_gas_wei: int | None = None
+    execute: bool = False
+
+
+def _log_operation_failure(
+    operation: BatchOperation, result: CommandResult, *, stdout: str,
+    started_at: float, elapsed_ms: int,
+) -> None:
+    print(json.dumps({
+        "event": "operation_failure", "operation": operation.kind,
+        "ordinal": operation.ordinal,
+        "returncode": result.returncode, "reason": result.reason,
+        "detail": result.detail, "stdout": redact_text(stdout),
+        "context": redact_data({
+            "workbook_path": str(operation.workbook_path),
+            "db_path": str(operation.db_path),
+            "wallets_path": str(operation.wallets_path) if operation.wallets_path else None,
+            "output_path": str(operation.output_path) if operation.output_path else None,
+            "plan_path": str(operation.plan_path) if operation.plan_path else None,
+            "plan_sha256": operation.plan_sha256, "action_id": operation.action_id,
+            "max_gas_wei": operation.max_gas_wei, "execute": operation.execute,
+        }), "started_at": started_at,
+        "elapsed_ms": elapsed_ms, "at": time.time(),
+    }), flush=True)
+
+
+def _log_batch_anomaly(run_id: str, ordinal: int, reason: str, context: Any) -> str:
+    detail = json.dumps(redact_data(context), ensure_ascii=False)
+    print(json.dumps({
+        "event": "batch_anomaly", "run_id": redact_text(run_id),
+        "ordinal": ordinal, "reason": reason, "detail": detail, "at": time.time(),
+    }, ensure_ascii=False), flush=True)
+    return detail
+
+
+def _run_operation(operation: BatchOperation) -> CommandResult:
+    """Invoke the same operations as the CLI, inside the batch worker process."""
+
+    started_at = time.time()
+    started_monotonic = time.monotonic()
+
+    def log_failure(failure: CommandResult, stdout: str = "") -> CommandResult:
+        _log_operation_failure(
+            operation, failure, stdout=stdout, started_at=started_at,
+            elapsed_ms=round((time.monotonic() - started_monotonic) * 1000),
         )
-        return CommandResult(result.returncode, None, reason)
+        return failure
+
     try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return CommandResult(4, None, "invalid_cli_output")
-    if not isinstance(payload, dict):
-        return CommandResult(4, None, "invalid_cli_output")
-    return CommandResult(0, payload)
+        _load_dotenv()
+        if operation.kind == "quote-defi":
+            if operation.wallets_path is None or operation.output_path is None:
+                raise ValueError("incomplete quote operation")
+            payload = quote_defi(
+                wallets_path=operation.wallets_path,
+                workbook_path=operation.workbook_path,
+                db_path=operation.db_path, output_path=operation.output_path,
+            )
+        elif operation.kind == "execute-defi":
+            if (operation.plan_path is None or operation.plan_sha256 is None
+                    or operation.action_id is None or operation.max_gas_wei is None):
+                raise ValueError("incomplete execution operation")
+            catalog = load_catalog(None)
+            payload = execute_defi(
+                plan_path=operation.plan_path, plan_sha256=operation.plan_sha256,
+                action_id=operation.action_id, workbook_path=operation.workbook_path,
+                db_path=operation.db_path, max_gas_wei=operation.max_gas_wei,
+                execute=operation.execute,
+                rpc_urls=_execution_rpc_urls(catalog),
+            )
+        else:
+            raise ValueError("unknown DeFi operation")
+        return CommandResult(0, payload)
+    except Exception as exc:
+        message = str(exc)
+        reason = (
+            "stale_plan" if message.startswith("DeFi plan is stale") else
+            "gas_estimate_rpc_error" if re.fullmatch(r"estimate_gas_[a-zA-Z0-9_]+", message)
+            else "ethereum_gas_deferred" if message.startswith("ethereum_gas_deferred:")
+            else type(exc).__name__
+        )
+        returncode = (
+            4 if isinstance(exc, (httpx.HTTPError, RequestError, AmbiguousBroadcast,
+                                  sqlite3.OperationalError)) else
+            2 if isinstance(exc, (ConfigError, ValueError, OSError)) else 1
+        )
+        detail = json.dumps(exception_diagnostic(exc), ensure_ascii=False)
+        return log_failure(CommandResult(returncode, None, reason, detail))
 
 
-def _cli_prefix() -> list[str]:
-    return [str(Path(sys.executable).with_name("evm-inventory"))]
-
-
-def _execute_args(run: sqlite3.Row, action: sqlite3.Row | dict, *, execute: bool) -> list[str]:
-    command = _cli_prefix() + [
-        "execute-defi", "--plan", action["plan_path"],
-        "--plan-sha256", action["plan_sha256"],
-        "--action-id", action["action_id"],
-        "--workbook", run["workbook_path"],
-        "--db", run["db_path"],
-        "--max-gas-wei", run["gas_cap_wei"],
-    ]
-    if execute:
-        command.append("--execute")
-    return command
+def _execute_operation(
+    run: sqlite3.Row, action: sqlite3.Row | dict, *, ordinal: int, execute: bool,
+) -> BatchOperation:
+    return BatchOperation(
+        kind="execute-defi", ordinal=ordinal,
+        plan_path=Path(action["plan_path"]),
+        plan_sha256=action["plan_sha256"], action_id=action["action_id"],
+        workbook_path=Path(run["workbook_path"]), db_path=Path(run["db_path"]),
+        max_gas_wei=int(run["gas_cap_wei"]), execute=execute,
+    )
 
 
 def _set_action(
@@ -512,12 +603,12 @@ def _retry_wallet(
 
 
 def _invoke_read_only(
-    invoke: Callable[[list[str]], CommandResult], command: list[str],
+    invoke: Callable[[BatchOperation], CommandResult], operation: BatchOperation,
 ) -> CommandResult:
     """Retry read-only API and RPC calls promptly, without transaction pacing."""
 
     for attempt in range(3):
-        result = invoke(command)
+        result = invoke(operation)
         if result.returncode != 4:
             return result
         if attempt < 2:
@@ -526,12 +617,12 @@ def _invoke_read_only(
 
 
 def _invoke_execute(
-    invoke: Callable[[list[str]], CommandResult], command: list[str],
+    invoke: Callable[[BatchOperation], CommandResult], operation: BatchOperation,
 ) -> CommandResult:
     """Only pre-broadcast gas-estimate failures are safe to retry immediately."""
 
     for attempt in range(3):
-        result = invoke(command)
+        result = invoke(operation)
         if result.reason != "gas_estimate_rpc_error" or attempt == 2:
             return result
         time.sleep(attempt + 1)
@@ -567,11 +658,11 @@ def process_wallet(
     run_id: str,
     ordinal: int,
     *,
-    invoke: Callable[[list[str]], CommandResult] = _run_cli,
+    invoke: Callable[[BatchOperation], CommandResult] = _run_operation,
     native_balance: Callable[[int, str], tuple[str | None, int | None]] = _native_snapshot,
     now: float | None = None,
 ) -> str:
-    """Process one wallet using fresh Rabby data and the existing single-action CLI."""
+    """Process one wallet using fresh Rabby data in the worker process."""
 
     now = time.time() if now is None else now
     with _connect(db_path) as connection:
@@ -596,10 +687,13 @@ def process_wallet(
             "AND status='executing' ORDER BY updated_at LIMIT 1", (run_id, ordinal),
         ).fetchone()
         if unresolved is not None:
-            recovered = invoke(_execute_args(run, unresolved, execute=True))
+            recovered = invoke(_execute_operation(run, unresolved, ordinal=ordinal, execute=True))
             if recovered.returncode == 0 and recovered.payload:
                 status = recovered.payload.get("status")
                 if status not in {"withdrawn", "manual_review"}:
+                    _log_batch_anomaly(
+                        run_id, ordinal, "invalid_recovery_result", recovered.payload,
+                    )
                     return "manual_review"
                 tx_hash = recovered.payload.get("tx_hash")
                 if isinstance(tx_hash, str):
@@ -638,6 +732,10 @@ def process_wallet(
                 return _retry_wallet(connection, run_id, ordinal, now=now,
                                      reason=recovered.reason, unresolved_action=True)
             else:
+                _log_batch_anomaly(run_id, ordinal, "recovery_failed", {
+                    "reason": recovered.reason, "detail": recovered.detail,
+                    "returncode": recovered.returncode,
+                })
                 return "manual_review"
 
         output_dir = Path(run["output_dir"])
@@ -645,11 +743,11 @@ def process_wallet(
         wallet_file = output_dir / f"wallet-{ordinal}.txt"
         wallet_file.write_text(wallet["wallet"] + "\n", encoding="utf-8")
         plan_path = output_dir / f"plan-{ordinal}-{time.time_ns()}-{secrets.token_hex(3)}.json"
-        quote = _invoke_read_only(invoke, _cli_prefix() + [
-            "quote-defi", "--wallets", str(wallet_file),
-            "--workbook", run["workbook_path"],
-            "--db", run["db_path"], "--output", str(plan_path),
-        ])
+        quote = _invoke_read_only(invoke, BatchOperation(
+            kind="quote-defi", ordinal=ordinal, wallets_path=wallet_file,
+            workbook_path=Path(run["workbook_path"]), db_path=Path(run["db_path"]),
+            output_path=plan_path,
+        ))
         if quote.returncode:
             connection.execute(
                 "UPDATE defi_batch_wallets SET last_error=? WHERE run_id=? AND ordinal=?",
@@ -669,14 +767,19 @@ def process_wallet(
                         connection, run_id, ordinal, entry, status="quote_failed",
                         reason=quote.reason, tx_hash=None, native_symbol=symbol,
                         native_before_wei=balance, native_after_wei=balance,
-                        now=time.time(),
+                        now=time.time(), error_detail=quote.detail,
                     )
             return "failed"
         if not quote.payload or not isinstance(quote.payload.get("plan_sha256"), str):
+            _log_batch_anomaly(run_id, ordinal, "invalid_quote_result", quote.payload)
             return "failed"
         plan_bytes = plan_path.read_bytes()
         digest = hashlib.sha256(plan_bytes).hexdigest()
         if digest != quote.payload["plan_sha256"]:
+            _log_batch_anomaly(run_id, ordinal, "quote_digest_mismatch", {
+                "calculated": digest, "reported": quote.payload["plan_sha256"],
+                "plan_path": str(plan_path),
+            })
             return "manual_review"
         plan = json.loads(plan_bytes)
         ready = [
@@ -704,7 +807,9 @@ def process_wallet(
             action = {"action_id": action_id, "plan_sha256": digest,
                       "plan_path": str(plan_path)}
             symbol, before = native_balance(entry["chain_id"], wallet["wallet"])
-            preview = _invoke_read_only(invoke, _execute_args(run, action, execute=False))
+            preview = _invoke_read_only(
+                invoke, _execute_operation(run, action, ordinal=ordinal, execute=False),
+            )
             if preview.returncode:
                 _set_action(connection, run_id, ordinal, action, status="skipped",
                             now=now, reason=preview.reason)
@@ -712,9 +817,13 @@ def process_wallet(
                 _record_outcome(connection, run_id, ordinal, entry, status="skipped",
                                 reason=preview.reason, tx_hash=None,
                                 native_symbol=symbol or after_symbol, native_before_wei=before,
-                                native_after_wei=after, now=time.time())
+                                native_after_wei=after, now=time.time(),
+                                error_detail=preview.detail)
                 continue
             if not preview.payload or preview.payload.get("status") != "preview":
+                detail = _log_batch_anomaly(
+                    run_id, ordinal, "invalid_preview", preview.payload,
+                )
                 _set_action(connection, run_id, ordinal, action, status="manual_review",
                             now=now, reason="invalid_preview")
                 after_symbol, after = native_balance(entry["chain_id"], wallet["wallet"])
@@ -722,7 +831,7 @@ def process_wallet(
                                 reason="invalid_preview", tx_hash=None,
                                 native_symbol=symbol or after_symbol,
                                 native_before_wei=before, native_after_wei=after,
-                                now=time.time())
+                                now=time.time(), error_detail=detail)
                 return "manual_review"
             due = _next_transaction_due(connection, run_id, ordinal)
             if due is not None and time.time() < due:
@@ -739,14 +848,14 @@ def process_wallet(
             )
             connection.commit()
             _set_action(connection, run_id, ordinal, action, status="executing", now=now)
-            execute_command = _execute_args(run, action, execute=True)
-            result = _invoke_execute(invoke, execute_command)
+            execute_operation = _execute_operation(run, action, ordinal=ordinal, execute=True)
+            result = _invoke_execute(invoke, execute_operation)
             for attempt in range(2):
                 if (result.returncode != 4 or result.reason == "gas_estimate_rpc_error"
                         or _journal_has_step(connection, wallet["wallet"], action_id)):
                     break
                 time.sleep(attempt + 1)
-                result = _invoke_execute(invoke, execute_command)
+                result = _invoke_execute(invoke, execute_operation)
             if result.returncode:
                 if result.reason == "gas_estimate_rpc_error":
                     _set_action(connection, run_id, ordinal, action, status="skipped",
@@ -755,7 +864,8 @@ def process_wallet(
                     _record_outcome(connection, run_id, ordinal, entry, status="skipped",
                                     reason=result.reason, tx_hash=None,
                                     native_symbol=symbol or after_symbol, native_before_wei=before,
-                                    native_after_wei=after, now=time.time())
+                                    native_after_wei=after, now=time.time(),
+                                    error_detail=result.detail)
                     continue
                 if result.returncode == 4:
                     tx_hash = _journal_tx_hash(connection, wallet["wallet"], action_id)
@@ -775,7 +885,7 @@ def process_wallet(
                                     reason=reason, tx_hash=None,
                                     native_symbol=symbol or after_symbol,
                                     native_before_wei=before, native_after_wei=after,
-                                    now=time.time())
+                                    now=time.time(), error_detail=result.detail)
                     if status == "manual_review":
                         return "manual_review"
                     continue
@@ -787,7 +897,7 @@ def process_wallet(
                                     reason="stale_plan", tx_hash=None,
                                     native_symbol=symbol or after_symbol,
                                     native_before_wei=before, native_after_wei=after,
-                                    now=time.time())
+                                    now=time.time(), error_detail=result.detail)
                     continue
                 _set_action(connection, run_id, ordinal, action, status="manual_review",
                             now=now, reason=result.reason)
@@ -796,11 +906,14 @@ def process_wallet(
                                 reason=result.reason, tx_hash=None,
                                 native_symbol=symbol or after_symbol,
                                 native_before_wei=before, native_after_wei=after,
-                                now=time.time())
+                                now=time.time(), error_detail=result.detail)
                 return "manual_review"
             if not result.payload or result.payload.get("status") not in {
                 "withdrawn", "manual_review"
             }:
+                detail = _log_batch_anomaly(
+                    run_id, ordinal, "invalid_execution_result", result.payload,
+                )
                 _set_action(connection, run_id, ordinal, action, status="manual_review",
                             now=now, reason="invalid_execution_result")
                 after_symbol, after = native_balance(entry["chain_id"], wallet["wallet"])
@@ -808,7 +921,7 @@ def process_wallet(
                                 reason="invalid_execution_result", tx_hash=None,
                                 native_symbol=symbol or after_symbol,
                                 native_before_wei=before, native_after_wei=after,
-                                now=time.time())
+                                now=time.time(), error_detail=detail)
                 return "manual_review"
             _set_action(
                 connection, run_id, ordinal, action, status=result.payload["status"],
@@ -875,6 +988,13 @@ def batch_status(db_path: Path, run_id: str) -> dict[str, Any]:
 def run_worker(db_path: Path, run_id: str) -> int:
     """Run the durable queue; wait only before a subsequent transaction."""
 
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                os.fchmod(stream.fileno(), 0o600)
+        except (AttributeError, OSError):
+            pass
+    db_path.chmod(0o600)
     lock_path = Path(str(db_path) + ".defi-batch.lock")
     with lock_path.open("a+") as lock:
         try:
@@ -962,9 +1082,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(batch_status(Path(args.db), args.run_id)))
             return 0
         return run_worker(Path(args.db), args.run_id)
-    except (OSError, sqlite3.Error, ValueError) as exc:
-        print(json.dumps({"status": "error", "error_type": type(exc).__name__}),
-              file=sys.stderr)
+    except Exception as exc:
+        print(json.dumps({
+            "status": "error", "error_type": type(exc).__name__,
+            "run_id": redact_text(args.run_id),
+            "diagnostic": exception_diagnostic(exc),
+        }, ensure_ascii=False), file=sys.stderr, flush=True)
         return 1
 
 

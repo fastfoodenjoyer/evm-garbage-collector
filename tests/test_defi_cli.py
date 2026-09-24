@@ -57,7 +57,7 @@ class FakeRabby:
 
 
 def test_quote_defi_writes_key_free_plan_and_digest(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("evm_inventory.cli.RabbyClient", FakeRabby)
+    monkeypatch.setattr("evm_inventory.defi_operations.RabbyClient", FakeRabby)
     wallets = tmp_path / "wallets.txt"
     wallets.write_text(WALLET + "\n")
     output = tmp_path / "out" / "defi.json"
@@ -80,7 +80,7 @@ def test_quote_defi_writes_key_free_plan_and_digest(tmp_path, monkeypatch, capsy
 
 
 def test_execute_defi_requires_explicit_action_and_reviewed_digest(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("evm_inventory.cli.RabbyClient", FakeRabby)
+    monkeypatch.setattr("evm_inventory.defi_operations.RabbyClient", FakeRabby)
     wallets = tmp_path / "wallets.txt"
     wallets.write_text(WALLET + "\n")
     plan_path = tmp_path / "defi.json"
@@ -100,7 +100,7 @@ def test_execute_defi_requires_explicit_action_and_reviewed_digest(tmp_path, mon
         called.update(kwargs)
         return {"status": "preview", "action_id": kwargs["action_id"]}
 
-    monkeypatch.setattr("evm_inventory.cli.execute_defi_action", fake_execute)
+    monkeypatch.setattr("evm_inventory.defi_operations.execute_defi_action", fake_execute)
     seen_proxies = []
 
     class FakeClient:
@@ -117,7 +117,7 @@ def test_execute_defi_requires_explicit_action_and_reviewed_digest(tmp_path, mon
         def close(self):
             pass
 
-    monkeypatch.setattr("evm_inventory.cli.httpx.Client", FakeClient)
+    monkeypatch.setattr("evm_inventory.defi_operations.httpx.Client", FakeClient)
     digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
     assert (
         main(
@@ -186,8 +186,8 @@ def test_quote_defi_uses_matching_proxy_for_each_wallet(tmp_path, monkeypatch, c
             used.append((wallet, self.proxy))
             return []
 
-    monkeypatch.setattr("evm_inventory.cli.httpx.Client", FakeClient)
-    monkeypatch.setattr("evm_inventory.cli.RabbyClient", RoutedRabby)
+    monkeypatch.setattr("evm_inventory.defi_operations.httpx.Client", FakeClient)
+    monkeypatch.setattr("evm_inventory.defi_operations.RabbyClient", RoutedRabby)
     assert main([
         "quote-defi", "--wallets", str(wallets), "--workbook", str(workbook_path),
         "--output", str(tmp_path / "plan.json"), "--db", str(tmp_path / "inventory.sqlite"),
@@ -197,7 +197,7 @@ def test_quote_defi_uses_matching_proxy_for_each_wallet(tmp_path, monkeypatch, c
 
 
 def test_quote_defi_accepts_socks5_proxy(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("evm_inventory.cli.RabbyClient", FakeRabby)
+    monkeypatch.setattr("evm_inventory.defi_operations.RabbyClient", FakeRabby)
     workbook_path = tmp_path / "wallets.xlsx"
     workbook_with_proxy(workbook_path, WALLET)
     book = load_workbook(workbook_path)
@@ -225,7 +225,7 @@ def test_quote_defi_rejects_missing_proxy_before_network(tmp_path, monkeypatch, 
     def unexpected_client(**_kwargs):
         raise AssertionError("Rabby request must not be sent directly")
 
-    monkeypatch.setattr("evm_inventory.cli.httpx.Client", unexpected_client)
+    monkeypatch.setattr("evm_inventory.defi_operations.httpx.Client", unexpected_client)
     assert main([
         "quote-defi", "--wallets", str(wallets), "--workbook", str(workbook_path),
         "--output", str(tmp_path / "plan.json"), "--db", str(tmp_path / "inventory.sqlite"),
@@ -234,7 +234,7 @@ def test_quote_defi_rejects_missing_proxy_before_network(tmp_path, monkeypatch, 
 
 
 def test_execute_defi_rejects_missing_proxy_before_rpc(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("evm_inventory.cli.RabbyClient", FakeRabby)
+    monkeypatch.setattr("evm_inventory.defi_operations.RabbyClient", FakeRabby)
     workbook_path = tmp_path / "wallets.xlsx"
     workbook_with_proxy(workbook_path, WALLET)
     wallets = tmp_path / "wallets.txt"
@@ -254,7 +254,7 @@ def test_execute_defi_rejects_missing_proxy_before_rpc(tmp_path, monkeypatch, ca
     def unexpected_execute(*_args, **_kwargs):
         raise AssertionError("execution must stop before RPC")
 
-    monkeypatch.setattr("evm_inventory.cli.execute_defi_action", unexpected_execute)
+    monkeypatch.setattr("evm_inventory.defi_operations.execute_defi_action", unexpected_execute)
     assert main([
         "execute-defi", "--plan", str(plan_path),
         "--plan-sha256", hashlib.sha256(plan_path.read_bytes()).hexdigest(),

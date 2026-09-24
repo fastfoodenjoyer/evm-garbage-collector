@@ -2,11 +2,64 @@ import json
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from evm_inventory.cli import _execution_rpc_urls, main
 from evm_inventory.models import ConfigError
 from evm_inventory.store import Store
+
+
+def test_http_error_reports_safe_type_without_proxy_credentials(monkeypatch, capsys):
+    secret = "http://user:password@proxy.example:8080"
+    monkeypatch.setattr(
+        "evm_inventory.cli._load_dotenv",
+        lambda: (_ for _ in ()).throw(httpx.ConnectError(secret)),
+    )
+
+    assert main(["scan", "--wallets", "unused", "--db", "unused"]) == 4
+    error = capsys.readouterr().err
+    lines = error.splitlines()
+    assert lines[0] == "error: external API request failed (ConnectError)"
+    diagnostic = json.loads(lines[1].removeprefix("diagnostic: "))
+    assert diagnostic["exceptions"][0]["type"] == "ConnectError"
+    assert diagnostic["exceptions"][0]["message"] == "[REDACTED_URL]"
+    assert "traceback" in diagnostic
+    assert secret not in error
+
+
+def test_http_status_error_reports_status_without_proxy_url(monkeypatch, capsys):
+    secret = "http://user:password@proxy.example:8080"
+    request = httpx.Request("GET", secret)
+    response = httpx.Response(429, request=request)
+    monkeypatch.setattr(
+        "evm_inventory.cli._load_dotenv",
+        lambda: (_ for _ in ()).throw(
+            httpx.HTTPStatusError("rate limited", request=request, response=response)
+        ),
+    )
+
+    assert main(["scan", "--wallets", "unused", "--db", "unused"]) == 4
+    error = capsys.readouterr().err
+    lines = error.splitlines()
+    assert lines[0] == "error: external API request failed (http_429)"
+    diagnostic = json.loads(lines[1].removeprefix("diagnostic: "))
+    assert diagnostic["exceptions"][0]["http_status"] == 429
+    assert secret not in error
+
+
+def test_value_error_keeps_exact_cause_and_traceback(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "evm_inventory.cli._load_dotenv",
+        lambda: (_ for _ in ()).throw(ValueError("estimated DeFi transaction exceeds gas cap")),
+    )
+
+    assert main(["scan", "--wallets", "unused", "--db", "unused"]) == 2
+    lines = capsys.readouterr().err.splitlines()
+    diagnostic = json.loads(lines[1].removeprefix("diagnostic: "))
+    assert lines[0] == "error: estimated DeFi transaction exceeds gas cap"
+    assert diagnostic["exceptions"][0]["message"] == "estimated DeFi transaction exceeds gas cap"
+    assert "ValueError" in diagnostic["traceback"]
 
 
 def test_workbook_commands_create_template_and_write_dry_run(tmp_path, capsys):

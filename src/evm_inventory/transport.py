@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time
+import traceback
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
@@ -13,10 +14,14 @@ import httpx
 
 
 class RequestError(Exception):
-    def __init__(self, code: str, retry_after: float | None = None):
+    def __init__(
+        self, code: str, retry_after: float | None = None,
+        *, diagnostic: dict | None = None,
+    ):
         super().__init__(code)
         self.code = code
         self.retry_after = retry_after
+        self.diagnostic = diagnostic
 
 
 def resolve_url(template: str) -> str:
@@ -44,6 +49,7 @@ class Transport:
 
     def post(self, url: str, payload: dict) -> dict:
         url = resolve_url(url)
+        diagnostic: dict = {"rpc_method": payload.get("method"), "attempts": []}
         try:
             parsed = urlsplit(url)
             if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -58,23 +64,48 @@ class Transport:
             self.last[host] = self.clock()
             try:
                 response = self.client.post(url, json=payload)
-            except httpx.InvalidURL:
-                raise RequestError("invalid_rpc_url") from None
-            except httpx.HTTPError:
+            except httpx.InvalidURL as exc:
+                diagnostic["attempts"].append({
+                    "attempt": attempt + 1, "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                    "traceback": "".join(traceback.format_exception(exc)),
+                })
+                raise RequestError("invalid_rpc_url", diagnostic=diagnostic) from exc
+            except httpx.HTTPError as exc:
+                diagnostic["attempts"].append({
+                    "attempt": attempt + 1, "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                    "traceback": "".join(traceback.format_exception(exc)),
+                })
                 code, wait = "network_error", 2**attempt + random.random()
             else:
                 if response.status_code == 200:
                     try:
                         result = response.json()
-                    except ValueError:
-                        raise RequestError("invalid_json") from None
+                    except ValueError as exc:
+                        diagnostic["attempts"].append({
+                            "attempt": attempt + 1, "http_status": response.status_code,
+                            "response_headers": dict(response.headers),
+                            "response_body": response.text,
+                        })
+                        raise RequestError("invalid_json", diagnostic=diagnostic) from exc
                     if not isinstance(result, dict):
-                        raise RequestError("invalid_response")
+                        diagnostic["attempts"].append({
+                            "attempt": attempt + 1, "http_status": response.status_code,
+                            "response_headers": dict(response.headers),
+                            "response_body": response.text,
+                        })
+                        raise RequestError("invalid_response", diagnostic=diagnostic)
                     return result
+                diagnostic["attempts"].append({
+                    "attempt": attempt + 1, "http_status": response.status_code,
+                    "response_headers": dict(response.headers),
+                    "response_body": response.text,
+                })
                 if response.status_code in (401, 403):
-                    raise RequestError("provider_access_denied")
+                    raise RequestError("provider_access_denied", diagnostic=diagnostic)
                 if response.status_code not in (408, 429) and response.status_code < 500:
-                    raise RequestError(f"http_{response.status_code}")
+                    raise RequestError(f"http_{response.status_code}", diagnostic=diagnostic)
                 code = "rate_limited" if response.status_code == 429 else "provider_unavailable"
                 wait = 2**attempt + random.random()
                 header = response.headers.get("retry-after")
@@ -90,8 +121,8 @@ class Transport:
                         except (ValueError, TypeError):
                             pass
             if wait > 30:
-                raise RequestError(code, time.time() + wait)
+                raise RequestError(code, time.time() + wait, diagnostic=diagnostic)
             if attempt == 2:
-                raise RequestError(code)
+                raise RequestError(code, diagnostic=diagnostic)
             self.sleep(wait)
         raise AssertionError("unreachable")

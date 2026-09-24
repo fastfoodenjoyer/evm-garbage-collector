@@ -200,7 +200,11 @@ def prepare_defi_action(
     )
     gas_cost = request.gas_limit * request.gas_price_wei
     if gas_cost > max_gas_wei:
-        raise ValueError("estimated DeFi transaction exceeds gas cap")
+        raise ValueError(
+            "estimated DeFi transaction exceeds gas cap: "
+            f"gas_limit={request.gas_limit};gas_price_wei={request.gas_price_wei};"
+            f"gas_cost_wei={gas_cost};max_gas_wei={max_gas_wei}"
+        )
     balance = quantity(rpc.call(rpc_url, "eth_getBalance", [wallet, "latest"]))
     require_native_reserve(balance=balance, gas_cost=gas_cost)
     tokens = tuple(current.get("output_token_ids") or ())
@@ -223,7 +227,7 @@ def _estimated_request(
     except RequestError as exc:
         raise RpcError(f"estimate_gas_{exc.code}") from exc
     if estimate <= 0:
-        raise ValueError("invalid DeFi gas estimate")
+        raise ValueError(f"invalid DeFi gas estimate: estimate={estimate}")
     return TransactionRequest(
         request.chain_id,
         request.to,

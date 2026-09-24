@@ -69,9 +69,20 @@ class ExecutionRpc:
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
         )
         if response.get("id") != request_id or response.get("jsonrpc") != "2.0":
-            raise RpcError("invalid_rpc_envelope")
-        if response.get("error") or "result" not in response:
-            raise RpcError("rpc_error")
+            raise RpcError("invalid_rpc_envelope", diagnostic={
+                "method": method, "expected_id": request_id, "response": response,
+            })
+        if response.get("error"):
+            raise RpcError("rpc_error", diagnostic={
+                "method": method,
+                "params": ("[SIGNED_TRANSACTION]" if method == "eth_sendRawTransaction"
+                           else params),
+                "provider_error": response["error"],
+            })
+        if "result" not in response:
+            raise RpcError("missing_rpc_result", diagnostic={
+                "method": method, "response": response,
+            })
         return response["result"]
 
 
@@ -84,7 +95,11 @@ def require_native_reserve(
         raise ValueError("invalid gas reserve inputs")
     retained = gas_cost * multiplier
     if balance < retained:
-        raise ValueError("insufficient native balance for gas reserve")
+        raise ValueError(
+            "insufficient native balance for gas reserve: "
+            f"balance_wei={balance};gas_cost_wei={gas_cost};"
+            f"multiplier={multiplier};required_wei={retained}"
+        )
     return retained
 
 

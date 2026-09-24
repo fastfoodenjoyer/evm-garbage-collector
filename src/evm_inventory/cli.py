@@ -3,27 +3,24 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 import re
 import sqlite3
 import sys
-from contextlib import ExitStack
 from pathlib import Path
 
 import httpx
 
 from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot, validate_delays
-from .defi_execution import execute_defi_action
-from .defi_plan import create_defi_plan
-from .executor import AmbiguousBroadcast, ExecutionRpc
+from .defi_operations import execute_defi, quote_defi
+from .diagnostics import exception_diagnostic, redact_text
+from .executor import AmbiguousBroadcast
 from .lifi import LifiClient
 from .live_plan import create_live_plan
 from .models import ConfigError
 from .planner_gas import PlannerGasEstimator
-from .rabby import RabbyClient
 from .report import export_current
 from .route_execution import execute_entries, resume_routes_read_only
 from .routing_settings import load_routing_settings
@@ -101,27 +98,11 @@ def _progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-class _WalletRabbyPortfolio:
-    """Use each wallet's proxy for its Rabby portfolio requests."""
-
-    def __init__(self, proxies: dict[str, str], stack: ExitStack):
-        self.proxies = proxies
-        self.stack = stack
-        self.clients: dict[str, RabbyClient] = {}
-
-    def _client(self, wallet: str) -> RabbyClient:
-        if wallet not in self.clients:
-            http_client = self.stack.enter_context(
-                httpx.Client(timeout=30, proxy=self.proxies[wallet], trust_env=False)
-            )
-            self.clients[wallet] = RabbyClient(http_client)
-        return self.clients[wallet]
-
-    def chain_ids(self) -> dict[str, int]:
-        return self._client(next(iter(self.proxies))).chain_ids()
-
-    def positions(self, wallet: str) -> list[dict]:
-        return self._client(wallet).positions(wallet)
+def _emit_error_diagnostic(exc: BaseException) -> None:
+    print(
+        "diagnostic: " + json.dumps(exception_diagnostic(exc), ensure_ascii=False),
+        file=sys.stderr, flush=True,
+    )
 
 
 def main(argv=None):
@@ -193,82 +174,20 @@ def main(argv=None):
         args = parser.parse_args(argv)
 
         if args.cmd == "quote-defi":
-            wallets = load_wallets(Path(args.wallets))
-            rows = load_wallet_workbook(Path(args.workbook), require_deposit_address=False)
-            wallet_map = {row.public_address: row for row in rows}
-            proxies: dict[str, str] = {}
-            for wallet in wallets:
-                row = wallet_map.get(wallet)
-                if row is None:
-                    raise ConfigError("DeFi wallet is not in workbook")
-                if not row.rabby_proxy:
-                    raise ConfigError(f"row {row.row_number}: Rabby proxy is required")
-                proxies[wallet] = row.rabby_proxy
-            catalog = load_catalog(Path(args.catalog) if args.catalog else None)
-            with ExitStack() as stack:
-                plan = create_defi_plan(
-                    wallets, _WalletRabbyPortfolio(proxies, stack),
-                    supported_chain_ids={network.chain_id for network in catalog.networks},
-                )
-            output = Path(args.output)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
-            plan_bytes = output.read_bytes()
-            plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
-            with Store(args.db) as store:
-                store.save_defi_plan(plan_sha256, plan_bytes)
-            print(json.dumps({
-                "status": "planned", "output": str(output),
-                "plan_sha256": plan_sha256,
-                **plan["summary"],
-            }))
+            print(json.dumps(quote_defi(
+                wallets_path=Path(args.wallets), workbook_path=Path(args.workbook),
+                db_path=Path(args.db), output_path=Path(args.output),
+                catalog_path=Path(args.catalog) if args.catalog else None,
+            )))
             return 0
         if args.cmd == "execute-defi":
-            plan_bytes = Path(args.plan).read_bytes()
-            if hashlib.sha256(plan_bytes).hexdigest() != args.plan_sha256:
-                raise ValueError("reviewed plan digest does not match file")
-            with Store(args.db, readonly=True) as store:
-                if store.defi_plan(args.plan_sha256) != plan_bytes:
-                    raise ValueError("reviewed DeFi plan is not stored in the inventory database")
-            plan = json.loads(plan_bytes)
-            entries = [
-                entry for entry in plan.get("entries", [])
-                if isinstance(entry, dict) and entry.get("action_id") == args.action_id
-            ]
-            if len(entries) != 1:
-                raise ValueError("DeFi action ID does not select one position")
             catalog = load_catalog(Path(args.catalog) if args.catalog else None)
-            urls = _execution_rpc_urls(catalog)
-            wallet_rows = load_wallet_workbook(Path(args.workbook), require_deposit_address=False)
-            wallet_map = {row.public_address: row for row in wallet_rows}
-            wallet = str(entries[0].get("wallet", ""))
-            if wallet not in wallet_map:
-                raise ValueError("selected DeFi wallet is not in workbook")
-            if not wallet_map[wallet].rabby_proxy:
-                raise ConfigError(
-                    f"row {wallet_map[wallet].row_number}: Rabby proxy is required"
-                )
-            chain_id = entries[0].get("chain_id")
-            if chain_id not in urls:
-                raise ValueError("selected DeFi chain is not configured")
-            transport = Transport(interval=0.2)
-            try:
-                with httpx.Client(
-                    timeout=30, proxy=wallet_map[wallet].rabby_proxy, trust_env=False
-                ) as http_client:
-                    result = execute_defi_action(
-                        plan_bytes, plan_sha256=args.plan_sha256,
-                        action_id=args.action_id, wallet_row=wallet_map[wallet],
-                        rabby=RabbyClient(http_client), rpc=ExecutionRpc(transport),
-                        rpc_url=urls[chain_id], journal_path=Path(args.db),
-                        max_gas_wei=args.max_gas_wei,
-                        execute=args.execute,
-                    )
-            finally:
-                transport.close()
-            with Store(args.db) as store:
-                store.record_defi_execution(args.plan_sha256, args.action_id, result)
-            print(json.dumps(result))
+            print(json.dumps(execute_defi(
+                plan_path=Path(args.plan), plan_sha256=args.plan_sha256,
+                action_id=args.action_id, workbook_path=Path(args.workbook),
+                db_path=Path(args.db), max_gas_wei=args.max_gas_wei,
+                execute=args.execute, rpc_urls=_execution_rpc_urls(catalog),
+            )))
             return 0
         if args.cmd == "workbook-template":
             output = Path(args.output)
@@ -404,24 +323,40 @@ def main(argv=None):
     except KeyboardInterrupt:
         print(json.dumps({"status": "interrupted"}), file=sys.stderr, flush=True)
         return 130
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
         print("error: database operation failed", file=sys.stderr)
+        _emit_error_diagnostic(exc)
         return 4
-    except httpx.HTTPError:
-        print("error: external API request failed", file=sys.stderr)
+    except httpx.HTTPStatusError as exc:
+        print(
+            f"error: external API request failed (http_{exc.response.status_code})",
+            file=sys.stderr,
+        )
+        _emit_error_diagnostic(exc)
+        return 4
+    except httpx.HTTPError as exc:
+        print(f"error: external API request failed ({type(exc).__name__})", file=sys.stderr)
+        _emit_error_diagnostic(exc)
         return 4
     except AmbiguousBroadcast as exc:
         print(
             f"error: transaction outcome is ambiguous; inspect database and hash {exc.tx_hash}",
             file=sys.stderr,
         )
+        _emit_error_diagnostic(exc)
         return 4
     except RequestError as exc:
         print(f"error: RPC request failed ({exc.code})", file=sys.stderr)
+        _emit_error_diagnostic(exc)
         return 4
     except (ConfigError, ValueError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {redact_text(str(exc))}", file=sys.stderr)
+        _emit_error_diagnostic(exc)
         return 2
+    except Exception as exc:
+        print(f"error: unexpected {type(exc).__name__}", file=sys.stderr)
+        _emit_error_diagnostic(exc)
+        return 1
 
 def _execution_rpc_urls(catalog) -> dict[int, str]:
     """Prefer Alchemy for execution preflight and broadcast when it maps the chain."""

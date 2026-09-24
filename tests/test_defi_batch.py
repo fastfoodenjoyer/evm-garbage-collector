@@ -2,14 +2,18 @@ import hashlib
 import json
 import random
 import sqlite3
+from pathlib import Path
 
+import httpx
 from openpyxl import load_workbook
 
 from evm_inventory.defi_batch import (
+    BatchOperation,
     CommandResult,
     _ensure_tables,
     _next_transaction_due,
     _reconcile_active_wallet_due,
+    _run_operation,
     _size_description,
     advance_wallet,
     initialize_batch,
@@ -165,6 +169,7 @@ def test_old_batch_tables_gain_within_wallet_deadline(tmp_path):
                 action_id TEXT NOT NULL, observed_at REAL NOT NULL,
                 next_not_before REAL NOT NULL
             );
+            CREATE TABLE defi_batch_outcomes (id INTEGER PRIMARY KEY, status TEXT);
         """)
         raw.execute("INSERT INTO defi_batch_runs VALUES (?, '', '', '', '', '', 1200, "
                     "6000, 'running', 0, NULL)", ("old-run",))
@@ -175,10 +180,75 @@ def test_old_batch_tables_gain_within_wallet_deadline(tmp_path):
         run = raw.execute("SELECT * FROM defi_batch_runs WHERE run_id='old-run'").fetchone()
         same_due = _next_transaction_due(raw, "old-run", 15)
         between_due = _next_transaction_due(raw, "old-run", 16)
+        outcome_columns = {row[1] for row in raw.execute("PRAGMA table_info(defi_batch_outcomes)")}
     assert (run["within_wallet_delay_min_seconds"],
             run["within_wallet_delay_max_seconds"]) == (60, 300)
     assert 2060 <= same_due <= 2300
     assert between_due == 5000
+    assert "error_detail" in outcome_columns
+
+
+def test_cli_failure_logs_full_stderr_without_proxy_credentials(monkeypatch, capsys):
+    detail = "ethereum_gas_deferred:source=rpc;value_wei=851018418;threshold_wei=500000000"
+    secret = "socks5://user:pass@proxy.example:1080"
+    def fail(**kwargs):
+        raise ValueError(f"{detail};proxy={secret}")
+    monkeypatch.setattr("evm_inventory.defi_batch.execute_defi", fail)
+    monkeypatch.setattr("evm_inventory.defi_batch.load_catalog", lambda _path: None)
+    monkeypatch.setattr("evm_inventory.defi_batch._execution_rpc_urls", lambda _catalog: {})
+
+    result = _run_operation(BatchOperation(
+        kind="execute-defi", ordinal=1, plan_path=Path("plan-1.json"),
+        plan_sha256="abc", action_id="def", workbook_path=Path("wallets.xlsx"),
+        db_path=Path("db.sqlite"), max_gas_wei=1,
+    ))
+    output = capsys.readouterr().out
+
+    assert result.reason == "ethereum_gas_deferred"
+    assert detail in result.detail
+    assert "[REDACTED_URL]" in result.detail
+    assert json.loads(output)["detail"] == result.detail
+    assert secret not in output
+
+
+def test_cli_unknown_failure_keeps_message_without_credentials(monkeypatch, capsys):
+    secret = "http://estimate_gas_secret_token@proxy.example:8080"
+    def fail(**kwargs):
+        raise RuntimeError(f"unexpected failure at {secret}")
+    monkeypatch.setattr("evm_inventory.defi_batch.quote_defi", fail)
+
+    result = _run_operation(BatchOperation(
+        kind="quote-defi", ordinal=1, wallets_path=Path("wallet-1.txt"),
+        workbook_path=Path("wallets.xlsx"), db_path=Path("db.sqlite"),
+        output_path=Path("plan-1.json"),
+    ))
+    output = capsys.readouterr().out
+
+    assert result.reason == "RuntimeError"
+    assert "unexpected failure at [REDACTED_URL]" in result.detail
+    event = json.loads(output)
+    assert event["stdout"] == ""
+    assert event["ordinal"] == 1
+    assert event["operation"] == "quote-defi"
+    assert event["context"]["wallets_path"] == "wallet-1.txt"
+    assert event["elapsed_ms"] >= 0
+    assert secret not in output
+
+
+def test_cli_external_api_failure_keeps_safe_error_type(monkeypatch, capsys):
+    def fail(**kwargs):
+        raise httpx.ConnectTimeout("provider did not answer")
+    monkeypatch.setattr("evm_inventory.defi_batch.quote_defi", fail)
+
+    result = _run_operation(BatchOperation(
+        kind="quote-defi", ordinal=1, wallets_path=Path("wallet-1.txt"),
+        workbook_path=Path("wallets.xlsx"), db_path=Path("db.sqlite"),
+        output_path=Path("plan-1.json"),
+    ))
+
+    assert result.reason == "ConnectTimeout"
+    assert "provider did not answer" in result.detail
+    assert json.loads(capsys.readouterr().out)["detail"] == result.detail
 
 
 def test_verified_stargate_receipt_has_human_readable_withdrawal_size():
@@ -216,10 +286,10 @@ def test_process_wallet_quotes_previews_then_executes_and_records_result(tmp_pat
     calls = []
     action_id = "a" * 64
 
-    def invoke(command):
-        calls.append(command)
-        if "quote-defi" in command:
-            path = command[command.index("--output") + 1]
+    def invoke(operation):
+        calls.append(operation)
+        if operation.kind == "quote-defi":
+            path = operation.output_path
             payload = {
                 "schema": "rabby-defi-withdraw-v1", "created_at": 1000,
                 "entries": [{"wallet": wallet, "status": "ready", "action_id": action_id,
@@ -229,10 +299,9 @@ def test_process_wallet_quotes_previews_then_executes_and_records_result(tmp_pat
                 "summary": {"ready": 1, "manual_review": 0},
             }
             data = (json.dumps(payload) + "\n").encode()
-            from pathlib import Path
             Path(path).write_bytes(data)
             return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
-        if "--execute" in command:
+        if operation.execute:
             return CommandResult(0, {"status": "withdrawn", "tx_hash": "0x" + "b" * 64})
         return CommandResult(0, {"status": "preview"})
 
@@ -241,8 +310,8 @@ def test_process_wallet_quotes_previews_then_executes_and_records_result(tmp_pat
 
     assert result == "done"
     assert len(calls) == 3
-    assert "--execute" not in calls[1]
-    assert "--execute" in calls[2]
+    assert not calls[1].execute
+    assert calls[2].execute
     with sqlite3.connect(db) as conn:
         status, tx_hash = conn.execute(
             "SELECT status, tx_hash FROM defi_batch_actions WHERE run_id='first-three'"
@@ -270,10 +339,9 @@ def test_second_action_of_same_wallet_uses_short_delay(tmp_path):
         ).fetchone()
     execute_calls = []
 
-    def invoke(command):
-        if "quote-defi" in command:
-            from pathlib import Path
-            path = Path(command[command.index("--output") + 1])
+    def invoke(operation):
+        if operation.kind == "quote-defi":
+            path = operation.output_path
             payload = {"schema": "rabby-defi-withdraw-v1", "entries": [
                 {"wallet": wallet, "status": "ready", "action_id": letter * 64,
                  "chain_id": 1, "protocol_name": "Test Pool",
@@ -283,8 +351,8 @@ def test_second_action_of_same_wallet_uses_short_delay(tmp_path):
             data = (json.dumps(payload) + "\n").encode()
             path.write_bytes(data)
             return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
-        if "--execute" in command:
-            execute_calls.append(command)
+        if operation.execute:
+            execute_calls.append(operation)
             return CommandResult(0, {"status": "withdrawn", "tx_hash": "0x" + "b" * 64})
         return CommandResult(0, {"status": "preview"})
 
@@ -321,10 +389,10 @@ def test_process_wallet_does_not_sign_when_preview_fails(tmp_path):
         ).fetchone()
     calls = []
 
-    def invoke(command):
-        calls.append(command)
-        if "quote-defi" in command:
-            path = command[command.index("--output") + 1]
+    def invoke(operation):
+        calls.append(operation)
+        if operation.kind == "quote-defi":
+            path = operation.output_path
             payload = {
                 "schema": "rabby-defi-withdraw-v1", "created_at": 1000,
                 "entries": [{"wallet": wallet, "status": "ready", "action_id": "a" * 64,
@@ -332,15 +400,14 @@ def test_process_wallet_does_not_sign_when_preview_fails(tmp_path):
                              "action": {"func": "redeem(uint256)()", "str_params": ["42"]}}],
             }
             data = (json.dumps(payload) + "\n").encode()
-            from pathlib import Path
             Path(path).write_bytes(data)
             return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
-        return CommandResult(2, None, "safety")
+        return CommandResult(2, None, "gas_cap_exceeded")
 
     assert process_wallet(db, "first-three", ordinal, invoke=invoke,
                           native_balance=lambda _chain, _wallet: ("ETH", 100), now=1000) == "done"
     assert len(calls) == 2
-    assert all("--execute" not in command for command in calls)
+    assert all(not operation.execute for operation in calls)
     with sqlite3.connect(db) as conn:
         status = conn.execute(
             "SELECT status FROM defi_batch_actions WHERE run_id='first-three'"
@@ -363,11 +430,10 @@ def test_gas_estimate_failure_retries_immediately_and_records_final_failure(tmp_
     monkeypatch.setattr("evm_inventory.defi_batch.time.sleep", waits.append)
     calls = []
 
-    def invoke(command):
-        calls.append(command)
-        if "quote-defi" in command:
-            from pathlib import Path
-            path = Path(command[command.index("--output") + 1])
+    def invoke(operation):
+        calls.append(operation)
+        if operation.kind == "quote-defi":
+            path = operation.output_path
             payload = {"schema": "rabby-defi-withdraw-v1", "entries": [{
                 "wallet": wallet, "status": "ready", "action_id": "a" * 64,
                 "chain_id": 1, "protocol_name": "Test Pool", "net_usd_value": 2,
@@ -376,21 +442,22 @@ def test_gas_estimate_failure_retries_immediately_and_records_final_failure(tmp_
             data = (json.dumps(payload) + "\n").encode()
             path.write_bytes(data)
             return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
-        return CommandResult(4, None, "gas_estimate_rpc_error")
+        return CommandResult(4, None, "gas_estimate_rpc_error",
+                             detail="estimate_gas_rpc_timeout")
 
     assert process_wallet(db, "first-three", ordinal, invoke=invoke,
                           native_balance=lambda _chain, _wallet: ("ETH", 100), now=1000) == "done"
     assert len(calls) == 4
     assert waits == [1, 2]
-    assert all("--execute" not in command for command in calls)
+    assert all(not operation.execute for operation in calls)
     with sqlite3.connect(db) as conn:
         event = conn.execute(
             "SELECT protocol_name, withdrawal_size, native_before_wei, native_after_wei, "
-            "reason FROM defi_batch_outcomes"
+            "reason, error_detail FROM defi_batch_outcomes"
         ).fetchone()
         transactions = conn.execute("SELECT count(*) FROM defi_batch_transactions").fetchone()[0]
     assert event == ("Test Pool", "redeem(uint256)() raw parameters: 42", "100", "100",
-                     "gas_estimate_rpc_error")
+                     "gas_estimate_rpc_error", "estimate_gas_rpc_timeout")
     assert transactions == 0
 
 
@@ -406,10 +473,9 @@ def test_execution_safety_failure_records_protocol_size_and_balances(tmp_path):
             "WHERE run_id='first-three' AND queue_index=0"
         ).fetchone()
 
-    def invoke(command):
-        if "quote-defi" in command:
-            from pathlib import Path
-            path = Path(command[command.index("--output") + 1])
+    def invoke(operation):
+        if operation.kind == "quote-defi":
+            path = operation.output_path
             payload = {"schema": "rabby-defi-withdraw-v1", "entries": [{
                 "wallet": wallet, "status": "ready", "action_id": "a" * 64,
                 "chain_id": 1, "protocol_id": "fuel", "protocol_name": "Fuel",
@@ -420,8 +486,11 @@ def test_execution_safety_failure_records_protocol_size_and_balances(tmp_path):
             data = (json.dumps(payload) + "\n").encode()
             path.write_bytes(data)
             return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
-        if "--execute" in command:
-            return CommandResult(2, None, "ethereum_gas_deferred")
+        if operation.execute:
+            return CommandResult(
+                2, None, "ethereum_gas_deferred",
+                detail="ethereum_gas_deferred:source=rpc;value_wei=851018418;threshold_wei=500000000",
+            )
         return CommandResult(0, {"status": "preview"})
 
     assert process_wallet(db, "first-three", ordinal, invoke=invoke,
@@ -430,12 +499,14 @@ def test_execution_safety_failure_records_protocol_size_and_balances(tmp_path):
     with sqlite3.connect(db) as conn:
         action = conn.execute("SELECT status,reason FROM defi_batch_actions").fetchone()
         outcome = conn.execute(
-            "SELECT protocol_name,withdrawal_size,native_before_wei,native_after_wei,reason "
+            "SELECT protocol_name,withdrawal_size,native_before_wei,native_after_wei,"
+            "reason,error_detail "
             "FROM defi_batch_outcomes"
         ).fetchone()
     assert action == ("manual_review", "ethereum_gas_deferred")
     assert outcome == ("Fuel", "0.001 ETH requested (1000000000000000 raw wei)",
-                       "100", "100", "ethereum_gas_deferred")
+                       "100", "100", "ethereum_gas_deferred",
+                       "ethereum_gas_deferred:source=rpc;value_wei=851018418;threshold_wei=500000000")
 
 
 def test_execution_rpc_failure_without_journal_intent_retries_without_long_wait(tmp_path,
@@ -454,10 +525,9 @@ def test_execution_rpc_failure_without_journal_intent_retries_without_long_wait(
     monkeypatch.setattr("evm_inventory.defi_batch.time.sleep", waits.append)
     execute_calls = []
 
-    def invoke(command):
-        if "quote-defi" in command:
-            from pathlib import Path
-            path = Path(command[command.index("--output") + 1])
+    def invoke(operation):
+        if operation.kind == "quote-defi":
+            path = operation.output_path
             payload = {"schema": "rabby-defi-withdraw-v1", "entries": [{
                 "wallet": wallet, "status": "ready", "action_id": "a" * 64,
                 "chain_id": 1, "protocol_name": "Test Pool", "net_usd_value": 1,
@@ -466,8 +536,8 @@ def test_execution_rpc_failure_without_journal_intent_retries_without_long_wait(
             data = (json.dumps(payload) + "\n").encode()
             path.write_bytes(data)
             return CommandResult(0, {"plan_sha256": hashlib.sha256(data).hexdigest()})
-        if "--execute" in command:
-            execute_calls.append(command)
+        if operation.execute:
+            execute_calls.append(operation)
             return CommandResult(4, None, "transient")
         return CommandResult(0, {"status": "preview"})
 

@@ -22,6 +22,8 @@ cp .env.example .env
 
 Приватные ключи берутся из workbook только на время выполнения и не записываются в отчёты, план или базу.
 
+Все команды проекта работают в одном процессе: CLI вызывает функции напрямую и не запускает дочерние команды. После `uv sync` запускайте установленный исполняемый файл `.venv/bin/evm-inventory`; для пакетной очереди используйте `.venv/bin/python -m evm_inventory.defi_batch`. Это правило проверяется тестом исходников для `src/` и `scripts/`.
+
 ## Режимы работы
 
 ### 1. Проверить входной список без сети
@@ -29,7 +31,7 @@ cp .env.example .env
 `scan --dry-run` валидирует файл с адресами и не делает RPC/API-запросов:
 
 ```bash
-uv run evm-inventory scan \
+.venv/bin/evm-inventory scan \
   --wallets input/wallets.txt \
   --db out/inventory.sqlite \
   --dry-run
@@ -42,7 +44,7 @@ uv run evm-inventory scan \
 Обычный `scan` читает балансы нативных монет, известных токенов и результаты discovery. Транзакции не подписываются и не отправляются.
 
 ```bash
-uv run evm-inventory scan \
+.venv/bin/evm-inventory scan \
   --wallets input/wallets.txt \
   --db out/inventory.sqlite
 ```
@@ -52,7 +54,7 @@ uv run evm-inventory scan \
 Для выгрузки уже собранного JSON в плоский CSV:
 
 ```bash
-uv run evm-inventory export \
+.venv/bin/evm-inventory export \
   --db out/inventory.sqlite \
   --output out/inventory-export
 ```
@@ -64,14 +66,14 @@ uv run evm-inventory export \
 Шаблон содержит адрес кошелька, приватный ключ и адрес депозита Bitget:
 
 ```bash
-uv run evm-inventory workbook-template \
+.venv/bin/evm-inventory workbook-template \
   --output input/wallets.xlsx
 ```
 
 Проверка workbook не подписывает транзакции, но требует корректные поля у всех его строк и может записать служебные статусы в файл:
 
 ```bash
-uv run evm-inventory workbook-dry-run \
+.venv/bin/evm-inventory workbook-dry-run \
   --workbook input/wallets.xlsx
 ```
 
@@ -80,7 +82,7 @@ uv run evm-inventory workbook-dry-run \
 Основной режим планирования получает живой каталог депозитов Bitget и котировки LI.FI, но остаётся read-only: кошельки не разблокируются и транзакции не создаются.
 
 ```bash
-uv run evm-inventory quote-routes \
+.venv/bin/evm-inventory quote-routes \
   --balances out/inventory-export/balances.csv \
   --workbook input/wallets.xlsx \
   --db out/inventory.sqlite \
@@ -94,7 +96,7 @@ uv run evm-inventory quote-routes \
 Также доступен упрощённый офлайн-классификатор без Bitget и LI.FI. Он не даёт исполнимых котировок — для реального маршрута используйте `quote-routes`:
 
 ```bash
-uv run evm-inventory route-plan \
+.venv/bin/evm-inventory route-plan \
   --balances out/inventory-export/balances.csv \
   --db out/inventory.sqlite \
   --output out/offline-plan.json \
@@ -120,7 +122,7 @@ uv run evm-inventory route-plan \
 Сначала запустите команду без `--execute`: она проверит план, workbook и каталог без подписи:
 
 ```bash
-uv run evm-inventory execute-routes \
+.venv/bin/evm-inventory execute-routes \
   --plan out/routes-plan.json \
   --workbook input/wallets.xlsx \
   --catalog src/evm_inventory/data/catalog.json \
@@ -130,7 +132,7 @@ uv run evm-inventory execute-routes \
 Только после проверки добавьте `--execute`:
 
 ```bash
-uv run evm-inventory execute-routes \
+.venv/bin/evm-inventory execute-routes \
   --plan out/routes-plan.json \
   --workbook input/wallets.xlsx \
   --catalog src/evm_inventory/data/catalog.json \
@@ -144,7 +146,7 @@ uv run evm-inventory execute-routes \
 ### 6. Посмотреть состояние выполнения и восстановить контекст
 
 ```bash
-uv run evm-inventory resume-routes \
+.venv/bin/evm-inventory resume-routes \
   --db out/inventory.sqlite
 ```
 
@@ -153,9 +155,9 @@ uv run evm-inventory resume-routes \
 ### Сквозной запуск
 
 ```bash
-uv run evm-inventory scan --wallets input/wallets.txt --db out/inventory.sqlite
-uv run evm-inventory export --db out/inventory.sqlite --output out/inventory-export
-uv run evm-inventory quote-routes --balances out/inventory-export/balances.csv \
+.venv/bin/evm-inventory scan --wallets input/wallets.txt --db out/inventory.sqlite
+.venv/bin/evm-inventory export --db out/inventory.sqlite --output out/inventory-export
+.venv/bin/evm-inventory quote-routes --balances out/inventory-export/balances.csv \
   --workbook input/wallets.xlsx --db out/inventory.sqlite \
   --output out/routes-plan.json --wallet-ranges 5
 ```
@@ -163,10 +165,10 @@ uv run evm-inventory quote-routes --balances out/inventory-export/balances.csv \
 Проверьте JSON-план: конкретную сеть и актив Bitget, адрес получателя, сумму, шаги и групповой `loss_pct`. Затем выполните выбранные диапазоны только с явным `--execute` и после завершения или прерывания прочитайте состояние общей базы:
 
 ```bash
-uv run evm-inventory execute-routes --plan out/routes-plan.json \
+.venv/bin/evm-inventory execute-routes --plan out/routes-plan.json \
   --workbook input/wallets.xlsx --catalog src/evm_inventory/data/catalog.json \
   --db out/inventory.sqlite --wallet-ranges 5 --execute
-uv run evm-inventory resume-routes --db out/inventory.sqlite
+.venv/bin/evm-inventory resume-routes --db out/inventory.sqlite
 ```
 
 ## Вывод средств из DeFi через действия Rabby
@@ -174,7 +176,7 @@ uv run evm-inventory resume-routes --db out/inventory.sqlite
 Rabby возвращает для части DeFi-позиций готовые `withdraw_actions`. Для каждого кошелька заполните колонку `Прокси Rabby` в XLSX: URL вида `http://user:pass@host:port`, `https://user:pass@host:port` или `socks5://user:pass@host:port`. Команды `quote-defi` и `execute-defi` обращаются к Rabby только через прокси соответствующего кошелька; при пустом или неверном прокси команда останавливается. Прокси и приватные ключи не записываются в план или базу. Поддерживаются простые прямые выводы; позиции с долгом, proxy-контрактом, очередью вывода, неоднозначным действием или неподдержанной функцией получают `manual_review`.
 
 ```bash
-uv run evm-inventory quote-defi \
+.venv/bin/evm-inventory quote-defi \
   --wallets input/wallets.txt \
   --workbook input/wallets.xlsx \
   --db out/inventory.sqlite \
@@ -184,7 +186,7 @@ uv run evm-inventory quote-defi \
 Команда выводит `plan_sha256`. В `defi-plan.json` найдите нужную строку со статусом `ready`, проверьте сеть, протокол, адрес контракта, `func`, `str_params`, получателя и при необходимости `need_approve`. Скопируйте её `action_id`. План действует 15 минут. Выполняется **ровно одно** выбранное действие:
 
 ```bash
-uv run evm-inventory execute-defi \
+.venv/bin/evm-inventory execute-defi \
   --plan out/defi-plan.json \
   --plan-sha256 <plan_sha256> \
   --action-id <action_id> \
@@ -204,7 +206,7 @@ uv run evm-inventory execute-defi \
 Для пакетного вывода из уже сохранённого в общей базе плана используйте `python -m evm_inventory.defi_batch init`, затем `run` с тем же `--db` и `--run-id`. При `init` можно задать два независимых интервала в секундах:
 
 ```bash
-uv run python -m evm_inventory.defi_batch init \
+.venv/bin/python -m evm_inventory.defi_batch init \
   --db out/inventory.sqlite --workbook local/wallets.xlsx \
   --seed-plan out/defi-plan-1-50.json --run-id defi-first-50 \
   --output-dir out/defi-batch-first-50 \
@@ -212,7 +214,7 @@ uv run python -m evm_inventory.defi_batch init \
   --between-wallet-delay-max-seconds 6000 \
   --within-wallet-delay-min-seconds 60 \
   --within-wallet-delay-max-seconds 300
-uv run python -m evm_inventory.defi_batch run \
+.venv/bin/python -m evm_inventory.defi_batch run \
   --db out/inventory.sqlite --run-id defi-first-50
 ```
 

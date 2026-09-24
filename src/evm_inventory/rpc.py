@@ -51,12 +51,17 @@ class RpcReader:
             url, {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
         )
         if result.get("id") != ident or result.get("jsonrpc") != "2.0":
-            raise RpcError("invalid_rpc_envelope")
+            raise RpcError("invalid_rpc_envelope", diagnostic={
+                "method": method, "expected_id": ident, "response": result,
+            })
         if result.get("error"):
-            # Provider message can include secrets or untrusted text; retain only numeric code.
-            raise RpcError("rpc_error")
+            raise RpcError("rpc_error", diagnostic={
+                "method": method, "params": params, "provider_error": result["error"],
+            })
         if "result" not in result:
-            raise RpcError("missing_rpc_result")
+            raise RpcError("missing_rpc_result", diagnostic={
+                "method": method, "response": result,
+            })
         return result["result"]
 
     def check_chain(self, url, chain_id):

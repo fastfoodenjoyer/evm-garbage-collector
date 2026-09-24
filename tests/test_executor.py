@@ -75,7 +75,8 @@ def test_sign_transaction_rejects_wrong_sender():
 
 def test_native_reserve_defaults_to_three_times_estimated_gas():
     assert require_native_reserve(balance=30, gas_cost=10) == 30
-    with pytest.raises(ValueError, match="gas reserve"):
+    with pytest.raises(ValueError, match="balance_wei=29;gas_cost_wei=10;"
+                                          "multiplier=3;required_wei=30"):
         require_native_reserve(balance=29, gas_cost=10)
 
 
