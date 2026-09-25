@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import time
 from decimal import Decimal, InvalidOperation
+from threading import Event
 from urllib.parse import urlencode
 
 import httpx
@@ -19,10 +20,6 @@ from .bitget_catalog import (
 )
 
 _COIN_DECIMALS = {"ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18}
-
-
-def _is_credited_status(status: str | None) -> bool:
-    return status is not None and status.lower() == "success"
 
 
 class BitgetClient:
@@ -112,11 +109,12 @@ class BitgetClient:
     ) -> str | None:
         for record in self.deposit_records(start_ms=start_ms, end_ms=end_ms, coin=coin):
             hashes = (record.get("tradeId"), record.get("txId"), record.get("txHash"))
+            recorded_recipient = record.get("toAddress", record.get("address", ""))
             if (
                 any(str(value or "").lower() == tx_hash.lower() for value in hashes)
                 and record.get("coin") == coin
-                and record.get("chain") == chain
-                and str(record.get("address", "")).lower() == recipient.lower()
+                and str(record.get("chain", "")).casefold() == chain.casefold()
+                and str(recorded_recipient).lower() == recipient.lower()
                 and _record_raw_amount(record, coin) >= minimum_raw
             ):
                 return str(record.get("status", "")) or None
@@ -133,23 +131,82 @@ class BitgetClient:
         minimum_raw: int,
         timeout_seconds: int = 21_600,
         poll_seconds: int = 60,
+        stop_event: Event | None = None,
     ) -> str | None:
-        """Poll Bitget after a submitted deposit; returns the exchange status or None."""
+        """Poll until Bitget reports a final deposit status or the deadline passes."""
+
+        return self._poll_deposit(
+            tx_hash=tx_hash, started_ms=started_ms, coin=coin, chain=chain,
+            recipient=recipient, minimum_raw=minimum_raw,
+            timeout_seconds=timeout_seconds, poll_seconds=poll_seconds,
+            stop_on_seen=False, stop_event=stop_event,
+        )
+
+    def wait_for_deposit_seen(
+        self,
+        *,
+        tx_hash: str,
+        started_ms: int,
+        coin: str,
+        chain: str,
+        recipient: str,
+        minimum_raw: int,
+        timeout_seconds: int = 1_800,
+        poll_seconds: int = 60,
+    ) -> str | None:
+        """Wait only until Bitget has a matching deposit record."""
+
+        return self._poll_deposit(
+            tx_hash=tx_hash, started_ms=started_ms, coin=coin, chain=chain,
+            recipient=recipient, minimum_raw=minimum_raw,
+            timeout_seconds=timeout_seconds, poll_seconds=poll_seconds,
+            stop_on_seen=True, stop_event=None,
+        )
+
+    def _poll_deposit(
+        self,
+        *,
+        tx_hash: str,
+        started_ms: int,
+        coin: str,
+        chain: str,
+        recipient: str,
+        minimum_raw: int,
+        timeout_seconds: int,
+        poll_seconds: int,
+        stop_on_seen: bool,
+        stop_event: Event | None,
+    ) -> str | None:
 
         deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            status = self.deposit_status(
-                tx_hash=tx_hash,
-                start_ms=started_ms,
-                end_ms=int(time.time() * 1000),
-                coin=coin,
-                chain=chain,
-                recipient=recipient,
-                minimum_raw=minimum_raw,
-            )
-            if _is_credited_status(status):
+        while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
+            try:
+                status = self.deposit_status(
+                    tx_hash=tx_hash,
+                    start_ms=started_ms,
+                    end_ms=max(started_ms + 1, int(time.time() * 1000)),
+                    coin=coin,
+                    chain=chain,
+                    recipient=recipient,
+                    minimum_raw=minimum_raw,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {429, 500, 502, 503, 504}:
+                    raise
+                status = None
+            except httpx.TransportError:
+                status = None
+            normalized = str(status or "").lower()
+            if normalized in {"success", "fail", "failed"} or (
+                stop_on_seen and normalized == "pending"
+            ):
                 return status
-            time.sleep(poll_seconds)
+            if stop_on_seen and normalized:
+                raise ValueError(f"unknown Bitget deposit status: {normalized}")
+            if stop_event is None:
+                time.sleep(poll_seconds)
+            else:
+                stop_event.wait(poll_seconds)
         return None
 
 

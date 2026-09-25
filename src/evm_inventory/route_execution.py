@@ -7,11 +7,13 @@ import os
 import random
 import time
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 from pathlib import Path
+from threading import Event
 
 import httpx
 
@@ -66,6 +68,112 @@ _NATIVE_LIFI_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 class GroupLossLimitExceeded(ValueError):
     """Raised when a fresh dependent route would exceed the configured budget."""
+
+
+class DepositNotSeen(ValueError):
+    """Bitget did not recognize a broadcast deposit before the sighting deadline."""
+
+
+class DepositSettlementFailed(ValueError):
+    """Bitget reported a failed deposit or missed the final settlement deadline."""
+
+
+class _DepositBackground:
+    """Poll seen deposits concurrently; persist results on the main thread."""
+
+    def __init__(self, *, bitget: BitgetClient, journal: Journal):
+        self.bitget = bitget
+        self.journal = journal
+        self.stop_event = Event()
+        self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bitget-deposit")
+        self.watches: dict[int, tuple[Future, int, int, Decimal]] = {}
+
+    def watch(self, *, entry: dict, position_id: int, recipient: str, loss_usd: str) -> None:
+        if position_id in self.watches:
+            return
+        position = self.journal.position(position_id)
+        step = self.journal.latest_step(position_id=position_id, step_key="direct_deposit")
+        if step is None or not step["tx_hash"]:
+            raise ValueError("seen deposit has no durable transaction hash")
+        started_ms = int(
+            datetime.fromisoformat(step["created_at"])
+            .replace(tzinfo=UTC)
+            .timestamp() * 1000
+        ) - 60_000
+        future = self.pool.submit(
+            self.bitget.wait_for_deposit,
+            tx_hash=step["tx_hash"], started_ms=started_ms,
+            coin=str(entry["target"]["coin"]),
+            chain=str(entry["target"]["chain"]), recipient=recipient,
+            minimum_raw=int(entry["target"]["minimum_raw"]),
+            stop_event=self.stop_event,
+        )
+        self.watches[position_id] = (
+            future, int(position["group_id"]), int(step["id"]),
+            _exact_money(loss_usd, "pending deposit loss"),
+        )
+
+    def raise_if_failed(self) -> None:
+        for position_id, (future, group_id, _, _) in self.watches.items():
+            if not future.done():
+                continue
+            try:
+                status = future.result()
+            except Exception as exc:
+                reason = _execution_reason(exc)
+                self._record_failure(position_id, group_id, reason)
+                raise DepositSettlementFailed(reason) from exc
+            if str(status or "").lower() != "success":
+                reason = "bitget_deposit_not_credited"
+                self._record_failure(position_id, group_id, reason)
+                raise DepositSettlementFailed(reason)
+
+    def _record_failure(self, position_id: int, group_id: int, reason: str) -> None:
+        step_id = self.watches[position_id][2]
+        self.journal.record_step_state(step_id, "manual_review")
+        self.journal.record_position_state(position_id, "manual_review", reason=reason)
+        self.journal.record_group_state(
+            group_id, "manual_review_group_halted", reason=reason
+        )
+        self.stop_event.set()
+
+    def finish(self) -> int:
+        remaining = set(self.watches)
+        while remaining:
+            wait([self.watches[pid][0] for pid in remaining], return_when=FIRST_COMPLETED)
+            for position_id in tuple(remaining):
+                future, group_id, step_id, _loss = self.watches[position_id]
+                if not future.done():
+                    continue
+                remaining.remove(position_id)
+                try:
+                    status = future.result()
+                except Exception as exc:
+                    status = None
+                    reason = _execution_reason(exc)
+                else:
+                    reason = "bitget_deposit_not_credited"
+                if str(status or "").lower() != "success":
+                    self._record_failure(position_id, group_id, reason)
+                    raise DepositSettlementFailed(reason)
+                self.journal.record_step_state(step_id, "credited")
+                self.journal.record_position_state(position_id, "completed")
+                if all(
+                    position["state"] == "completed"
+                    for position in self.journal.group_positions(group_id)
+                ):
+                    self.journal.record_group_state(group_id, "completed")
+        return len(self.watches)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 def _asset_from_data(value: object) -> AssetIdentity:
@@ -172,9 +280,9 @@ def _require_live_target(
         or live.decimals != planned.decimals
     ):
         raise ValueError("requote_required:target_identity_changed")
-    if live.minimum_raw != planned.minimum_raw:
+    if live.minimum_raw > planned.minimum_raw:
         raise ValueError("requote_required:target_minimum_changed")
-    return live
+    return replace(live, minimum_raw=planned.minimum_raw)
 
 
 def _require_target_minimum(
@@ -278,6 +386,7 @@ def execute_group_entries(
     preflight: Callable[[dict], dict],
     submit_step: Callable[[dict, dict], dict],
     requote_after_swap: Callable[[dict, int], dict] | None = None,
+    before_step: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Revalidate and execute one loss-bounded wallet/source-network group.
 
@@ -311,6 +420,16 @@ def execute_group_entries(
         loss_budget_pct=_decimal_string(loss_limit),
         source_usd=_decimal_string(source_usd),
     )
+    if (
+        group["state"] == "manual_review_group_halted"
+        and len(entries) == 1
+        and first.get("status") == "direct_deposit"
+        and (
+            journal.reactivate_known_direct_deposit(group["id"], _position_key(first))
+            or journal.reactivate_legacy_gas_deferral(group["id"], _position_key(first))
+        )
+    ):
+        group = journal.group(group["id"])
     if group["state"] in {
         "completed",
         "manual_review_after_swap",
@@ -339,6 +458,8 @@ def execute_group_entries(
     counts = {
         "group_id": group["id"],
         "completed": 0,
+        "deposit_pending": 0,
+        "gas_deferred": 0,
         "manual_review": 0,
         "manual_review_after_swap": 0,
         "manual_review_group_threshold_exceeded": 0,
@@ -378,10 +499,64 @@ def execute_group_entries(
         journal.record_group_state(group["id"], group_state, reason=reason)
 
     for index, entry in enumerate(entries):
+        if before_step is not None:
+            before_step()
         position_id = positions[index]["id"]
-        if journal.position(position_id)["state"] == "completed":
+        position_state = journal.position(position_id)["state"]
+        if position_state == "completed":
             counts["completed"] += 1
             continue
+        unresolved = journal.unresolved_direct_deposit(
+            wallet=wallet,
+            chain_id=source_chain_id,
+            asset_id=str(entry["asset_id"]),
+            exclude_position_id=position_id,
+        )
+        if unresolved is not None:
+            raise ValueError(
+                "unresolved prior direct deposit for this wallet, chain and asset: "
+                f"{unresolved['tx_hash']}"
+            )
+        if position_state in {"deposit_pending", "direct_deposit_submitted"}:
+            saved = journal.latest_step(position_id=position_id, step_key="direct_deposit")
+            if position_state == "deposit_pending" or (saved and saved["tx_hash"]):
+                try:
+                    result = submit_step(
+                        {**entry, "_journal_position_id": position_id},
+                        {"kind": "direct_deposit"},
+                    )
+                    if result.get("state") == "deposit_pending":
+                        realized = Decimal(journal.account_position_loss(
+                            position_id,
+                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
+                        ))
+                        journal.record_position_state(
+                            position_id, "deposit_pending", reason=result.get("reason")
+                        )
+                        counts["deposit_pending"] += 1
+                        continue
+                    if result.get("state") != "completed":
+                        raise ValueError("deposit reconciliation returned no result")
+                    realized = Decimal(journal.account_position_loss(
+                        position_id,
+                        loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
+                    ))
+                    journal.record_position_state(position_id, "completed")
+                    counts["completed"] += 1
+                    continue
+                except (DepositNotSeen, DepositSettlementFailed) as exc:
+                    reason = _execution_reason(exc)
+                    journal.record_position_state(position_id, "manual_review", reason=reason)
+                    counts["manual_review"] += 1
+                    halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
+                    return counts
+                except Exception as exc:
+                    journal.record_position_state(
+                        position_id, "deposit_pending", reason=_execution_reason(exc)
+                    )
+                    counts["deposit_pending"] += 1
+                    journal.record_group_state(group["id"], "deposit_pending")
+                    return counts
         try:
             fresh = preflight(entry)
             if not isinstance(fresh, dict):
@@ -390,6 +565,11 @@ def execute_group_entries(
             future_loss = _exact_sum(
                 _entry_loss(item) for item in entries[index + 1 :]
             )
+        except EthereumGasDeferred as exc:
+            journal.record_position_state(position_id, "gas_deferred", reason=exc.reason)
+            journal.record_group_state(group["id"], "gas_deferred", reason=exc.reason)
+            counts["gas_deferred"] += 1
+            return counts
         except Exception as exc:
             reason = _execution_reason(exc)
             journal.record_position_state(position_id, "manual_review", reason=reason)
@@ -596,14 +776,33 @@ def execute_group_entries(
                         },
                         step,
                     )
+                    if (
+                        step.get("kind") == "direct_deposit"
+                        and result.get("state") == "deposit_pending"
+                    ):
+                        realized = Decimal(journal.account_position_loss(
+                            position_id,
+                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(fresh))),
+                        ))
+                        journal.record_position_state(
+                            position_id, "deposit_pending", reason=result.get("reason")
+                        )
+                        counts["deposit_pending"] += 1
+                        break
                     if result.get("state") not in {"confirmed", "completed"}:
                         raise ValueError("route step did not confirm")
-                    realized = _add_realized(
-                        realized, result.get("realized_loss_usd", "0")
-                    )
-                    journal.record_group_realized_loss(
-                        group["id"], realized_loss_usd=_decimal_string(realized)
-                    )
+                    if step.get("kind") == "direct_deposit":
+                        realized = Decimal(journal.account_position_loss(
+                            position_id,
+                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(fresh))),
+                        ))
+                    else:
+                        realized = _add_realized(
+                            realized, result.get("realized_loss_usd", "0")
+                        )
+                        journal.record_group_realized_loss(
+                            group["id"], realized_loss_usd=_decimal_string(realized)
+                        )
                 except GroupLossLimitExceeded as exc:
                     reason = _execution_reason(exc)
                     halt_remaining(
@@ -612,8 +811,50 @@ def execute_group_entries(
                         reason=reason,
                     )
                     return counts
+                except EthereumGasDeferred as exc:
+                    if step.get("kind") != "direct_deposit":
+                        reason = _execution_reason(exc)
+                        journal.record_position_state(
+                            position_id, "manual_review", reason=reason
+                        )
+                        counts["manual_review"] += 1
+                        halt_remaining(
+                            index + 1, state="manual_review_group_halted", reason=reason
+                        )
+                        if index + 1 == len(entries):
+                            journal.record_group_state(
+                                group["id"], "manual_review_group_halted", reason=reason
+                            )
+                        return counts
+                    journal.record_position_state(
+                        position_id, "gas_deferred", reason=exc.reason
+                    )
+                    journal.record_group_state(
+                        group["id"], "gas_deferred", reason=exc.reason
+                    )
+                    counts["gas_deferred"] += 1
+                    return counts
+                except (DepositNotSeen, DepositSettlementFailed) as exc:
+                    reason = _execution_reason(exc)
+                    journal.record_position_state(position_id, "manual_review", reason=reason)
+                    counts["manual_review"] += 1
+                    halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
+                    return counts
                 except Exception as exc:
                     reason = _execution_reason(exc)
+                    if step.get("kind") == "direct_deposit":
+                        saved = journal.latest_step(
+                            position_id=position_id, step_key="direct_deposit"
+                        )
+                        if saved is not None and saved["tx_hash"]:
+                            journal.record_position_state(
+                                position_id, "deposit_pending", reason=reason
+                            )
+                            counts["deposit_pending"] += 1
+                            journal.record_group_state(
+                                group["id"], "deposit_pending", reason=reason
+                            )
+                            return counts
                     journal.record_position_state(
                         position_id, "manual_review", reason=reason
                     )
@@ -629,10 +870,15 @@ def execute_group_entries(
                         )
                     return counts
 
-        journal.record_position_state(position_id, "completed")
-        counts["completed"] += 1
+        if journal.position(position_id)["state"] != "deposit_pending":
+            journal.record_position_state(position_id, "completed")
+            counts["completed"] += 1
 
-    journal.record_group_state(group["id"], "completed")
+    has_pending = any(
+        journal.position(position["id"])["state"] == "deposit_pending"
+        for position in positions
+    )
+    journal.record_group_state(group["id"], "deposit_pending" if has_pending else "completed")
     return counts
 
 
@@ -948,8 +1194,11 @@ def _execute_live_groups(
     previous_wallet: str | None = None
 
     try:
-        with Journal(journal_path) as journal:
+        with Journal(journal_path) as journal, _DepositBackground(
+            bitget=bitget, journal=journal
+        ) as background:
             for group_key in ordered_groups:
+                background.raise_if_failed()
                 group_entries = groups[group_key]
                 wallet_address = str(group_entries[0]["wallet"]).lower()
                 wallet = wallets.get(wallet_address)
@@ -973,6 +1222,7 @@ def _execute_live_groups(
                     )
 
                 def submit(entry: dict, step: dict) -> dict:
+                    background.raise_if_failed()
                     def requote_dependent(
                         original: dict, asset: AssetIdentity, amount: int
                     ) -> dict:
@@ -989,11 +1239,12 @@ def _execute_live_groups(
                             now_ms=now_ms,
                         )
 
-                    return _submit_live_step(
+                    result = _submit_live_step(
                         {
                             **entry,
                             "_requote_after_intermediate": requote_dependent,
                             "_sleep": sleep,
+                            "_before_sign": background.raise_if_failed,
                         },
                         step,
                         wallet=wallet,
@@ -1004,6 +1255,14 @@ def _execute_live_groups(
                         journal=journal,
                         now_ms=now_ms,
                     )
+                    if result.get("state") == "deposit_pending":
+                        background.watch(
+                            entry=entry,
+                            position_id=int(entry["_journal_position_id"]),
+                            recipient=wallet.bitget_deposit_address,
+                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
+                        )
+                    return result
 
                 def requote(entry: dict, amount: int) -> dict:
                     return _requote_bridge_after_swap(
@@ -1023,10 +1282,14 @@ def _execute_live_groups(
                     preflight=preflight,
                     submit_step=submit,
                     requote_after_swap=requote,
+                    before_step=background.raise_if_failed,
                 )
                 for state, count in result.items():
                     if state != "group_id" and isinstance(count, int):
                         summary[state] = summary.get(state, 0) + count
+            settled = background.finish()
+            summary["completed"] = summary.get("completed", 0) + settled
+            summary["deposit_pending"] = summary.get("deposit_pending", 0) - settled
     finally:
         lifi_http.close()
         transport.close()
@@ -1084,7 +1347,7 @@ def _preflight_live_entry(
             destination_price=price,
             wallet_paid_gas=(fee,),
             gas_estimate_complete=True,
-            now=now,
+            now=datetime.fromtimestamp(now_ms() / 1000, UTC),
             max_price_age=_MAX_PRICE_AGE,
         )
         _require_valid_candidate(candidate)
@@ -1680,46 +1943,77 @@ def _submit_live_step(
 ) -> dict:
     position_id = int(entry["_journal_position_id"])
     if step.get("kind") == "direct_deposit":
-        request = entry.get("_direct_transaction")
-        if not isinstance(request, TransactionRequest):
-            raise ValueError("direct deposit preflight is missing a transaction")
-        tx_hash = _execute_entry(
-            entry=entry,
-            wallet=wallet,
-            rpc=rpc,
-            jumper=jumper,
-            rpc_urls=rpc_urls,
-            now_ms=now_ms,
-            journal=journal,
-            position_id=position_id,
-            prepared_request=request,
-        )
-        status = bitget.wait_for_deposit(
-            tx_hash=tx_hash,
-            started_ms=int(time.time() * 1000),
-            coin=str(entry["target"]["coin"]),
-            chain=str(entry["target"]["chain"]),
-            recipient=wallet.bitget_deposit_address,
-            minimum_raw=int(entry["target"]["minimum_raw"]),
-        )
-        if str(status or "").lower() != "success":
-            raise ValueError("bitget_deposit_not_confirmed")
+        saved = journal.latest_step(position_id=position_id, step_key="direct_deposit")
+        if saved is not None and saved["tx_hash"]:
+            tx_hash = str(saved["tx_hash"])
+            started_ms = int(
+                datetime.fromisoformat(saved["created_at"])
+                .replace(tzinfo=UTC)
+                .timestamp() * 1000
+            ) - 60_000
+            # Recovery observes the known transaction; it never prepares or signs another.
+        else:
+            request = entry.get("_direct_transaction")
+            if not isinstance(request, TransactionRequest):
+                raise ValueError("direct deposit preflight is missing a transaction")
+            started_ms = now_ms()
+            tx_hash = _execute_entry(
+                entry=entry,
+                wallet=wallet,
+                rpc=rpc,
+                jumper=jumper,
+                rpc_urls=rpc_urls,
+                now_ms=now_ms,
+                journal=journal,
+                position_id=position_id,
+                prepared_request=request,
+            )
+            saved = journal.latest_step(
+                position_id=position_id, step_key="direct_deposit"
+            )
+        try:
+            status = bitget.wait_for_deposit_seen(
+                tx_hash=tx_hash,
+                started_ms=started_ms,
+                coin=str(entry["target"]["coin"]),
+                chain=str(entry["target"]["chain"]),
+                recipient=wallet.bitget_deposit_address,
+                minimum_raw=int(entry["target"]["minimum_raw"]),
+            )
+        except Exception as exc:
+            raise DepositNotSeen(_execution_reason(exc)) from exc
+        normalized_status = str(status or "").lower()
+        if not normalized_status:
+            raise DepositNotSeen("bitget_deposit_not_seen")
+        if normalized_status in {"fail", "failed"}:
+            raise DepositSettlementFailed("bitget_deposit_failed")
+        if normalized_status not in {"pending", "success"}:
+            raise DepositSettlementFailed("bitget_deposit_unknown_status")
+        if saved is not None:
+            if saved["state"] == "submitted":
+                journal.record_step_state(saved["id"], "deposit_seen")
+            if normalized_status == "success" and saved["state"] in {
+                "submitted", "deposit_seen", "confirmed", "awaiting_bridge"
+            }:
+                journal.record_step_state(saved["id"], "credited")
         realized_before = _exact_money(
             entry.get("_realized_loss_before_current_usd", "0"),
             "realized loss before direct deposit",
         )
+        loss_usd = _decimal_string(
+            _exact_sum((
+                realized_before,
+                _exact_money(entry["valuation"]["loss_usd"], "direct deposit loss"),
+            ))
+        )
+        if normalized_status == "pending":
+            return {
+                "state": "deposit_pending", "reason": "bitget_seen_pending",
+                "realized_loss_usd": loss_usd,
+            }
         return {
             "state": "completed",
-            "realized_loss_usd": _decimal_string(
-                _exact_sum(
-                    (
-                        realized_before,
-                        _exact_money(
-                            entry["valuation"]["loss_usd"], "direct deposit loss"
-                        ),
-                    )
-                )
-            ),
+            "realized_loss_usd": loss_usd,
         }
 
     route_data = step.get("route")
@@ -2065,7 +2359,12 @@ def _execute_entry(
         if recovered is not None:
             wait_for_receipt(rpc, url=url, tx_hash=recovered)
             return ExecutedTransactionHash(recovered, None)
-    request = FeePlanner(rpc).plan(url, request, sender=wallet.public_address)
+    if not (
+        prepared_request is not None
+        and entry["status"] == "direct_deposit"
+        and entry["asset_id"] == "native"
+    ):
+        request = FeePlanner(rpc).plan(url, request, sender=wallet.public_address)
     require_ethereum_planned_gas_price_valid(request)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     generated_native_cap = (
@@ -2086,6 +2385,9 @@ def _execute_entry(
     )
     asset_id = str(entry["asset_id"])
     approval_tx_hash = None
+    before_sign = entry.get("_before_sign")
+    if callable(before_sign):
+        before_sign()
     if entry["status"] == "route_ready" and asset_id != "native":
         approval_tx_hash = _approve_if_needed(
             entry,
@@ -2099,6 +2401,8 @@ def _execute_entry(
         )
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
     try:
+        if callable(before_sign):
+            before_sign()
         require_ethereum_gas_below_limit(rpc, url=url, request=request)
         if entry["status"] == "route_ready":
             try:

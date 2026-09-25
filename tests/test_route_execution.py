@@ -1,10 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from evm_inventory.bitget_catalog import BitgetDepositTarget
+from evm_inventory.executor import EthereumGasDeferred
 from evm_inventory.journal import Journal
 from evm_inventory.lifi import (
     LifiPriceEvidence,
@@ -15,10 +16,14 @@ from evm_inventory.live_plan import _route_data
 from evm_inventory.models import AssetIdentity
 from evm_inventory.planner_gas import PlannerGasEstimator
 from evm_inventory.route_execution import (
+    DepositNotSeen,
+    DepositSettlementFailed,
     GroupLossLimitExceeded,
     _await_cross_chain_transfer,
+    _DepositBackground,
     _execute_entry,
     _preflight_live_entry,
+    _require_live_target,
     _submit_live_step,
     execute_entries,
     execute_group_entries,
@@ -178,6 +183,337 @@ def test_group_preflight_failure_does_not_call_submitter(tmp_path):
     assert result["manual_review"] == 1
 
 
+def test_gas_cap_defers_group_and_retries_same_plan(tmp_path):
+    entry = _entry(ASSET_A)
+    attempts = []
+
+    def preflight(planned):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise EthereumGasDeferred("ethereum_gas_deferred:source=plan")
+        return planned
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        first = execute_group_entries(
+            [entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=preflight,
+            submit_step=lambda *_: {"state": "completed", "realized_loss_usd": "1"},
+        )
+        assert first["gas_deferred"] == 1
+        assert journal.group(first["group_id"])["state"] == "gas_deferred"
+        second = execute_group_entries(
+            [entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=preflight,
+            submit_step=lambda *_: {"state": "completed", "realized_loss_usd": "1"},
+        )
+        assert second["completed"] == 1
+
+
+def test_legacy_gas_cap_refusal_retries_only_without_broadcast(tmp_path):
+    entry = _entry(ASSET_A)
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=entry["group"]["key"], wallet=WALLET,
+            source_chain_id=10, loss_budget_pct="15", source_usd="100",
+        )
+        position = journal.get_or_create_position(
+            position_key=f"{entry['group']['key']}:{ASSET_A}", wallet=WALLET,
+            group_id=group["id"], source_asset_id=ASSET_A,
+            source_amount_raw="1000000",
+        )
+        reason = "ethereum_gas_deferred:source=plan"
+        journal.record_position_state(position["id"], "manual_review", reason=reason)
+        journal.record_group_state(group["id"], "manual_review_group_halted", reason=reason)
+        result = execute_group_entries(
+            [entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda planned: planned,
+            submit_step=lambda *_: {"state": "completed", "realized_loss_usd": "1"},
+        )
+        assert result["completed"] == 1
+
+
+def test_pending_direct_deposit_resumes_without_preflight_or_second_send(tmp_path):
+    entry = _entry(ASSET_A)
+    outcomes = iter((
+        {"state": "deposit_pending"},
+        {"state": "completed", "realized_loss_usd": "1"},
+    ))
+    calls = []
+
+    def submit(_entry, _step):
+        calls.append("observe")
+        return next(outcomes)
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        first = execute_group_entries(
+            [entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda planned: planned, submit_step=submit,
+        )
+        assert first["deposit_pending"] == 1
+        assert journal.group(first["group_id"])["state"] == "deposit_pending"
+        assert journal.connection.execute(
+            "SELECT state FROM route_positions"
+        ).fetchone()["state"] == "deposit_pending"
+
+        second = execute_group_entries(
+            [entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda _: pytest.fail("pending deposit must not preflight a new send"),
+            submit_step=submit,
+        )
+        assert second["completed"] == 1
+        assert journal.group(second["group_id"])["state"] == "completed"
+    assert calls == ["observe", "observe"]
+
+
+def test_seen_deposit_does_not_block_next_group_transaction(tmp_path):
+    first = _entry(ASSET_A, loss="2")
+    second = _entry(ASSET_B, loss="3")
+    submitted = []
+
+    def submit(entry, _step):
+        submitted.append(entry["asset_id"])
+        if entry["asset_id"] == ASSET_A:
+            return {"state": "deposit_pending", "reason": "bitget_seen_pending"}
+        return {"state": "completed", "realized_loss_usd": "3"}
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        result = execute_group_entries(
+            [first, second], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda planned: planned, submit_step=submit,
+        )
+        positions = journal.connection.execute(
+            "SELECT state FROM route_positions ORDER BY id"
+        ).fetchall()
+        assert journal.group(result["group_id"])["state"] == "deposit_pending"
+    assert submitted == [ASSET_A, ASSET_B]
+    assert [row["state"] for row in positions] == ["deposit_pending", "completed"]
+
+
+def test_pending_direct_deposit_uses_saved_hash_without_signing(tmp_path, monkeypatch):
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    entry = _entry(ASSET_A)
+    entry["_journal_position_id"] = 1
+    tx_hash = "0x" + "a" * 64
+    observed = []
+
+    class Bitget:
+        def wait_for_deposit_seen(self, **kwargs):
+            observed.append(kwargs["tx_hash"])
+            return "success"
+
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda **_: pytest.fail("saved deposit must not sign again"),
+    )
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(position_key="saved", wallet=WALLET)
+        entry["_journal_position_id"] = position["id"]
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], tx_hash)
+        result = _submit_live_step(
+            entry, {"kind": "direct_deposit"}, wallet=wallet, rpc=object(),
+            rpc_urls={}, jumper=object(), bitget=Bitget(), journal=journal,
+            now_ms=lambda: 1,
+        )
+    assert observed == [tx_hash]
+    assert result["state"] == "completed"
+
+
+def test_new_plan_refuses_unresolved_direct_deposit(tmp_path):
+    old = _entry(ASSET_A)
+    new = _entry(ASSET_A)
+    new["group"] = {**new["group"], "key": "new-plan"}
+    submitted = []
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        old_group = journal.get_or_create_group(
+            group_key=old["group"]["key"], wallet=WALLET, source_chain_id=10,
+            loss_budget_pct="15", source_usd="100",
+        )
+        old_position = journal.get_or_create_position(
+            position_key=f"{old['group']['key']}:{ASSET_A}", wallet=WALLET,
+            group_id=old_group["id"], source_asset_id=ASSET_A,
+            source_amount_raw="1000000",
+        )
+        step = journal.record_step_intent(
+            position_id=old_position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
+        with pytest.raises(ValueError, match="unresolved prior direct deposit"):
+            execute_group_entries(
+                [new], journal=journal, max_route_loss_pct=Decimal("15"),
+                preflight=lambda planned: planned,
+                submit_step=lambda *_: submitted.append(True),
+            )
+    assert not submitted
+
+
+def test_legacy_manual_review_recovers_known_direct_deposit(tmp_path):
+    entry = _entry(ASSET_A)
+    calls = []
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=entry["group"]["key"], wallet=WALLET,
+            source_chain_id=10, loss_budget_pct="15", source_usd="100",
+        )
+        position = journal.get_or_create_position(
+            position_key=f"{entry['group']['key']}:{ASSET_A}", wallet=WALLET,
+            group_id=group["id"], source_asset_id=ASSET_A,
+            source_amount_raw="1000000",
+        )
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
+        journal.record_position_state(position["id"], "manual_review")
+        journal.record_group_state(group["id"], "manual_review_group_halted")
+        result = execute_group_entries(
+            [entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda _: pytest.fail("legacy send must not preflight"),
+            submit_step=lambda _, __: calls.append("reconcile") or
+            {"state": "completed", "realized_loss_usd": "1"},
+        )
+        assert journal.group(group["id"])["state"] == "completed"
+    assert result["completed"] == 1
+    assert calls == ["reconcile"]
+
+
+def test_background_deposit_success_completes_journal_without_blocking_submit(tmp_path):
+    entry = _entry(ASSET_A)
+
+    class Bitget:
+        def wait_for_deposit(self, **_):
+            return "success"
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=entry["group"]["key"], wallet=WALLET,
+            source_chain_id=10, loss_budget_pct="15", source_usd="100",
+        )
+        position = journal.get_or_create_position(
+            position_key="background", wallet=WALLET, group_id=group["id"],
+            source_asset_id=ASSET_A, source_amount_raw="1000000",
+        )
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
+        journal.record_step_state(step["id"], "deposit_seen")
+        journal.record_position_state(position["id"], "direct_deposit_submitted")
+        journal.record_position_state(position["id"], "deposit_pending")
+        journal.record_group_state(group["id"], "active")
+        journal.record_group_state(group["id"], "deposit_pending")
+        with _DepositBackground(bitget=Bitget(), journal=journal) as background:
+            background.watch(
+                entry=entry, position_id=position["id"], recipient=DEPOSIT,
+                loss_usd="1",
+            )
+            assert background.finish() == 1
+        assert journal.position(position["id"])["state"] == "completed"
+        assert journal.group(group["id"])["state"] == "completed"
+        assert journal.step(step["id"])["state"] == "credited"
+
+
+def test_background_deposit_failure_stops_group(tmp_path):
+    entry = _entry(ASSET_A)
+
+    class Bitget:
+        def wait_for_deposit(self, **_):
+            return "fail"
+
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key=entry["group"]["key"], wallet=WALLET,
+            source_chain_id=10, loss_budget_pct="15", source_usd="100",
+        )
+        position = journal.get_or_create_position(
+            position_key="background", wallet=WALLET, group_id=group["id"],
+            source_asset_id=ASSET_A, source_amount_raw="1000000",
+        )
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
+        journal.record_step_state(step["id"], "deposit_seen")
+        journal.record_position_state(position["id"], "direct_deposit_submitted")
+        journal.record_position_state(position["id"], "deposit_pending")
+        journal.record_group_state(group["id"], "active")
+        journal.record_group_state(group["id"], "deposit_pending")
+        with _DepositBackground(bitget=Bitget(), journal=journal) as background:
+            background.watch(
+                entry=entry, position_id=position["id"], recipient=DEPOSIT,
+                loss_usd="1",
+            )
+            with pytest.raises(DepositSettlementFailed):
+                background.finish()
+        assert journal.position(position["id"])["state"] == "manual_review"
+        assert journal.group(group["id"])["state"] == "manual_review_group_halted"
+        assert journal.step(step["id"])["state"] == "manual_review"
+
+
+def test_unseen_saved_deposit_stops_without_new_signature(tmp_path, monkeypatch):
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    entry = _entry(ASSET_A)
+
+    class Bitget:
+        def wait_for_deposit_seen(self, **_):
+            return None
+
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda **_: pytest.fail("saved deposit must not sign again"),
+    )
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(position_key="saved", wallet=WALLET)
+        entry["_journal_position_id"] = position["id"]
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
+        with pytest.raises(DepositNotSeen):
+            _submit_live_step(
+                entry, {"kind": "direct_deposit"}, wallet=wallet, rpc=object(),
+                rpc_urls={}, jumper=object(), bitget=Bitget(), journal=journal,
+                now_ms=lambda: 1,
+            )
+
+
+def test_seen_pending_saved_deposit_returns_before_final_credit(tmp_path, monkeypatch):
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    entry = _entry(ASSET_A)
+
+    class Bitget:
+        def wait_for_deposit_seen(self, **_):
+            return "pending"
+
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._execute_entry",
+        lambda **_: pytest.fail("saved deposit must not sign again"),
+    )
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(position_key="saved", wallet=WALLET)
+        entry["_journal_position_id"] = position["id"]
+        step = journal.record_step_intent(
+            position_id=position["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+        )
+        journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
+        result = _submit_live_step(
+            entry, {"kind": "direct_deposit"}, wallet=wallet, rpc=object(),
+            rpc_urls={}, jumper=object(), bitget=Bitget(), journal=journal,
+            now_ms=lambda: 1,
+        )
+        assert journal.step(step["id"])["state"] == "deposit_seen"
+    assert result["state"] == "deposit_pending"
+
+
 def test_group_execution_rejects_loss_limit_changed_after_plan(tmp_path):
     entry = _entry(ASSET_A)
     submitted = []
@@ -309,6 +645,42 @@ def test_generated_native_gas_reserve_cannot_use_preexisting_wallet_balance(
             )
 
     assert signed == []
+
+
+def test_preflighted_native_deposit_keeps_its_reserved_fee_quote(monkeypatch):
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    request = TransactionRequest(42161, DEPOSIT, "0x", 700_000, 21_000, 1)
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.FeePlanner.plan",
+        lambda *_args, **_kwargs: pytest.fail("preflighted native fee must not change"),
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution._native_balance", lambda *_args, **_kwargs: 763_000,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.pending_nonce", lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.sign_transaction", lambda *_args, **_kwargs: "0x01",
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.broadcast_signed_transaction",
+        lambda *_args, **_kwargs: "0x" + "a" * 64,
+    )
+    monkeypatch.setattr(
+        "evm_inventory.route_execution.wait_for_receipt", lambda *_args, **_kwargs: {},
+    )
+
+    result = _execute_entry(
+        entry={"chain_id": 42161, "asset_id": "native", "status": "direct_deposit"},
+        wallet=wallet,
+        rpc=object(),
+        jumper=object(),
+        rpc_urls={42161: "https://rpc.example"},
+        prepared_request=request,
+    )
+
+    assert str(result) == "0x" + "a" * 64
 
 
 @pytest.mark.parametrize("intermediate_output", [900, 800])
@@ -773,13 +1145,17 @@ def test_direct_final_hop_keeps_losses_from_completed_intermediate_hops(
         "_journal_position_id": 1,
     }
 
+    events = []
+
     class Bitget:
-        def wait_for_deposit(self, **_kwargs):
+        def wait_for_deposit_seen(self, **kwargs):
+            events.append("wait")
+            assert kwargs["started_ms"] == 1234567
             return "success"
 
     monkeypatch.setattr(
         "evm_inventory.route_execution._execute_entry",
-        lambda **_kwargs: "0x" + "1" * 64,
+        lambda **_kwargs: events.append("send") or "0x" + "1" * 64,
     )
     with Journal(tmp_path / "journal.sqlite") as journal:
         position = journal.get_or_create_position(
@@ -795,8 +1171,9 @@ def test_direct_final_hop_keeps_losses_from_completed_intermediate_hops(
             jumper=object(),
             bitget=Bitget(),
             journal=journal,
-            now_ms=lambda: int(NOW.timestamp() * 1000),
+            now_ms=lambda: events.append("clock") or 1234567,
         )
+    assert events[:3] == ["clock", "send", "wait"]
 
     assert result == {"state": "completed", "realized_loss_usd": "5"}
 
@@ -878,6 +1255,13 @@ def test_direct_preflight_refreshes_balance_target_and_gas_without_route_quote()
     asset = AssetIdentity(10, ASSET_A, 6)
     target = BitgetDepositTarget("USDC", 10, ASSET_A, 1, "Optimism", 6)
     wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    price_time = NOW + timedelta(seconds=2)
+    clock_calls = 0
+
+    def clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        return int((NOW if clock_calls == 1 else price_time).timestamp() * 1000)
 
     class Rpc:
         calls = []
@@ -897,7 +1281,7 @@ def test_direct_preflight_refreshes_balance_target_and_gas_without_route_quote()
 
         def token_price(self, requested):
             price = "1" if not requested.is_native else "2000"
-            return LifiPriceEvidence(requested, price, NOW.isoformat())
+            return LifiPriceEvidence(requested, price, price_time.isoformat())
 
         def routes(self, _request):
             self.route_requests += 1
@@ -937,7 +1321,7 @@ def test_direct_preflight_refreshes_balance_target_and_gas_without_route_quote()
         gas_estimator=PlannerGasEstimator(
             rpc, {10: "https://rpc.example"}, prices
         ),
-        now_ms=lambda: int(NOW.timestamp() * 1000),
+        now_ms=clock,
     )
 
     assert fresh["raw_balance"] == "2000000"
@@ -974,6 +1358,23 @@ def test_direct_preflight_rejects_changed_live_target_minimum_before_rpc():
             gas_estimator=object(),
             now_ms=lambda: int(NOW.timestamp() * 1000),
         )
+
+
+def test_lower_live_bitget_minimum_preserves_stricter_planned_minimum():
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    entry = _entry(ASSET_A)
+    entry["target"].update({
+        "chain_id": 10, "asset_id": ASSET_A,
+        "chain": "Optimism", "minimum_raw": "10",
+    })
+
+    class Bitget:
+        def revalidate_deposit_target(self, _target, *, recipient):
+            assert recipient == DEPOSIT
+            return BitgetDepositTarget("USDC", 10, ASSET_A, 9, "Optimism", 6)
+
+    target = _require_live_target(entry, wallet=wallet, bitget=Bitget())
+    assert target.minimum_raw == 10
 
 
 def _lifi_route(

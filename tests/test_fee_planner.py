@@ -54,6 +54,21 @@ def test_plans_eip1559_fee_and_buffered_gas_limit():
     ]
 
 
+def test_ethereum_mainnet_max_fee_is_130_percent_of_base_fee():
+    rpc = StubRpc({
+        "eth_estimateGas": "0x5208",
+        "eth_getBlockByNumber": {"number": "0xa", "baseFeePerGas": "0x64"},
+        "eth_feeHistory": {
+            "baseFeePerGas": ["0x64", "0x70"],
+            "reward": [["0x7"]],
+        },
+    })
+    request = TransactionRequest(1, "0x" + "1" * 40, "0x", 0, 0, 0)
+    planned = FeePlanner(rpc).plan("https://rpc", request, sender="0x" + "2" * 40)
+    assert planned.max_fee_per_gas_wei == 130
+    assert planned.max_priority_fee_per_gas_wei <= 30
+
+
 def test_plans_legacy_price_when_block_has_no_base_fee():
     rpc = StubRpc(
         {

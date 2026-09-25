@@ -176,7 +176,12 @@ class FeePlanner:
             raise ValueError("invalid_latest_base_fee")
 
         priority_fee, source, fallback_reason = self._priority_fee(url)
-        if source == "eth_gasPrice_fallback":
+        if request.chain_id == 1:
+            max_fee = (base_fee * 13 + 9) // 10
+            priority_fee = min(priority_fee, max_fee - base_fee)
+            source = f"{source}+ethereum_base_fee_1_3"
+            eip1559 = True
+        elif source == "eth_gasPrice_fallback":
             max_fee = priority_fee
             eip1559 = False
         else:

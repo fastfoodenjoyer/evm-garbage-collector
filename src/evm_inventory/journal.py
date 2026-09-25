@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
 _GROUP_STATES = {
     "planned",
     "active",
+    "deposit_pending",
+    "gas_deferred",
     "completed",
     "manual_review_after_swap",
     "manual_review_group_threshold_exceeded",
@@ -18,17 +20,24 @@ _GROUP_STATES = {
 _GROUP_TRANSITIONS = {
     "planned": {
         "active",
+        "gas_deferred",
         "completed",
         "manual_review_after_swap",
         "manual_review_group_threshold_exceeded",
         "manual_review_group_halted",
     },
     "active": {
+        "deposit_pending",
+        "gas_deferred",
         "completed",
         "manual_review_after_swap",
         "manual_review_group_threshold_exceeded",
         "manual_review_group_halted",
     },
+    "deposit_pending": {
+        "active", "completed", "deposit_pending", "manual_review_group_halted",
+    },
+    "gas_deferred": {"active", "gas_deferred"},
     "completed": set(),
     "manual_review_after_swap": set(),
     "manual_review_group_threshold_exceeded": set(),
@@ -36,6 +45,7 @@ _GROUP_TRANSITIONS = {
 }
 _POSITION_TRANSITIONS = {
     "planned": {
+        "gas_deferred",
         "swap_submitted",
         "direct_deposit_submitted",
         "source_asset_converted_bridge_pending",
@@ -81,10 +91,17 @@ _POSITION_TRANSITIONS = {
         "manual_review_group_halted",
     },
     "direct_deposit_submitted": {
+        "deposit_pending",
+        "gas_deferred",
         "completed",
         "manual_review_group_threshold_exceeded",
         "manual_review_group_halted",
         "manual_review",
+    },
+    "deposit_pending": {"completed", "manual_review"},
+    "gas_deferred": {
+        "direct_deposit_submitted", "bridge_submitted", "swap_submitted",
+        "manual_review", "gas_deferred",
     },
     "completed": set(),
     "manual_review_after_swap": set(),
@@ -94,7 +111,11 @@ _POSITION_TRANSITIONS = {
 }
 _STEP_TRANSITIONS = {
     "planned": {"submitted", "failed", "manual_review"},
-    "submitted": {"confirmed", "reverted", "failed", "bridge_timeout", "manual_review"},
+    "submitted": {
+        "confirmed", "deposit_seen", "reverted", "failed", "bridge_timeout",
+        "manual_review",
+    },
+    "deposit_seen": {"credited", "manual_review", "failed"},
     "confirmed": {"awaiting_bridge", "credited", "completed", "bridge_timeout", "manual_review"},
     "awaiting_bridge": {"credited", "bridge_timeout", "manual_review"},
     "bridge_timeout": {"requote_required", "credited", "manual_review"},
@@ -159,6 +180,7 @@ class Journal:
               source_amount_raw TEXT,
               actual_asset_id TEXT,
               actual_balance_raw TEXT,
+              accounted_loss_usd TEXT,
               reason TEXT,
               state TEXT NOT NULL DEFAULT 'planned',
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -173,6 +195,7 @@ class Journal:
                 "source_amount_raw": "TEXT",
                 "actual_asset_id": "TEXT",
                 "actual_balance_raw": "TEXT",
+                "accounted_loss_usd": "TEXT",
                 "reason": "TEXT",
             },
         )
@@ -344,6 +367,64 @@ class Journal:
             raise KeyError(group_id)
         return dict(row)
 
+    def reactivate_known_direct_deposit(self, group_id: int, position_key: str) -> bool:
+        """Recover a legacy API failure only when exactly one known send exists."""
+        rows = self.connection.execute(
+            "SELECT id, position_key, state FROM route_positions WHERE group_id=?",
+            (group_id,),
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["position_key"] != position_key:
+            return False
+        position = rows[0]
+        if position["state"] not in {"manual_review", "deposit_pending"}:
+            return False
+        step = self.latest_step(position_id=position["id"], step_key="direct_deposit")
+        if step is None or not step["tx_hash"] or step["state"] in {"failed", "reverted"}:
+            return False
+        self.connection.execute(
+            """UPDATE route_positions SET state='deposit_pending',
+               updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (position["id"],),
+        )
+        self.connection.execute(
+            """UPDATE route_groups SET state='deposit_pending',
+               updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (group_id,),
+        )
+        self.connection.commit()
+        return True
+
+    def reactivate_legacy_gas_deferral(self, group_id: int, position_key: str) -> bool:
+        """Retry an old pre-signature gas-cap refusal without changing the cap."""
+        rows = self.connection.execute(
+            "SELECT id, position_key, state, reason FROM route_positions WHERE group_id=?",
+            (group_id,),
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["position_key"] != position_key:
+            return False
+        position = rows[0]
+        if (
+            position["state"] != "manual_review"
+            or not str(position["reason"] or "").startswith("ethereum_gas_deferred:")
+        ):
+            return False
+        broadcast = self.connection.execute(
+            "SELECT 1 FROM route_steps WHERE position_id=? AND tx_hash IS NOT NULL LIMIT 1",
+            (position["id"],),
+        ).fetchone()
+        if broadcast is not None:
+            return False
+        self.connection.execute(
+            "UPDATE route_positions SET state='gas_deferred' WHERE id=?",
+            (position["id"],),
+        )
+        self.connection.execute(
+            "UPDATE route_groups SET state='gas_deferred' WHERE id=?",
+            (group_id,),
+        )
+        self.connection.commit()
+        return True
+
     def record_group_projection(
         self, group_id: int, *, projected_loss_usd: str, projected_loss_pct: str
     ) -> None:
@@ -364,7 +445,7 @@ class Journal:
         group = self.group(group_id)
         if Decimal(loss) < Decimal(group["realized_loss_usd"]):
             raise ValueError("realised group loss cannot move backwards")
-        if group["state"] not in {"planned", "active"}:
+        if group["state"] not in {"planned", "active", "deposit_pending"}:
             raise ValueError("cannot update a terminal route group realised loss")
         self.connection.execute(
             """UPDATE route_groups SET realized_loss_usd=?, updated_at=CURRENT_TIMESTAMP
@@ -372,6 +453,33 @@ class Journal:
             (loss, group_id),
         )
         self.connection.commit()
+
+    def account_position_loss(self, position_id: int, *, loss_usd: str) -> str:
+        """Count a broadcast position's loss once, including across restarts."""
+        loss = _decimal_text(loss_usd, "position realised loss")
+        position = self.position(position_id)
+        group_id = position["group_id"]
+        if group_id is None:
+            raise ValueError("position has no route group")
+        existing = position["accounted_loss_usd"]
+        if existing is not None:
+            # Reconciliation can revalue the same transfer after a restart.
+            # The first recorded cost remains authoritative for this position.
+            return self.group(group_id)["realized_loss_usd"]
+        with localcontext() as context:
+            context.prec = 80
+            total = Decimal(self.group(group_id)["realized_loss_usd"]) + Decimal(loss)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE route_positions SET accounted_loss_usd=? WHERE id=?",
+                (loss, position_id),
+            )
+            self.connection.execute(
+                """UPDATE route_groups SET realized_loss_usd=?,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (format(total, "f"), group_id),
+            )
+        return format(total, "f")
 
     def record_group_state(
         self, group_id: int, state: str, *, reason: str | None = None
@@ -434,6 +542,12 @@ class Journal:
         if row is None:
             raise KeyError(position_id)
         return dict(row)
+
+    def group_positions(self, group_id: int) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT * FROM route_positions WHERE group_id=? ORDER BY id", (group_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_position_state(
         self,
@@ -613,6 +727,21 @@ class Journal:
             """SELECT * FROM route_steps WHERE position_id=? AND step_key=?
                ORDER BY id DESC LIMIT 1""",
             (position_id, step_key),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def unresolved_direct_deposit(
+        self, *, wallet: str, chain_id: int, asset_id: str, exclude_position_id: int
+    ) -> dict | None:
+        row = self.connection.execute(
+            """SELECT p.id AS position_id, s.tx_hash FROM route_positions p
+               JOIN route_groups g ON g.id=p.group_id
+               JOIN route_steps s ON s.position_id=p.id
+               WHERE p.wallet=? AND g.source_chain_id=? AND p.source_asset_id=?
+                 AND p.id<>? AND p.state<>'completed'
+                 AND s.step_key='direct_deposit' AND s.tx_hash IS NOT NULL
+               ORDER BY s.id DESC LIMIT 1""",
+            (wallet.lower(), chain_id, asset_id.lower(), exclude_position_id),
         ).fetchone()
         return dict(row) if row is not None else None
 

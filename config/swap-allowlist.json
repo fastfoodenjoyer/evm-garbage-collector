@@ -19,6 +19,7 @@
     {"chain_id": 100, "network": "Gnosis", "asset_id": "0xe91d153e0b41518a2ce8dd3d7944fa863463a97d", "symbol": "WXDAI", "action": "swap"},
     {"chain_id": 130, "network": "Unichain", "asset_id": "0x078d782b760474a361dda0af3839290b0ef57ad6", "symbol": "USDC", "action": "swap"},
     {"chain_id": 130, "network": "Unichain", "asset_id": "0x9151434b16b9763660705744891fa906f660ecc5", "symbol": "USDT0", "action": "swap"},
+    {"chain_id": 137, "network": "Polygon PoS", "asset_id": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359", "symbol": "USDC", "action": "swap"},
     {"chain_id": 8453, "network": "Base", "asset_id": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "symbol": "USDC", "action": "swap"},
     {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "0xaf88d065e77c8cc2239327c5edb3a432268e5831", "symbol": "USDC", "action": "swap"},
     {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8", "symbol": "USDC.e", "action": "swap"},

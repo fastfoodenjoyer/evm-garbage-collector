@@ -1,3 +1,4 @@
+import httpx
 import pytest
 
 from evm_inventory.bitget import BitgetClient
@@ -16,6 +17,21 @@ def test_deposit_status_matches_transaction_hash_fields():
     assert client.deposit_status(
         tx_hash="0xAbC", start_ms=1, end_ms=2, coin="USDC", chain="BASE",
         recipient="0x" + "1" * 40, minimum_raw=10_000,
+    ) == "success"
+
+
+def test_deposit_status_matches_real_bitget_recipient_field_and_chain_case():
+    class Client(BitgetClient):
+        def deposit_records(self, **_):
+            return ({
+                "tradeId": "0xabc", "coin": "ETH", "chain": "Optimism",
+                "toAddress": "0x" + "1" * 40, "size": "0.01", "status": "success",
+            },)
+
+    client = Client(api_key="key", secret_key="secret", passphrase="pass")
+    assert client.deposit_status(
+        tx_hash="0xabc", start_ms=1, end_ms=2, coin="ETH", chain="OPTIMISM",
+        recipient="0x" + "1" * 40, minimum_raw=10**16,
     ) == "success"
 
 
@@ -78,6 +94,62 @@ def test_wait_for_deposit_accepts_success_case_insensitively(monkeypatch):
     ) == "SUCCESS"
 
 
+def test_wait_for_deposit_seen_returns_pending_without_waiting_for_success(monkeypatch):
+    class Client(BitgetClient):
+        statuses = iter((None, "pending"))
+
+        def deposit_status(self, **_):
+            return next(self.statuses)
+
+    monkeypatch.setattr("evm_inventory.bitget.time.monotonic", lambda: 0)
+    monkeypatch.setattr("evm_inventory.bitget.time.sleep", lambda _: None)
+    client = Client(api_key="key", secret_key="secret", passphrase="pass")
+    assert client.wait_for_deposit_seen(
+        tx_hash="0xabc", started_ms=1, coin="USDC", chain="BASE",
+        recipient="0x" + "1" * 40, minimum_raw=1,
+        timeout_seconds=1, poll_seconds=0,
+    ) == "pending"
+
+
+def test_wait_for_deposit_uses_valid_range_in_same_millisecond(monkeypatch):
+    class Client(BitgetClient):
+        def deposit_status(self, **kwargs):
+            assert kwargs["end_ms"] > kwargs["start_ms"] == 1000
+            return "success"
+
+    monkeypatch.setattr("evm_inventory.bitget.time.monotonic", lambda: 0)
+    monkeypatch.setattr("evm_inventory.bitget.time.time", lambda: 1.0)
+    client = Client(api_key="key", secret_key="secret", passphrase="pass")
+
+    assert client.wait_for_deposit(
+        tx_hash="0xabc", started_ms=1000, coin="USDC", chain="BASE",
+        recipient="0x" + "1" * 40, minimum_raw=1, timeout_seconds=1, poll_seconds=0
+    ) == "success"
+
+
+def test_wait_for_deposit_retries_temporary_api_error(monkeypatch):
+    request = httpx.Request("GET", "https://api.bitget.com/deposits")
+    response = httpx.Response(429, request=request)
+    attempts = []
+
+    class Client(BitgetClient):
+        def deposit_status(self, **_kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+            return "success"
+
+    monkeypatch.setattr("evm_inventory.bitget.time.monotonic", lambda: 0)
+    monkeypatch.setattr("evm_inventory.bitget.time.sleep", lambda _: None)
+    client = Client(api_key="key", secret_key="secret", passphrase="pass")
+
+    assert client.wait_for_deposit(
+        tx_hash="0xabc", started_ms=1000, coin="USDC", chain="BASE",
+        recipient="0x" + "1" * 40, minimum_raw=1, timeout_seconds=1, poll_seconds=0
+    ) == "success"
+    assert len(attempts) == 2
+
+
 def test_wait_for_deposit_polls_pending_status_until_success(monkeypatch):
     class Client(BitgetClient):
         statuses = iter(("pending", "success"))
@@ -96,7 +168,7 @@ def test_wait_for_deposit_polls_pending_status_until_success(monkeypatch):
     ) == "success"
 
 
-@pytest.mark.parametrize("status", (None, "", "failed", "unexpected"))
+@pytest.mark.parametrize("status", (None, "", "unexpected"))
 def test_wait_for_deposit_does_not_credit_empty_failed_or_unknown_status(monkeypatch, status):
     class Client(BitgetClient):
         def deposit_status(self, **_):
@@ -111,6 +183,20 @@ def test_wait_for_deposit_does_not_credit_empty_failed_or_unknown_status(monkeyp
         tx_hash="0xabc", started_ms=1, coin="USDC", chain="BASE",
         recipient="0x" + "1" * 40, minimum_raw=1, timeout_seconds=1, poll_seconds=0
     ) is None
+
+
+def test_wait_for_deposit_stops_on_failed_record(monkeypatch):
+    class Client(BitgetClient):
+        def deposit_status(self, **_):
+            return "fail"
+
+    monkeypatch.setattr("evm_inventory.bitget.time.monotonic", lambda: 0)
+    client = Client(api_key="key", secret_key="secret", passphrase="pass")
+    assert client.wait_for_deposit(
+        tx_hash="0xabc", started_ms=1, coin="USDC", chain="BASE",
+        recipient="0x" + "1" * 40, minimum_raw=1,
+        timeout_seconds=1, poll_seconds=0,
+    ) == "fail"
 
 
 def test_wait_for_deposit_propagates_deposit_api_errors(monkeypatch):

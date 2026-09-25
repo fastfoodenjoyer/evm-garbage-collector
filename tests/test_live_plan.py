@@ -1,6 +1,6 @@
 import csv
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -46,6 +46,68 @@ def test_live_plan_stages_existing_base_usdc_for_one_final_deposit(tmp_path):
 
     assert [entry["status"] for entry in plan["entries"]] == ["direct_deposit"]
     assert plan["entries"][0]["steps"][0]["kind"] == "direct_deposit"
+
+
+def test_live_plan_quote_floor_uses_usd_value_for_native_balance(tmp_path):
+    balances = _balance_rows(tmp_path, [{
+        "wallet": WALLET,
+        "chain_id": 1,
+        "asset_id": "native",
+        "raw_balance": str(4 * 10**15),
+        "decimals": 18,
+        "symbol": "ETH",
+        "status": "success",
+    }])
+    plan = create_live_plan(
+        balances,
+        deposit_addresses={WALLET: "0x" + "d" * 40},
+        allowlist_path=_allowlist(tmp_path, [(1, "native", "swap")]),
+        quote_floor="0.01",
+        client=_RecordingQuotes(lambda _request: pytest.fail("direct deposit must not route")),
+        targets=(BitgetDepositTarget("ETH", 1, "native", 10**14),),
+        gas_estimator=lambda **_kwargs: (
+            FeeQuote(10**11, QuotePrice(AssetIdentity(1, "native", 18), "2000", NOW)),
+        ),
+        now_ms=lambda: int(NOW.timestamp() * 1000),
+    )
+
+    assert plan["entries"][0]["status"] == "direct_deposit"
+
+
+def test_live_plan_accepts_price_fetched_after_plan_started(tmp_path):
+    balances = _balance_rows(tmp_path, [{
+        "wallet": WALLET,
+        "chain_id": 8453,
+        "asset_id": SOURCE,
+        "raw_balance": "10000000",
+        "decimals": 6,
+        "symbol": "USDC",
+        "status": "success",
+    }])
+    later = NOW + timedelta(seconds=2)
+    class LaterQuotes(_RecordingQuotes):
+        def token_price(self, asset):
+            return LifiPriceEvidence(asset, "1", later.isoformat())
+
+    calls = 0
+    def clock():
+        nonlocal calls
+        calls += 1
+        return int((NOW if calls == 1 else later).timestamp() * 1000)
+
+    plan = create_live_plan(
+        balances,
+        deposit_addresses={WALLET: "0x" + "d" * 40},
+        allowlist_path=_allowlist(tmp_path, [(8453, SOURCE, "swap")]),
+        client=LaterQuotes(lambda _request: ()),
+        targets=(BitgetDepositTarget("USDC", 8453, SOURCE, 1),),
+        gas_estimator=lambda **_kwargs: (FeeQuote(
+            1000, QuotePrice(AssetIdentity(8453, "native", 18), "2000", later)
+        ),),
+        now_ms=clock,
+    )
+
+    assert plan["entries"][0]["status"] == "direct_deposit"
 
 
 def test_live_plan_rejects_route_without_a_complete_gas_estimate(tmp_path):

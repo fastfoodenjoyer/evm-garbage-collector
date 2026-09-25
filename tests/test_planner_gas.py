@@ -64,6 +64,18 @@ def test_planner_gas_estimator_quotes_direct_erc20_transfer():
     )
 
 
+def test_planner_gas_estimates_native_transfer_without_spending_full_balance():
+    rpc = Rpc()
+    estimator = PlannerGasEstimator(rpc, {42161: "https://rpc.example"}, PriceClient())
+    estimates = estimator(
+        purpose="direct_deposit", route=None, wallet=WALLET,
+        source_asset=AssetIdentity(42161, "native", 18), target=None,
+        amount=537433696312410, recipient=RECIPIENT,
+    )
+    assert estimates is not None
+    assert rpc.calls[0][2][0]["value"] == "0x0"
+
+
 def test_planner_gas_estimator_prices_required_approval():
     rpc = Rpc()
     estimator = PlannerGasEstimator(rpc, {10: "https://rpc.example"}, PriceClient())

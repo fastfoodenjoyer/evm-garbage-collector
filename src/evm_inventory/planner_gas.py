@@ -119,7 +119,9 @@ class PlannerGasEstimator:
             transaction = {
                 "from": wallet,
                 "to": recipient,
-                "value": hex(amount),
+                # Execution chooses the sendable value after reserving gas.
+                # Estimating the full observed balance can fail for insufficient funds.
+                "value": "0x0",
                 "data": "0x",
             }
         else:

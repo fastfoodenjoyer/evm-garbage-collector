@@ -32,6 +32,7 @@ from evm_inventory.workbook import WalletWorkbookRow
 @pytest.fixture(autouse=True)
 def planned_fee_quote_for_route_tests(monkeypatch):
     """Keep these route-state tests focused; fee quote behavior has dedicated tests."""
+    monkeypatch.setenv("ETHEREUM_GAS_PRICE_LIMIT_GWEI", "0.5")
 
     def plan(_self, _url, request, *, sender, max_total_fee_wei=None):
         del sender

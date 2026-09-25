@@ -80,8 +80,10 @@ def create_live_plan(
 ) -> dict:
     """Quote exact enabled Bitget targets and enforce loss per wallet/network."""
 
-    quoted_at = int((now_ms or _utc_now_ms)())
-    observed_at = datetime.fromtimestamp(quoted_at / 1000, UTC)
+    clock_ms = now_ms or _utc_now_ms
+    quoted_at = int(clock_ms())
+    def valuation_now() -> datetime:
+        return datetime.fromtimestamp(clock_ms() / 1000, UTC)
     limit = _loss_limit(max_route_loss_pct)
     floor = _quote_floor(quote_floor)
     actions = _actions(allowlist_path)
@@ -119,10 +121,13 @@ def create_live_plan(
             if action == "review":
                 excluded_entries.append(_manual(base, "policy_review"))
                 continue
-            if int(base["raw_balance"]) < _floor_raw(floor, asset.decimals):
+            price = _token_price(quote_client, asset)
+            source_usd = _usd_value(
+                int(base["raw_balance"]), asset, price, valuation_now()
+            )
+            if source_usd is not None and source_usd < floor:
                 excluded_entries.append({**base, "status": "dust"})
                 continue
-
             address = addresses.get(base["wallet"])
             if address is None:
                 excluded_entries.append(
@@ -136,10 +141,6 @@ def create_live_plan(
                 )
                 continue
 
-            price = _token_price(quote_client, asset)
-            source_usd = _usd_value(
-                int(base["raw_balance"]), asset, price, observed_at
-            )
             executable.append(
                 _Input(
                     base=base,
@@ -169,7 +170,7 @@ def create_live_plan(
                 enabled_targets,
                 quote_client,
                 limit,
-                observed_at,
+                valuation_now,
                 gas_estimator,
                 quoted_at,
             )
@@ -207,7 +208,7 @@ def _plan_group(
     targets: tuple[BitgetDepositTarget, ...],
     client: QuoteClient,
     limit: Decimal,
-    now: datetime,
+    now: Callable[[], datetime],
     gas_estimator: GasEstimator | None,
     quoted_at: int,
 ) -> list[dict]:
@@ -228,7 +229,7 @@ def _plan_group(
                     destination_price=None,
                     wallet_paid_gas=(),
                     gas_estimate_complete=False,
-                    now=now,
+                    now=now(),
                     max_price_age=_PRICE_MAX_AGE,
                 )
             choices_by_item.append((item, None, failed_candidate))
@@ -321,7 +322,7 @@ def _route_choices(
     targets: tuple[BitgetDepositTarget, ...],
     client: QuoteClient,
     limit: Decimal,
-    now: datetime,
+    now: Callable[[], datetime],
     gas_estimator: GasEstimator | None,
 ) -> tuple[list[_RouteChoice], list[ConsolidationCandidate]]:
     if item.target is not None:
@@ -468,7 +469,7 @@ def _direct_candidate(
     item: _Input,
     client: QuoteClient,
     gas_estimator: GasEstimator | None,
-    now: datetime,
+    now: Callable[[], datetime],
 ) -> ConsolidationCandidate:
     target = item.target
     assert target is not None
@@ -494,7 +495,7 @@ def _direct_candidate(
         destination_price=item.source_price,
         wallet_paid_gas=estimates or (),
         gas_estimate_complete=complete,
-        now=now,
+        now=now(),
         max_price_age=_PRICE_MAX_AGE,
     )
 
@@ -504,7 +505,7 @@ def _route_choice(
     item: _Input,
     target: BitgetDepositTarget,
     client: QuoteClient,
-    now: datetime,
+    now: Callable[[], datetime],
     gas_estimator: GasEstimator | None,
     *,
     expected_source: AssetIdentity,
@@ -535,7 +536,7 @@ def _route_candidate(
     route: LifiRoute,
     item: _Input,
     client: QuoteClient,
-    now: datetime,
+    now: Callable[[], datetime],
     gas_estimator: GasEstimator | None,
     *,
     expected_source: AssetIdentity,
@@ -585,7 +586,7 @@ def _route_candidate(
         expected_input_amount=expected_amount,
         recipient=recipient,
         gas_estimate_complete=gas_complete,
-        now=now,
+        now=now(),
         max_price_age=_PRICE_MAX_AGE,
         prices=prices,
         wallet_paid_gas=priced_estimates,
@@ -975,10 +976,6 @@ def _quote_floor(value: str) -> Decimal:
     if not result.is_finite() or result <= 0:
         raise ConfigError("quote floor must be a positive decimal")
     return result
-
-
-def _floor_raw(floor: Decimal, decimals: int) -> int:
-    return int(floor * Decimal(10**decimals))
 
 
 def _loss_limit(value: Decimal) -> Decimal:

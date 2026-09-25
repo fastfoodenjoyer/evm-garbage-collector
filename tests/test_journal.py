@@ -16,6 +16,23 @@ def test_journal_persists_transaction_and_deposit_status(tmp_path):
     assert row["deposit_status"] == "success"
 
 
+def test_position_loss_is_counted_once_when_reconciliation_quote_changes(tmp_path):
+    wallet = "0x" + "1" * 40
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        group = journal.get_or_create_group(
+            group_key="loss-reconciliation", wallet=wallet,
+            source_chain_id=1, loss_budget_pct="15", source_usd="100",
+        )
+        position = journal.get_or_create_position(
+            position_key="loss-reconciliation:eth", wallet=wallet,
+            group_id=group["id"], source_asset_id="native",
+            source_amount_raw="1000000",
+        )
+        assert journal.account_position_loss(position["id"], loss_usd="0.25") == "0.25"
+        assert journal.account_position_loss(position["id"], loss_usd="0.30") == "0.25"
+        assert journal.position(position["id"])["accounted_loss_usd"] == "0.25"
+
+
 def test_journal_migrates_legacy_operations_and_records_deferred_reason(tmp_path):
     path = tmp_path / "journal.sqlite"
     connection = sqlite3.connect(path)
