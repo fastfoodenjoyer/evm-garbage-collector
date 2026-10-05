@@ -16,6 +16,7 @@ from .config import load_catalog
 from .lifi import TransactionRequest
 from .models import AssetIdentity
 from .rpc import quantity, uint256
+from .stages import StageDeadlineExceeded
 
 _OP_STACK_CHAIN_IDS = frozenset(
     {
@@ -122,6 +123,8 @@ class FeePlanner:
             raise ValueError("invalid_total_fee_cap")
         try:
             estimate = quantity(self.rpc.call(url, "eth_estimateGas", [transaction, "latest"]))
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             raise ValueError(f"estimate_gas_rpc_error:{_rpc_failure_detail(exc)}") from exc
         if estimate <= 0:
@@ -140,6 +143,8 @@ class FeePlanner:
             raise ValueError("latest_block_unavailable_for_fee_quote")
         try:
             quote_block_number = quantity(header.get("number"))
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             raise ValueError("invalid_latest_block_number_for_fee_quote") from exc
         base_fee_value = header.get("baseFeePerGas")
@@ -170,6 +175,8 @@ class FeePlanner:
             return self._check_fee_cap(planned)
         try:
             base_fee = quantity(base_fee_value)
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             raise ValueError("invalid_latest_base_fee") from exc
         if base_fee <= 0:
@@ -253,6 +260,8 @@ class FeePlanner:
             fee = uint256(result)
             if fee > 0:
                 return fee
+        except StageDeadlineExceeded:
+            raise
         except Exception:
             pass
 
@@ -274,6 +283,8 @@ class FeePlanner:
             fee = uint256(result)
             if fee > 0:
                 return fee
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             raise ValueError(f"op_stack_l1_fee_estimation_failed:{type(exc).__name__}") from exc
         raise ValueError("op_stack_l1_fee_estimation_failed:empty_result")
@@ -319,6 +330,8 @@ class FeePlanner:
                         None,
                     )
             failures.append("eth_feeHistory returned no usable reward percentiles")
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             failures.append(f"eth_feeHistory:{_rpc_failure_detail(exc)}")
         try:
@@ -330,6 +343,8 @@ class FeePlanner:
                     ";".join(failures),
                 )
             failures.append("eth_maxPriorityFeePerGas returned a negative value")
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             failures.append(f"eth_maxPriorityFeePerGas:{_rpc_failure_detail(exc)}")
         # Legacy transactions remain valid on EIP-1559 chains and are a safe
@@ -339,6 +354,8 @@ class FeePlanner:
     def _legacy_price(self, url: str) -> int:
         try:
             gas_price = quantity(self.rpc.call(url, "eth_gasPrice", []))
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             raise ValueError(f"gas_price_rpc_error:{_rpc_failure_detail(exc)}") from exc
         if gas_price <= 0:

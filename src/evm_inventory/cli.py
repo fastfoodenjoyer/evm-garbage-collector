@@ -17,7 +17,6 @@ from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot
 from .defi_operations import execute_defi, quote_defi
 from .diagnostics import exception_diagnostic, redact_text
 from .executor import AmbiguousBroadcast
-from .lifi import LifiClient
 from .live_plan import create_live_plan
 from .models import ConfigError
 from .planner_gas import PlannerGasEstimator
@@ -29,11 +28,13 @@ from .runbook import create_route_plan
 from .scanner import scan
 from .store import Store
 from .transport import RequestError, Transport
+from .wallet_lifi import WalletLifiClients
 from .workbook import (
     create_wallet_template,
     dry_run_workbook,
     load_wallet_workbook,
     parse_ordinal_ranges,
+    require_trusted_deposit_addresses,
     wallet_range_batches,
 )
 
@@ -105,6 +106,16 @@ def _emit_error_diagnostic(exc: BaseException) -> None:
     )
 
 
+def _stage_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("stage seconds must be a number") from exc
+    if not math.isfinite(seconds) or not 0 < seconds <= 30:
+        raise argparse.ArgumentTypeError("stage seconds must be greater than zero and at most 30")
+    return seconds
+
+
 def main(argv=None):
     try:
         _load_dotenv()
@@ -117,7 +128,9 @@ def main(argv=None):
         scan_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
         scan_parser.add_argument("--delay-min", type=float, default=1)
         scan_parser.add_argument("--delay-max", type=float, default=3)
-        scan_parser.add_argument("--interval", type=float, default=1)
+        scan_parser.add_argument("--interval", type=float, default=0)
+        scan_parser.add_argument("--stage-seconds", type=_stage_seconds, default=30)
+        scan_parser.add_argument("--workers", type=int, default=16)
         scan_parser.add_argument("--no-discovery", action="store_true")
         scan_parser.add_argument("--dry-run", action="store_true")
         export_parser = sub.add_parser("export")
@@ -127,6 +140,10 @@ def main(argv=None):
         template_parser.add_argument("--output", required=True)
         workbook_dry_run_parser = sub.add_parser("workbook-dry-run")
         workbook_dry_run_parser.add_argument("--workbook", required=True)
+        workbook_dry_run_parser.add_argument(
+            "--allow-duplicate-deposit-addresses", action="store_true",
+            help="Allow repeated Bitget deposit addresses in the entire workbook",
+        )
         route_plan_parser = sub.add_parser("route-plan")
         route_plan_parser.add_argument("--balances", required=True)
         route_plan_parser.add_argument("--output", required=True)
@@ -140,6 +157,13 @@ def main(argv=None):
         quote_routes_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
         quote_routes_parser.add_argument("--catalog")
         quote_routes_parser.add_argument("--quote-floor", default="0.01")
+        quote_routes_parser.add_argument("--stage-seconds", type=_stage_seconds, default=30)
+        quote_routes_parser.add_argument("--workers", type=int, default=16)
+        quote_routes_parser.add_argument("--target-workers", type=int, default=8)
+        quote_routes_parser.add_argument(
+            "--allow-duplicate-deposit-addresses", action="store_true",
+            help="Allow repeated Bitget deposit addresses in the entire workbook",
+        )
         quote_routes_parser.add_argument(
             "--wallet-ranges",
             help="inclusive workbook ordinals, e.g. 1-50,75,100-120",
@@ -165,6 +189,15 @@ def main(argv=None):
         execute_parser.add_argument("--catalog", required=True)
         execute_parser.add_argument("--db", required=True)
         execute_parser.add_argument("--execute", action="store_true")
+        execute_parser.add_argument(
+            "--trust-deposit-addresses", action="store_true",
+            help="Confirm workbook deposit addresses were checked and belong to Bitget",
+        )
+        execute_parser.add_argument(
+            "--allow-duplicate-deposit-addresses", action="store_true",
+            help="Allow repeated Bitget deposit addresses in the entire workbook",
+        )
+        execute_parser.add_argument("--stage-seconds", type=_stage_seconds, default=30)
         execute_parser.add_argument(
             "--wallet-ranges",
             help="inclusive workbook ordinals, e.g. 1-50,75,100-120",
@@ -195,7 +228,10 @@ def main(argv=None):
             print(json.dumps({"status": "created", "workbook": str(output)}))
             return 0
         if args.cmd == "workbook-dry-run":
-            print(json.dumps(dry_run_workbook(Path(args.workbook))))
+            print(json.dumps(dry_run_workbook(
+                Path(args.workbook),
+                allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
+            )))
             return 0
         if args.cmd == "route-plan":
             plan = create_route_plan(Path(args.balances), quote_floor_raw=args.quote_floor_raw)
@@ -211,15 +247,16 @@ def main(argv=None):
                 Path(args.workbook),
                 require_deposit_address=False,
                 ordinal_ranges=ordinal_ranges,
+                check_deposit_uniqueness=True,
+                allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
             )
             wallet_range_batches(wallet_rows, ordinal_ranges)
             addresses = {
                 item.public_address: item.bitget_deposit_address for item in wallet_rows
             }
             catalog = load_catalog(Path(args.catalog) if args.catalog else None)
-            transport = Transport()
-            lifi_http = httpx.Client(timeout=30)
-            quote_client = LifiClient(lifi_http)
+            transport = Transport(interval=0)
+            quote_client = WalletLifiClients(wallet_rows)
             try:
                 gas_estimator = PlannerGasEstimator(
                     RpcReader(transport), _execution_rpc_urls(catalog), quote_client
@@ -233,9 +270,12 @@ def main(argv=None):
                     max_route_loss_pct=routing_settings.max_route_loss_pct,
                     client=quote_client,
                     gas_estimator=gas_estimator,
+                    stage_seconds=args.stage_seconds,
+                    workers=args.workers,
+                    target_workers=args.target_workers,
                 )
             finally:
-                lifi_http.close()
+                quote_client.close()
                 transport.close()
             Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
             with Store(args.db) as store:
@@ -243,6 +283,7 @@ def main(argv=None):
             print(json.dumps({"status": "quoted", "output": str(args.output), **plan["summary"]}))
             return 0
         if args.cmd == "execute-routes":
+            require_trusted_deposit_addresses(args.trust_deposit_addresses)
             routing_settings = load_routing_settings()
             ordinal_ranges = parse_ordinal_ranges(args.wallet_ranges)
             plan_bytes = Path(args.plan).read_bytes()
@@ -252,7 +293,8 @@ def main(argv=None):
             catalog = load_catalog(Path(args.catalog))
             rpc_urls = _execution_rpc_urls(catalog)
             wallet_rows = load_wallet_workbook(
-                Path(args.workbook), ordinal_ranges=ordinal_ranges
+                Path(args.workbook), ordinal_ranges=ordinal_ranges,
+                allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
             )
             batches = wallet_range_batches(wallet_rows, ordinal_ranges)
             wallet_map = {item.public_address: item for item in wallet_rows}
@@ -274,10 +316,13 @@ def main(argv=None):
                     rpc_urls=rpc_urls,
                     journal_path=Path(args.db),
                     execute=args.execute,
-                    delay_min_seconds=int(execution.get("delay_min_seconds", 1800)),
-                    delay_max_seconds=int(execution.get("delay_max_seconds", 10800)),
+                    delay_min_seconds=int(execution.get("delay_min_seconds", 0)),
+                    delay_max_seconds=int(execution.get("delay_max_seconds", 0)),
                     wallet_batches=wallet_batches,
                     max_route_loss_pct=routing_settings.max_route_loss_pct,
+                    stage_seconds=args.stage_seconds,
+                    allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
+                    trust_deposit_addresses=args.trust_deposit_addresses,
                 )
             print(json.dumps({"status": "finished", **summary}))
             return 0
@@ -296,12 +341,16 @@ def main(argv=None):
             delay_min, delay_max = validate_delays(args.delay_min, args.delay_max)
             if not math.isfinite(args.interval) or args.interval < 0:
                 raise ConfigError("interval must be finite and nonnegative")
+            if not 1 <= args.workers <= 32:
+                raise ConfigError("scan workers must be from 1 to 32")
             key_present = bool(os.environ.get("ALCHEMY_API_KEY"))
             settings = {
                 "delay_min": delay_min,
                 "delay_max": delay_max,
                 "interval": float(args.interval),
                 "discovery_enabled": key_present and not args.no_discovery,
+                "stage_seconds": args.stage_seconds,
+                "workers": args.workers,
             }
             scope = snapshot(catalog, wallets, settings)
             scope = add_allowlisted_tokens(scope, Path(args.allowlist))

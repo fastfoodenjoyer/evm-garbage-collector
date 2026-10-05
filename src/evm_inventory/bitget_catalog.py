@@ -8,6 +8,8 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 
+from .stages import http_request
+
 _EVM_CHAINS = {
     "ETH": 1,
     "ETHEREUM": 1,
@@ -40,9 +42,13 @@ class BitgetDepositTarget:
 
 def fetch_public_coins(http_client: httpx.Client | None = None) -> tuple[dict, ...]:
     client = http_client or httpx.Client(timeout=30)
-    response = client.get("https://api.bitget.com/api/v2/spot/public/coins")
-    response.raise_for_status()
-    body = response.json()
+    try:
+        response = http_request(client, 'get', "https://api.bitget.com/api/v2/spot/public/coins")
+        response.raise_for_status()
+        body = response.json()
+    finally:
+        if http_client is None:
+            client.close()
     if body.get("code") != "00000" or not isinstance(body.get("data"), list):
         raise ValueError("Bitget public coin catalog is unavailable")
     return tuple(item for item in body["data"] if isinstance(item, dict))

@@ -16,7 +16,9 @@ from typing import Any
 from .models import Catalog, ConfigError, Network, Token
 
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-_SNAPSHOT_SETTINGS = frozenset({"delay_min", "delay_max", "interval", "discovery_enabled"})
+_SNAPSHOT_SETTINGS = frozenset({
+    "delay_min", "delay_max", "interval", "discovery_enabled", "stage_seconds", "workers",
+})
 
 
 def load_wallets(path: Path) -> tuple[str, ...]:
@@ -219,6 +221,15 @@ def snapshot(
     if unknown:
         raise ConfigError("snapshot settings contain unsupported fields")
     clean_settings = dict(settings)
+    if "stage_seconds" in clean_settings:
+        value = clean_settings["stage_seconds"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not 0 < value <= 30):
+            raise ConfigError("snapshot setting stage_seconds must be in (0, 30]")
+    if "workers" in clean_settings:
+        value = clean_settings["workers"]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 32:
+            raise ConfigError("snapshot setting workers must be an integer in [1, 32]")
     for name in ("delay_min", "delay_max", "interval"):
         if name in clean_settings:
             value = clean_settings[name]

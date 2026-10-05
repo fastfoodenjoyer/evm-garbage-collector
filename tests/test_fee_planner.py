@@ -5,6 +5,7 @@ import pytest
 from evm_inventory.fee_planner import FeePlanner, FeePolicy
 from evm_inventory.lifi import TransactionRequest
 from evm_inventory.rpc import RpcError
+from evm_inventory.stages import StageDeadlineExceeded
 
 
 class StubRpc:
@@ -22,6 +23,13 @@ class StubRpc:
 
 def _request() -> TransactionRequest:
     return TransactionRequest(10, "0x" + "1" * 40, "0x12345678", 7, 0, 0)
+
+
+def test_deadline_does_not_fall_back_to_another_fee_request():
+    rpc = StubRpc({"eth_estimateGas": StageDeadlineExceeded("expired")})
+    with pytest.raises(StageDeadlineExceeded):
+        FeePlanner(rpc).plan("https://rpc", _request(), sender="0x" + "2" * 40)
+    assert len(rpc.calls) == 1
 
 
 def test_plans_eip1559_fee_and_buffered_gas_limit():

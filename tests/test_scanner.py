@@ -266,3 +266,124 @@ def test_rpc_urls_accepts_the_documented_alchemy_api_key(monkeypatch):
     monkeypatch.setenv("ALCHEMY_API_KEY", "test-key")
     urls = _rpc_urls({"rpc_urls": ["https://public.example"], "alchemy_network": "opt-mainnet"})
     assert urls == ("https://opt-mainnet.g.alchemy.com/v2/test-key",)
+
+
+def test_network_checks_overlap_and_only_main_thread_writes(tmp_path):
+    import threading
+    import time
+
+    owner = threading.get_ident()
+    active = maximum = 0
+    lock = threading.Lock()
+
+    class ParallelRPC(RPC):
+        def block(self, *args):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.04)
+            with lock:
+                active -= 1
+            return super().block(*args)
+
+    class MainThreadStore(Store):
+        def record_asset(self, *args, **kwargs):
+            assert threading.get_ident() == owner
+            return super().record_asset(*args, **kwargs)
+
+        def write_discovery_state(self, *args, **kwargs):
+            assert threading.get_ident() == owner
+            return super().write_discovery_state(*args, **kwargs)
+
+    networks = [{**scope()["catalog"]["networks"][0], "chain_id": cid} for cid in range(10, 14)]
+    with MainThreadStore(tmp_path / "db.sqlite") as store:
+        result = scan(store, scope(networks=networks), rpc=ParallelRPC(), sleep=lambda _: None)
+        assert result["mandatory_failed"] == 0
+    assert maximum >= 3
+
+
+def test_deadline_persists_finished_balances_and_defers_late_results(tmp_path):
+    import threading
+    import time
+
+    release = threading.Event()
+    started = threading.Event()
+
+    class SlowRPC(RPC):
+        def token(self, *args):
+            started.set()
+            release.wait(2)
+            return 1230000, 6
+
+        def native(self, *args):
+            return 42
+
+    s = scope()
+    s["settings"]["stage_seconds"] = 0.08
+    with Store(tmp_path / "db.sqlite") as store:
+        start = time.monotonic()
+        result = scan(store, s, rpc=SlowRPC(), sleep=lambda _: None)
+        assert time.monotonic() - start < 0.4
+        assert started.is_set()
+        assert result["timed_out"] is True
+        native = next(row for row in store.assets() if row["asset_id"] == "native")
+        token = next(row for row in store.assets() if row["asset_id"] == T.lower())
+        assert native["status"] == "success" and native["result"]["raw_balance"] == "42"
+        assert token["status"] == "deferred"
+        before = store.assets()
+        release.set()
+        time.sleep(0.04)
+        assert store.assets() == before
+
+
+def test_expired_rescan_clears_previous_success(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class HangingRPC(RPC):
+        def block(self, *args):
+            release.wait(2)
+            return super().block(*args)
+
+    s = scope()
+    with Store(tmp_path / "db.sqlite") as store:
+        scan(store, s, rpc=RPC(), sleep=lambda _: None)
+        s["settings"]["stage_seconds"] = 0.03
+        result = scan(store, s, rpc=HangingRPC(), sleep=lambda _: None)
+        release.set()
+        assert result["positive_balances"] == 0
+        assert all(row["status"] == "deferred" for row in store.assets())
+        assert all("raw_balance" not in row["result"] for row in store.assets())
+        assert store.discovery_state(W, 10)["status"] == "disabled"
+
+
+def test_discovery_deadline_keeps_page_cursor_and_completed_mandatory_checks(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class SlowPages(Discover):
+        def page(self, wallet, network, cursor=None):
+            if cursor is None:
+                return ([{"address": D, "reported_raw_balance": "10", "decimals": 6}], "page-2")
+            release.wait(2)
+            return [], None
+
+    s = scope()
+    s["settings"]["stage_seconds"] = 0.08
+    s["catalog"]["networks"][0]["alchemy_network"] = "opt-mainnet"
+    with Store(tmp_path / "db.sqlite") as store:
+        result = scan(store, s, rpc=RPC(), discovery=SlowPages(), sleep=lambda _: None)
+        release.set()
+        state = store.discovery_state(W, 10)
+        assert result["mandatory_failed"] == 0
+        assert state["status"] == "deferred"
+        assert state["cursor"] == "page-2"
+        assert state["cursor_history"] == ["page-2"]
+        assert state["error"]["code"] == "stage_deadline_exceeded"
+        assert (
+            next(row for row in store.assets() if row["asset_id"] == D.lower())["status"]
+            == "provider_only"
+        )

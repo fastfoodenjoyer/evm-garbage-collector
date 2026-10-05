@@ -18,6 +18,12 @@ from .bitget_catalog import (
     fetch_public_coins,
     validate_live_target,
 )
+from .stages import (
+    budget_sleep,
+    check_deadline,
+    current_deadline,
+    http_request,
+)
 
 _COIN_DECIMALS = {"ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18}
 
@@ -42,58 +48,49 @@ class BitgetClient:
                 self.secret_key.encode(), f"{timestamp}GET{path}".encode(), hashlib.sha256
             ).digest()
         ).decode()
-        response = self.http.get(self.endpoint + path, headers={
-            "ACCESS-KEY": self.api_key, "ACCESS-SIGN": signature,
-            "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": self.passphrase,
-            "locale": "en-US", "Content-Type": "application/json",
-        })
+        response = http_request(
+            self.http,
+            "get",
+            self.endpoint + path,
+            headers={
+                "ACCESS-KEY": self.api_key,
+                "ACCESS-SIGN": signature,
+                "ACCESS-TIMESTAMP": timestamp,
+                "ACCESS-PASSPHRASE": self.passphrase,
+                "locale": "en-US",
+                "Content-Type": "application/json",
+            },
+        )
         response.raise_for_status()
         body = response.json()
         if body.get("code") != "00000" or not isinstance(body.get("data"), list):
             raise ValueError("Bitget deposit record request failed")
         return tuple(item for item in body["data"] if isinstance(item, dict))
 
-    def deposit_address(self, *, coin: str, chain: str) -> str:
-        """Read the current authenticated Bitget deposit address for an exact target."""
-
-        path = "/api/v2/spot/wallet/deposit-address?" + urlencode({"coin": coin, "chain": chain})
-        timestamp = str(int(time.time() * 1000))
-        signature = base64.b64encode(
-            hmac.new(
-                self.secret_key.encode(), f"{timestamp}GET{path}".encode(), hashlib.sha256
-            ).digest()
-        ).decode()
-        response = self.http.get(self.endpoint + path, headers={
-            "ACCESS-KEY": self.api_key, "ACCESS-SIGN": signature,
-            "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": self.passphrase,
-            "locale": "en-US", "Content-Type": "application/json",
-        })
-        response.raise_for_status()
-        body = response.json()
-        data = body.get("data")
-        address = data.get("address") if isinstance(data, dict) else None
-        if body.get("code") != "00000" or not isinstance(address, str):
-            raise ValueError("Bitget deposit address request failed")
-        return address
-
     def revalidate_deposit_target(self, target: dict, *, recipient: str) -> BitgetDepositTarget:
-        """Reload enabled metadata and address immediately before a final deposit."""
+        """Validate enabled asset/network/minimum, trusting the workbook recipient.
+
+        Bitget public APIs expose one deposit address per account, not the full
+        additional-address book. Ownership cannot be verified through them;
+        the workbook operator is responsible for the destination address.
+        """
 
         try:
             planned = BitgetDepositTarget(
-                str(target["coin"]), int(target["chain_id"]), str(target["asset_id"]).lower(),
-                int(target["minimum_raw"]), str(target["chain"]),
+                str(target["coin"]),
+                int(target["chain_id"]),
+                str(target["asset_id"]).lower(),
+                int(target["minimum_raw"]),
+                str(target["chain"]),
+                target.get("decimals"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid planned Bitget target") from exc
-        current_address = self.deposit_address(coin=planned.coin, chain=planned.chain)
         live = validate_live_target(
             planned,
             live_targets=deposit_targets(fetch_public_coins(self.http)),
-            user_address=current_address,
+            user_address=recipient,
         )
-        if current_address.lower() != recipient.lower():
-            raise ValueError("Bitget deposit address changed since planning")
         return live
 
     def deposit_status(
@@ -136,10 +133,16 @@ class BitgetClient:
         """Poll until Bitget reports a final deposit status or the deadline passes."""
 
         return self._poll_deposit(
-            tx_hash=tx_hash, started_ms=started_ms, coin=coin, chain=chain,
-            recipient=recipient, minimum_raw=minimum_raw,
-            timeout_seconds=timeout_seconds, poll_seconds=poll_seconds,
-            stop_on_seen=False, stop_event=stop_event,
+            tx_hash=tx_hash,
+            started_ms=started_ms,
+            coin=coin,
+            chain=chain,
+            recipient=recipient,
+            minimum_raw=minimum_raw,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+            stop_on_seen=False,
+            stop_event=stop_event,
         )
 
     def wait_for_deposit_seen(
@@ -157,10 +160,16 @@ class BitgetClient:
         """Wait only until Bitget has a matching deposit record."""
 
         return self._poll_deposit(
-            tx_hash=tx_hash, started_ms=started_ms, coin=coin, chain=chain,
-            recipient=recipient, minimum_raw=minimum_raw,
-            timeout_seconds=timeout_seconds, poll_seconds=poll_seconds,
-            stop_on_seen=True, stop_event=None,
+            tx_hash=tx_hash,
+            started_ms=started_ms,
+            coin=coin,
+            chain=chain,
+            recipient=recipient,
+            minimum_raw=minimum_raw,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+            stop_on_seen=True,
+            stop_event=None,
         )
 
     def _poll_deposit(
@@ -180,6 +189,7 @@ class BitgetClient:
 
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
+            check_deadline()
             try:
                 status = self.deposit_status(
                     tx_hash=tx_hash,
@@ -203,8 +213,10 @@ class BitgetClient:
                 return status
             if stop_on_seen and normalized:
                 raise ValueError(f"unknown Bitget deposit status: {normalized}")
+            if current_deadline() is not None:
+                return status
             if stop_event is None:
-                time.sleep(poll_seconds)
+                budget_sleep(poll_seconds)
             else:
                 stop_event.wait(poll_seconds)
         return None

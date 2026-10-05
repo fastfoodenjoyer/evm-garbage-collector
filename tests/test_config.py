@@ -58,6 +58,21 @@ def _catalog(*networks: Network) -> Catalog:
     )
 
 
+def test_snapshot_accepts_bounded_scan_settings():
+    settings = {"stage_seconds": 25.0, "workers": 16}
+    assert snapshot(_catalog(_network()), ["0x" + "a" * 40], settings)["settings"] == settings
+
+
+@pytest.mark.parametrize("settings", [
+    {"stage_seconds": 31}, {"stage_seconds": 0}, {"stage_seconds": float("nan")},
+    {"stage_seconds": True}, {"workers": 0}, {"workers": 33}, {"workers": 1.5},
+    {"workers": True},
+])
+def test_snapshot_rejects_invalid_stage_settings(settings):
+    with pytest.raises(ConfigError):
+        snapshot(_catalog(_network()), ["0x" + "a" * 40], settings)
+
+
 def test_load_wallets_strips_blanks_and_normalizes_duplicate_addresses(tmp_path: Path) -> None:
     path = tmp_path / "wallets.txt"
     path.write_text(

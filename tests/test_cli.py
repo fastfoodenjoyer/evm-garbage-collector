@@ -434,6 +434,9 @@ def test_quote_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeypat
     ) == 0
 
     assert calls["max_route_loss_pct"] == Decimal("7.25")
+    assert calls["stage_seconds"] == 30
+    assert calls["workers"] == 4
+    assert calls["target_workers"] == 8
     capsys.readouterr()
 
 
@@ -480,4 +483,14 @@ def test_execute_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeyp
 
     assert calls["max_route_loss_pct"] == Decimal("8.5")
     assert calls["journal_path"] == tmp_path / "inventory.sqlite"
+    assert calls["stage_seconds"] == 30
     capsys.readouterr()
+
+
+@pytest.mark.parametrize("budget", ["31", "0", "-1", "nan", "inf"])
+def test_scan_rejects_invalid_stage_budget_before_network_or_database(tmp_path, budget):
+    db = tmp_path / 'inventory.sqlite'
+    with pytest.raises(SystemExit) as exc:
+        main(['scan', '--wallets', 'unused', '--db', str(db), '--stage-seconds', budget])
+    assert exc.value.code == 2
+    assert not db.exists()

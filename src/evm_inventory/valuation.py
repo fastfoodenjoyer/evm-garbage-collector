@@ -17,6 +17,8 @@ class QuotePrice:
     asset: AssetIdentity
     usd_per_token: Decimal | str | None
     observed_at: datetime
+    source: str = "quote"
+    reported_usd_per_token: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.asset, AssetIdentity):

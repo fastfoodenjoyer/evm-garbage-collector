@@ -8,9 +8,12 @@ import time
 import traceback
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from threading import Lock
 from urllib.parse import urlsplit
 
 import httpx
+
+from .stages import budget_sleep, check_deadline, http_request
 
 
 class RequestError(Exception):
@@ -43,6 +46,7 @@ class Transport:
         self.sleep = sleep
         self.clock = clock
         self.last = {}
+        self._pace_lock = Lock()
 
     def close(self):
         self.client.close()
@@ -58,12 +62,15 @@ class Transport:
         except ValueError:
             raise RequestError("invalid_rpc_url") from None
         for attempt in range(3):
-            delay = self.interval - (self.clock() - self.last.get(host, float("-inf")))
+            check_deadline()
+            with self._pace_lock:
+                stamp = self.clock()
+                delay = max(0, self.interval - (stamp - self.last.get(host, float('-inf'))))
+                self.last[host] = stamp + delay
             if delay > 0:
-                self.sleep(delay)
-            self.last[host] = self.clock()
+                budget_sleep(delay, sleep=self.sleep)
             try:
-                response = self.client.post(url, json=payload)
+                response = http_request(self.client, 'post', url, json=payload)
             except httpx.InvalidURL as exc:
                 diagnostic["attempts"].append({
                     "attempt": attempt + 1, "exception_type": type(exc).__name__,
@@ -124,5 +131,5 @@ class Transport:
                 raise RequestError(code, time.time() + wait, diagnostic=diagnostic)
             if attempt == 2:
                 raise RequestError(code, diagnostic=diagnostic)
-            self.sleep(wait)
+            budget_sleep(wait, sleep=self.sleep)
         raise AssertionError("unreachable")

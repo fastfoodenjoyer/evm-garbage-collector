@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from threading import Lock
 
+from .diagnostics import redact_text
 from .executor import approve_transaction, token_allowance
 from .fee_planner import FeePlanner, native_asset_identity
 from .lifi import LifiClient, LifiRoute, TransactionRequest
 from .models import AssetIdentity
 from .rpc import RpcReader, quantity
+from .stages import StageDeadlineExceeded
 from .valuation import FeeQuote, QuotePrice
 
 _TRANSFER_SELECTOR = "a9059cbb"
@@ -28,6 +31,16 @@ class PlannerGasEstimator:
         self.rpc = rpc
         self.rpc_urls = rpc_urls
         self.price_client = price_client
+        self.diagnostics: list[dict] = []
+        self._diagnostic_lock = Lock()
+
+    def _failure(self, route, phase: str, error: Exception) -> None:
+        with self._diagnostic_lock:
+            self.diagnostics.append({
+                "route_id": route.route_id if route else None,
+                "phase": phase, "error": type(error).__name__,
+                "detail": redact_text(str(error))[:500],
+            })
 
     def __call__(
         self,
@@ -49,7 +62,10 @@ class PlannerGasEstimator:
             return self.estimate_prepared_route(
                 route=route, wallet=wallet, prepared_transactions=prepared
             )
-        except Exception:
+        except StageDeadlineExceeded:
+            raise
+        except Exception as error:
+            self._failure(route, "prepare_transactions", error)
             # Gas evidence is an admission requirement; an RPC/API failure
             # rejects this candidate instead of stopping the whole plan.
             return None
@@ -69,9 +85,13 @@ class PlannerGasEstimator:
             )
             approval_quotes = self._estimate_approvals(route, wallet)
             if transaction_quotes is None or approval_quotes is None:
+                self._failure(route, "estimate", ValueError("incomplete route gas metadata"))
                 return None
             return (*transaction_quotes, *approval_quotes)
-        except Exception:
+        except StageDeadlineExceeded:
+            raise
+        except Exception as error:
+            self._failure(route, "estimate", error)
             return None
 
     def _estimate_route_transactions(
@@ -137,8 +157,6 @@ class PlannerGasEstimator:
         self, route: LifiRoute, wallet: str
     ) -> tuple[FeeQuote, ...] | None:
         if route.evidence is None:
-            return None
-        if any(_nested_approval(step) for step in route.raw_steps):
             return None
         result: list[FeeQuote] = []
         top_level = tuple(step for step in route.evidence.steps if not step.is_substep)
@@ -214,7 +232,9 @@ class PlannerGasEstimator:
         if evidence.asset != native or evidence.price_usd is None:
             raise ValueError("native gas-token price is unavailable")
         observed = _timestamp(evidence.timestamp)
-        price = QuotePrice(native, evidence.price_usd, observed)
+        price = QuotePrice(
+            native, evidence.price_usd, observed, evidence.source, evidence.reported_price_usd
+        )
         return FeeQuote(planned.max_total_fee_wei, price)
 
     def _url(self, chain_id: int) -> str:

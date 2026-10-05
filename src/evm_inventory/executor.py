@@ -15,6 +15,7 @@ from eth_utils import keccak, to_checksum_address
 from .lifi import TransactionRequest
 from .models import ConfigError
 from .rpc import RpcError, quantity, uint256
+from .stages import StageDeadlineExceeded, budget_sleep, check_deadline, current_deadline
 from .transport import Transport
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -76,20 +77,33 @@ class ExecutionRpc:
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
         )
         if response.get("id") != request_id or response.get("jsonrpc") != "2.0":
-            raise RpcError("invalid_rpc_envelope", diagnostic={
-                "method": method, "expected_id": request_id, "response": response,
-            })
+            raise RpcError(
+                "invalid_rpc_envelope",
+                diagnostic={
+                    "method": method,
+                    "expected_id": request_id,
+                    "response": response,
+                },
+            )
         if response.get("error"):
-            raise RpcError("rpc_error", diagnostic={
-                "method": method,
-                "params": ("[SIGNED_TRANSACTION]" if method == "eth_sendRawTransaction"
-                           else params),
-                "provider_error": response["error"],
-            })
+            raise RpcError(
+                "rpc_error",
+                diagnostic={
+                    "method": method,
+                    "params": (
+                        "[SIGNED_TRANSACTION]" if method == "eth_sendRawTransaction" else params
+                    ),
+                    "provider_error": response["error"],
+                },
+            )
         if "result" not in response:
-            raise RpcError("missing_rpc_result", diagnostic={
-                "method": method, "response": response,
-            })
+            raise RpcError(
+                "missing_rpc_result",
+                diagnostic={
+                    "method": method,
+                    "response": response,
+                },
+            )
         return response["result"]
 
 
@@ -124,10 +138,11 @@ def require_ethereum_gas_below_limit(
     gas_limit_wei = _ethereum_gas_price_limit_wei()
     try:
         endpoint_chain_id = quantity(broadcaster.call(url, "eth_chainId", []))
+    except StageDeadlineExceeded:
+        raise
     except Exception as exc:
         raise EthereumGasDeferred(
-            "ethereum_gas_deferred:source=chain_probe_error;"
-            f"threshold_wei={gas_limit_wei}"
+            f"ethereum_gas_deferred:source=chain_probe_error;threshold_wei={gas_limit_wei}"
         ) from exc
     if endpoint_chain_id != 1:
         raise EthereumGasDeferred(
@@ -136,10 +151,11 @@ def require_ethereum_gas_below_limit(
         )
     try:
         rpc_gas_price = quantity(broadcaster.call(url, "eth_gasPrice", []))
+    except StageDeadlineExceeded:
+        raise
     except Exception as exc:
         raise EthereumGasDeferred(
-            "ethereum_gas_deferred:source=rpc_probe_error;"
-            f"threshold_wei={gas_limit_wei}"
+            f"ethereum_gas_deferred:source=rpc_probe_error;threshold_wei={gas_limit_wei}"
         ) from exc
     if rpc_gas_price >= gas_limit_wei:
         raise EthereumGasDeferred(
@@ -190,19 +206,23 @@ def require_ethereum_planned_gas_price_valid(request: TransactionRequest) -> Non
     if request.chain_id != 1:
         return
     if (
-        (request.gas_price_wei is not None and (
-            isinstance(request.gas_price_wei, bool)
-            or not isinstance(request.gas_price_wei, int)
-            or request.gas_price_wei < 0
-        ))
-        or (request.max_fee_per_gas_wei is None) != (
-            request.max_priority_fee_per_gas_wei is None
-        )
-        or (request.max_fee_per_gas_wei is not None and (
+        (
             request.gas_price_wei is not None
-            or request.max_fee_per_gas_wei < request.max_priority_fee_per_gas_wei
-            or request.max_priority_fee_per_gas_wei < 0
-        ))
+            and (
+                isinstance(request.gas_price_wei, bool)
+                or not isinstance(request.gas_price_wei, int)
+                or request.gas_price_wei < 0
+            )
+        )
+        or (request.max_fee_per_gas_wei is None) != (request.max_priority_fee_per_gas_wei is None)
+        or (
+            request.max_fee_per_gas_wei is not None
+            and (
+                request.gas_price_wei is not None
+                or request.max_fee_per_gas_wei < request.max_priority_fee_per_gas_wei
+                or request.max_priority_fee_per_gas_wei < 0
+            )
+        )
         or (request.max_fee_per_gas_wei is None and request.gas_price_wei is None)
     ):
         raise EthereumGasDeferred(
@@ -369,6 +389,7 @@ def wait_for_receipt(
 ) -> dict:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        check_deadline()
         receipt = broadcaster.call(url, "eth_getTransactionReceipt", [tx_hash])
         if receipt is not None:
             if not isinstance(receipt, dict):
@@ -376,5 +397,7 @@ def wait_for_receipt(
             if quantity(receipt.get("status")) != 1:
                 raise ValueError("transaction reverted")
             return receipt
-        time.sleep(poll_seconds)
+        if current_deadline() is not None:
+            raise StageDeadlineExceeded(f"receipt_pending:{tx_hash}")
+        budget_sleep(poll_seconds)
     raise TimeoutError("transaction receipt timeout")

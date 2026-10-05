@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -25,6 +26,45 @@ WORKSHEET_HEADERS = (
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _ORDINAL_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+DEPOSIT_ADDRESS_WARNING = (
+    "ОБЯЗАТЕЛЬНО ПРОВЕРЬТЕ ЧТО ЗА АДРЕСА ДЕПОЗИТОВ ВЫ ТУДА ВСТАВИЛИ. "
+    "Публичный API Bitget не предоставляет полный список дополнительных депозитных адресов. "
+    "Код доверяет адресам из таблицы и не проверяет их принадлежность Bitget. "
+    "За адреса и выбранные сети отвечает тот, кто заполнил таблицу."
+)
+
+
+def require_trusted_deposit_addresses(trusted: bool) -> None:
+    """Require explicit operator acknowledgement before executing deposit routes."""
+    if not trusted:
+        raise ConfigError(
+            DEPOSIT_ADDRESS_WARNING
+            + " Запуск заблокирован. После проверки адресов добавьте --trust-deposit-addresses."
+        )
+
+
+def require_unique_deposit_addresses(
+    addresses: Iterable[tuple[int, object]], *, allow_duplicates: bool = False
+) -> None:
+    """Check the full table, including rows outside the selected wallet range."""
+    if allow_duplicates:
+        return
+    rows_by_address: dict[str, list[int]] = {}
+    for row_number, value in addresses:
+        if isinstance(value, str) and value.strip():
+            rows_by_address.setdefault(value.strip().lower(), []).append(row_number)
+    duplicates = [
+        f"deposit address {address}: Excel rows {', '.join(map(str, rows))}"
+        for address, rows in rows_by_address.items()
+        if len(rows) > 1
+    ]
+    if duplicates:
+        raise ConfigError(
+            "duplicate Bitget deposit addresses: "
+            + "; ".join(duplicates)
+            + ". To explicitly allow duplicates, use --allow-duplicate-deposit-addresses."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +181,8 @@ def load_wallet_workbook(
     require_deposit_address: bool = True,
     require_rabby_proxy: bool = False,
     ordinal_ranges: tuple[tuple[int, int], ...] | None = None,
+    allow_duplicate_deposit_addresses: bool = False,
+    check_deposit_uniqueness: bool | None = None,
 ) -> tuple[WalletWorkbookRow, ...]:
     """Read and validate operator input without persisting private keys."""
 
@@ -157,6 +199,18 @@ def load_wallet_workbook(
     ):
         raise ConfigError("workbook headers do not match the wallet template")
     has_proxy_column = headers == WORKSHEET_HEADERS
+    if check_deposit_uniqueness is True or (
+        check_deposit_uniqueness is None and require_deposit_address
+    ):
+        require_unique_deposit_addresses(
+            (
+                (number, value[0])
+                for number, value in enumerate(
+                    sheet.iter_rows(min_row=2, min_col=4, max_col=4, values_only=True), start=2
+                )
+            ),
+            allow_duplicates=allow_duplicate_deposit_addresses,
+        )
 
     rows: list[WalletWorkbookRow] = []
     seen_ordinals: set[int] = set()
@@ -224,10 +278,14 @@ def load_wallet_workbook(
     return tuple(rows)
 
 
-def dry_run_workbook(path: Path) -> dict[str, int]:
+def dry_run_workbook(
+    path: Path, *, allow_duplicate_deposit_addresses: bool = False
+) -> dict[str, int]:
     """Validate all inputs, then atomically write placeholder plans to the workbook."""
 
-    rows = load_wallet_workbook(path)
+    rows = load_wallet_workbook(
+        path, allow_duplicate_deposit_addresses=allow_duplicate_deposit_addresses
+    )
     workbook = load_workbook(path)
     sheet = workbook[WORKSHEET_NAME]
     for row in rows:

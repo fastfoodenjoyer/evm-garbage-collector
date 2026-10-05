@@ -335,7 +335,11 @@ def candidate_from_route(
         if asset != quote.asset:
             return _rejected(**base, reason="price_identity_mismatch")
         previous = price_book.get(asset)
-        if previous is not None and previous.observed_at == quote.observed_at:
+        if quote.source.startswith("defillama:"):
+            # Use a fresh independently checked price instead of a known
+            # anomalous LI.FI value, regardless of retrieval-time ordering.
+            price_book[asset] = quote
+        elif previous is not None and previous.observed_at == quote.observed_at:
             if previous.usd_per_token != quote.usd_per_token:
                 return _rejected(**base, reason="conflicting_price_evidence")
         elif previous is None or quote.observed_at > previous.observed_at:
@@ -553,7 +557,10 @@ def _quote_for_gas(
 
 
 def _price_from_lifi_evidence(item: LifiPriceEvidence) -> QuotePrice:
-    return QuotePrice(item.asset, item.price_usd, _parse_timestamp(item.timestamp))
+    return QuotePrice(
+        item.asset, item.price_usd, _parse_timestamp(item.timestamp),
+        item.source, item.reported_price_usd,
+    )
 
 
 def _parse_timestamp(value: str) -> datetime:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from decimal import Decimal, InvalidOperation, localcontext
@@ -35,7 +36,10 @@ _GROUP_TRANSITIONS = {
         "manual_review_group_halted",
     },
     "deposit_pending": {
-        "active", "completed", "deposit_pending", "manual_review_group_halted",
+        "active",
+        "completed",
+        "deposit_pending",
+        "manual_review_group_halted",
     },
     "gas_deferred": {"active", "gas_deferred"},
     "completed": set(),
@@ -77,6 +81,7 @@ _POSITION_TRANSITIONS = {
         "manual_review_group_threshold_exceeded",
     },
     "bridge_submitted": {
+        "deposit_pending",
         "bridge_timeout",
         "completed",
         "manual_review_after_swap",
@@ -100,8 +105,11 @@ _POSITION_TRANSITIONS = {
     },
     "deposit_pending": {"completed", "manual_review"},
     "gas_deferred": {
-        "direct_deposit_submitted", "bridge_submitted", "swap_submitted",
-        "manual_review", "gas_deferred",
+        "direct_deposit_submitted",
+        "bridge_submitted",
+        "swap_submitted",
+        "manual_review",
+        "gas_deferred",
     },
     "completed": set(),
     "manual_review_after_swap": set(),
@@ -112,7 +120,11 @@ _POSITION_TRANSITIONS = {
 _STEP_TRANSITIONS = {
     "planned": {"submitted", "failed", "manual_review"},
     "submitted": {
-        "confirmed", "deposit_seen", "reverted", "failed", "bridge_timeout",
+        "confirmed",
+        "deposit_seen",
+        "reverted",
+        "failed",
+        "bridge_timeout",
         "manual_review",
     },
     "deposit_seen": {"credited", "manual_review", "failed"},
@@ -131,12 +143,18 @@ _STEP_TRANSITIONS = {
 class Journal:
     def __init__(self, path: Path, *, readonly: bool = False):
         self.connection = (
-            sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-            if readonly else sqlite3.connect(path)
+            sqlite3.connect(f"file:{path}?mode=ro", uri=True) if readonly else sqlite3.connect(path)
         )
         self.connection.row_factory = sqlite3.Row
         if readonly:
             return
+        self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS route_checkpoints (
+                position_id INTEGER NOT NULL, checkpoint_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (position_id, checkpoint_key)
+            )
+        """)
         self.connection.execute("""
             CREATE TABLE IF NOT EXISTS operations (
               id INTEGER PRIMARY KEY, wallet TEXT NOT NULL, action TEXT NOT NULL,
@@ -146,9 +164,7 @@ class Journal:
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(operations)")
-        }
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(operations)")}
         if "reason" not in columns:
             self.connection.execute("ALTER TABLE operations ADD COLUMN reason TEXT")
         if "approval_tx_hash" not in columns:
@@ -247,15 +263,10 @@ class Journal:
         self.connection.commit()
 
     def _migrate_columns(self, table: str, columns: dict[str, str]) -> None:
-        existing = {
-            row["name"]
-            for row in self.connection.execute(f"PRAGMA table_info({table})")
-        }
+        existing = {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")}
         for name, declaration in columns.items():
             if name not in existing:
-                self.connection.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
-                )
+                self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def __enter__(self):
         return self
@@ -265,9 +276,8 @@ class Journal:
 
     def has_route_tables(self) -> bool:
         names = {
-            row[0] for row in self.connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            row[0]
+            for row in self.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         return {"route_groups", "route_positions", "route_steps", "route_events"} <= names
 
@@ -293,7 +303,8 @@ class Journal:
         self._update(
             operation_id,
             state,
-            status=status, reason=reason,
+            status=status,
+            reason=reason,
             unless_states=("deferred", "approval_completed_route_deferred"),
         )
 
@@ -403,9 +414,8 @@ class Journal:
         if len(rows) != 1 or rows[0]["position_key"] != position_key:
             return False
         position = rows[0]
-        if (
-            position["state"] != "manual_review"
-            or not str(position["reason"] or "").startswith("ethereum_gas_deferred:")
+        if position["state"] != "manual_review" or not str(position["reason"] or "").startswith(
+            "ethereum_gas_deferred:"
         ):
             return False
         broadcast = self.connection.execute(
@@ -481,9 +491,7 @@ class Journal:
             )
         return format(total, "f")
 
-    def record_group_state(
-        self, group_id: int, state: str, *, reason: str | None = None
-    ) -> None:
+    def record_group_state(self, group_id: int, state: str, *, reason: str | None = None) -> None:
         group = self.group(group_id)
         if state not in _GROUP_STATES:
             raise ValueError("invalid route group state")
@@ -792,6 +800,35 @@ class Journal:
         )
         self.connection.commit()
 
+    def save_checkpoint(self, position_id: int, key: str, payload: dict) -> None:
+        from .route_checkpoints import encode
+
+        self.connection.execute(
+            "INSERT INTO route_checkpoints VALUES (?, ?, ?) "
+            "ON CONFLICT(position_id, checkpoint_key) DO UPDATE SET "
+            "payload_json=excluded.payload_json",
+            (position_id, key, json.dumps(encode(payload), sort_keys=True)),
+        )
+        self.connection.commit()
+
+    def checkpoint(self, position_id: int, key: str) -> dict | None:
+        from .route_checkpoints import decode
+
+        row = self.connection.execute(
+            "SELECT payload_json FROM route_checkpoints WHERE position_id=? AND checkpoint_key=?",
+            (position_id, key),
+        ).fetchone()
+        return decode(json.loads(row["payload_json"])) if row else None
+
+    def has_broadcast(self, position_id: int) -> bool:
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM route_steps WHERE position_id=? AND tx_hash IS NOT NULL LIMIT 1",
+                (position_id,),
+            ).fetchone()
+            is not None
+        )
+
     def record_step_state(self, step_id: int, state: str) -> None:
         self._transition_step(step_id, state)
         self.connection.commit()
@@ -835,10 +872,7 @@ class Journal:
             """SELECT reason, COUNT(*) AS count FROM route_positions
                WHERE reason IS NOT NULL GROUP BY reason ORDER BY reason"""
         ).fetchall()
-        return [
-            {"reason": str(row["reason"]), "count": int(row["count"])}
-            for row in rows
-        ]
+        return [{"reason": str(row["reason"]), "count": int(row["count"])} for row in rows]
 
     def _update(
         self,
@@ -859,7 +893,12 @@ class Journal:
             "updated_at=CURRENT_TIMESTAMP WHERE id=?"
         )
         parameters: tuple[str | int | None, ...] = (
-            state, tx_hash, approval_tx_hash, status, reason, operation_id
+            state,
+            tx_hash,
+            approval_tx_hash,
+            status,
+            reason,
+            operation_id,
         )
         if unless_states:
             placeholders = ", ".join("?" for _ in unless_states)

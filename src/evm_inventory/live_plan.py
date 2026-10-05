@@ -7,7 +7,8 @@ import json
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -26,9 +27,11 @@ from .consolidation import (
     select_candidate,
 )
 from .fee_planner import native_asset_identity
-from .lifi import LifiClient, LifiPriceEvidence, LifiRoute, LifiRouteRequest
+from .lifi import LifiPriceEvidence, LifiRoute, LifiRouteRequest
 from .models import AssetIdentity, ConfigError
 from .planner_gas import PlannerGasEstimator
+from .quote_parallel import CachedQuoteClient, complete_parallel
+from .stages import Deadline, StageDeadlineExceeded, check_deadline, deadline_scope, run_parallel
 from .valuation import FeeQuote, QuotePrice, raw_to_decimal
 
 _PRICE_MAX_AGE = timedelta(minutes=5)
@@ -53,7 +56,7 @@ class _Input:
     asset: AssetIdentity
     action: str
     target: BitgetDepositTarget | None
-    deposit_address: str
+    deposit_address: str | None
     source_price: QuotePrice | None
     source_usd: Decimal | None
 
@@ -77,28 +80,39 @@ def create_live_plan(
     wallet_addresses: set[str] | None = None,
     now_ms: Callable[[], int] | None = None,
     gas_estimator: GasEstimator | None = None,
+    stage_seconds: float = 30,
+    workers: int = 16,
+    target_workers: int = 8,
 ) -> dict:
     """Quote exact enabled Bitget targets and enforce loss per wallet/network."""
 
     clock_ms = now_ms or _utc_now_ms
     quoted_at = int(clock_ms())
+
     def valuation_now() -> datetime:
         return datetime.fromtimestamp(clock_ms() / 1000, UTC)
+
     limit = _loss_limit(max_route_loss_pct)
     floor = _quote_floor(quote_floor)
     actions = _actions(allowlist_path)
-    enabled_targets = tuple(
-        sorted(
-            targets if targets is not None else deposit_targets(fetch_public_coins()),
-            key=lambda item: (item.chain_id, item.asset_id, item.coin, item.chain),
-        )
-    )
-    quote_client = client or LifiClient(httpx.Client(timeout=30))
+    if isinstance(stage_seconds, bool) or not 0 < stage_seconds <= 30:
+        raise ConfigError("quote stage_seconds must be greater than zero and at most 30")
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or not 1 <= workers <= 32
+        or isinstance(target_workers, bool)
+        or not isinstance(target_workers, int)
+        or not 1 <= target_workers <= 8
+    ):
+        raise ConfigError("quote workers must be 1..32 and target_workers 1..8")
+    enabled_targets = targets
+    if client is None:
+        raise ConfigError("LI.FI client with wallet proxy is required")
+    quote_client = client
     addresses = {wallet.lower(): address for wallet, address in deposit_addresses.items()}
     selected_wallets = (
-        {wallet.lower() for wallet in wallet_addresses}
-        if wallet_addresses is not None
-        else None
+        {wallet.lower() for wallet in wallet_addresses} if wallet_addresses is not None else None
     )
 
     excluded_entries: list[dict] = []
@@ -121,60 +135,96 @@ def create_live_plan(
             if action == "review":
                 excluded_entries.append(_manual(base, "policy_review"))
                 continue
-            price = _token_price(quote_client, asset)
-            source_usd = _usd_value(
-                int(base["raw_balance"]), asset, price, valuation_now()
-            )
-            if source_usd is not None and source_usd < floor:
-                excluded_entries.append({**base, "status": "dust"})
-                continue
             address = addresses.get(base["wallet"])
-            if address is None:
-                excluded_entries.append(
-                    {**base, "status": "missing_deposit_address"}
-                )
-                continue
-            target = _target(asset, enabled_targets)
-            if target is not None and int(base["raw_balance"]) < target.minimum_raw:
-                excluded_entries.append(
-                    _manual(base, "direct_deposit_below_minimum", target)
-                )
-                continue
-
-            executable.append(
-                _Input(
-                    base=base,
-                    asset=asset,
-                    action=action,
-                    target=target,
-                    deposit_address=address,
-                    source_price=price,
-                    source_usd=source_usd,
-                )
-            )
+            executable.append(_Input(base, asset, action, None, address, None, None))
 
     groups: dict[tuple[str, int], list[_Input]] = defaultdict(list)
     for item in executable:
         groups[(item.base["wallet"], item.asset.chain_id)].append(item)
 
     entries = list(excluded_entries)
-    for group_key in sorted(groups):
-        group_items = sorted(
-            groups[group_key],
-            key=lambda item: (item.asset.contract_address, item.asset.decimals),
-        )
-        entries.extend(
-            _plan_group(
-                group_key,
-                group_items,
-                enabled_targets,
-                quote_client,
-                limit,
-                valuation_now,
-                gas_estimator,
-                quoted_at,
+    wallets = sorted({wallet for wallet, _chain in groups})
+    for wallet in wallets:
+        deadline = Deadline(seconds=stage_seconds, label="quote")
+        select_client = getattr(quote_client, "for_wallet", None)
+        scoped_client = select_client(wallet) if select_client is not None else quote_client
+        wallet_client = CachedQuoteClient(scoped_client, workers=target_workers)
+        wallet_gas_estimator = gas_estimator
+        if isinstance(gas_estimator, PlannerGasEstimator):
+            wallet_gas_estimator = copy(gas_estimator)
+            wallet_gas_estimator.price_client = (
+                wallet_client
+                if gas_estimator.price_client is quote_client
+                else CachedQuoteClient(gas_estimator.price_client, workers=target_workers)
             )
-        )
+        wallet_groups = [
+            (
+                key,
+                sorted(
+                    groups[key], key=lambda item: (item.asset.contract_address, item.asset.decimals)
+                ),
+            )
+            for key in sorted(groups)
+            if key[0] == wallet
+        ]
+        with deadline_scope(deadline):
+            if enabled_targets is None:
+                catalog = run_parallel(
+                    lambda _unused: deposit_targets(fetch_public_coins()),
+                    (None,),
+                    deadline=deadline,
+                    workers=1,
+                )
+                if catalog.pending or catalog.errors:
+                    reason = (
+                        "stage_deadline_exceeded"
+                        if catalog.pending
+                        or any(
+                            isinstance(error, StageDeadlineExceeded)
+                            for error in catalog.errors.values()
+                        )
+                        else "target_catalog_unavailable"
+                    )
+                    entries.extend(
+                        _manual(item.base, reason)
+                        for _key, items in wallet_groups
+                        for item in items
+                    )
+                    continue
+                enabled_targets = tuple(catalog.completed[0])
+            wallet_targets = tuple(
+                sorted(
+                    enabled_targets,
+                    key=lambda item: (item.chain_id, item.asset_id, item.coin, item.chain),
+                )
+            )
+
+            def plan_group(job):
+                group_key, group_items = job
+                return _prepare_group(
+                    group_key,
+                    group_items,
+                    wallet_targets,
+                    wallet_client,
+                    limit,
+                    floor,
+                    valuation_now,
+                    wallet_gas_estimator,
+                    quoted_at,
+                )
+
+            results = run_parallel(plan_group, wallet_groups, deadline=deadline, workers=workers)
+            for index, (_key, group_items) in enumerate(wallet_groups):
+                if index in results.completed:
+                    entries.extend(results.completed[index])
+                else:
+                    error = results.errors.get(index)
+                    reason = (
+                        "stage_deadline_exceeded"
+                        if index in results.pending or isinstance(error, StageDeadlineExceeded)
+                        else "quote_group_failed"
+                    )
+                    entries.extend(_manual(item.base, reason) for item in group_items)
 
     for entry in entries:
         entry["quoted_at"] = quoted_at
@@ -198,8 +248,49 @@ def create_live_plan(
             "requires_fresh_quote_and_balance_observation": True,
         },
         "summary": dict(sorted(counts.items())),
+        "gas_diagnostics": list(getattr(gas_estimator, "diagnostics", ())),
+        "route_diagnostics": list(getattr(quote_client, "route_diagnostics", ())),
         "entries": entries,
     }
+
+
+def _prepare_group(group_key, items, targets, client, limit, floor, now, gas_estimator, quoted_at):
+    prices = complete_parallel(
+        lambda item: _token_price(client, item.asset), items, workers=client.workers
+    )
+    excluded = []
+    prepared = []
+    for item, price in zip(items, prices, strict=True):
+        check_deadline()
+        source_usd = _usd_value(int(item.base["raw_balance"]), item.asset, price, now())
+        price_data = {
+            "source_price": {
+                "asset": _asset_data(item.asset),
+                "price_usd": _decimal(price.usd_per_token),
+                "source": price.source,
+                "reported_price_usd": price.reported_usd_per_token,
+                "observed_at": price.observed_at.isoformat(),
+            } if price is not None else None,
+            "source_usd": _decimal(source_usd),
+            "quote_floor_usd": _decimal(floor),
+        }
+        item = replace(item, base={**item.base, **price_data})
+        if source_usd is not None and source_usd < floor:
+            excluded.append({**item.base, "status": "dust"})
+            continue
+        if item.deposit_address is None:
+            excluded.append({**item.base, "status": "missing_deposit_address"})
+            continue
+        target = _target(item.asset, targets)
+        if target is not None and int(item.base["raw_balance"]) < target.minimum_raw:
+            excluded.append(_manual(item.base, "direct_deposit_below_minimum", target))
+            continue
+        prepared.append(replace(item, target=target, source_price=price, source_usd=source_usd))
+    if prepared:
+        excluded.extend(
+            _plan_group(group_key, prepared, targets, client, limit, now, gas_estimator, quoted_at)
+        )
+    return excluded
 
 
 def _plan_group(
@@ -213,8 +304,18 @@ def _plan_group(
     quoted_at: int,
 ) -> list[dict]:
     choices_by_item: list[tuple[_Input, _RouteChoice | None, ConsolidationCandidate]] = []
+    direct_items = list(items)
+    direct_choices = complete_parallel(
+        lambda item: _route_choices(item, targets, client, limit, now, gas_estimator),
+        direct_items,
+        workers=client.workers,
+    )
+    direct_by_id = {
+        id(item): choices for item, choices in zip(direct_items, direct_choices, strict=True)
+    }
     for item in items:
-        choices, failed = _route_choices(item, targets, client, limit, now, gas_estimator)
+        check_deadline()
+        choices, failed = direct_by_id[id(item)]
         best = select_candidate(choice.candidate for choice in choices)
         if best is None:
             failed_candidate = _best_failed(failed)
@@ -232,6 +333,8 @@ def _plan_group(
                     now=now(),
                     max_price_age=_PRICE_MAX_AGE,
                 )
+                if getattr(client, "route_rate_error", None):
+                    failed_candidate = _with_reason(failed_candidate, "route_api_rate_limited")
             choices_by_item.append((item, None, failed_candidate))
         else:
             selected = next(choice for choice in choices if choice.candidate is best)
@@ -335,36 +438,44 @@ def _route_choices(
 
     routes_by_target: list[_RouteChoice] = []
     failed: list[ConsolidationCandidate] = []
-    if item.asset.is_native or item.base["symbol"].upper() in _STABLE_SYMBOLS:
-        for target in targets:
-            routes = _request_routes(
+
+    def direct_target(target):
+        target_asset = AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target))
+        return [
+            _route_choice(
+                route,
+                item,
+                target,
+                client,
+                now,
+                gas_estimator,
+                expected_source=item.asset,
+                expected_destination=target_asset,
+                expected_amount=int(item.base["raw_balance"]),
+                recipient=item.deposit_address,
+                steps=(("bridge", route),),
+            )
+            for route in _request_routes(
                 client,
                 item.asset,
-                AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target)),
+                target_asset,
                 int(item.base["raw_balance"]),
                 item.base["wallet"],
                 item.deposit_address,
             )
-            for route in routes:
-                choice = _route_choice(
-                    route,
-                    item,
-                    target,
-                    client,
-                    now,
-                    gas_estimator,
-                    expected_source=item.asset,
-                    expected_destination=AssetIdentity(
-                        target.chain_id, target.asset_id, _target_decimals(target)
-                    ),
-                    expected_amount=int(item.base["raw_balance"]),
-                    recipient=item.deposit_address,
-                    steps=(('bridge', route),),
-                )
+        ]
+
+    def collect(function):
+        batches = complete_parallel(function, targets, workers=client.workers)
+        for batch in batches:
+            for choice in batch:
                 if choice.candidate.is_valid:
                     routes_by_target.append(choice)
                 else:
                     failed.append(choice.candidate)
+
+    if item.asset.is_native or item.base["symbol"].upper() in _STABLE_SYMBOLS:
+        collect(direct_target)
         return routes_by_target, failed
 
     native = native_asset_identity(item.asset.chain_id)
@@ -377,40 +488,11 @@ def _route_choices(
         item.base["wallet"],
     )
     if not swap_routes:
-        # Keep target enumeration observable even when LI.FI cannot quote the
-        # preparatory swap. These direct candidates are still validated against
-        # exact source/target identities and may be usable for provider paths
-        # that bridge the token without converting it to native first.
-        for target in targets:
-            target_asset = AssetIdentity(
-                target.chain_id, target.asset_id, _target_decimals(target)
-            )
-            for route in _request_routes(
-                client,
-                item.asset,
-                target_asset,
-                int(item.base["raw_balance"]),
-                item.base["wallet"],
-                item.deposit_address,
-            ):
-                choice = _route_choice(
-                    route,
-                    item,
-                    target,
-                    client,
-                    now,
-                    gas_estimator,
-                    expected_source=item.asset,
-                    expected_destination=target_asset,
-                    expected_amount=int(item.base["raw_balance"]),
-                    recipient=item.deposit_address,
-                    steps=(("bridge", route),),
-                )
-                if choice.candidate.is_valid:
-                    routes_by_target.append(choice)
-                else:
-                    failed.append(choice.candidate)
+        # Enumerate every enabled target even if the preparatory native swap
+        # cannot be quoted; exact source and target checks still apply.
+        collect(direct_target)
     for swap in swap_routes:
+        check_deadline()
         swap_candidate = _route_candidate(
             swap,
             item,
@@ -428,22 +510,22 @@ def _route_choices(
             continue
         assert swap.evidence is not None
         bridge_amount = swap.evidence.min_output_amount
-        for target in targets:
-            target_asset = AssetIdentity(
-                target.chain_id, target.asset_id, _target_decimals(target)
-            )
-            bridge_routes = _request_routes(
+
+        def bridge_target(target):
+            target_asset = AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target))
+            result = []
+            for bridge in _request_routes(
                 client,
                 native,
                 target_asset,
                 bridge_amount,
                 item.base["wallet"],
                 item.deposit_address,
-            )
-            for bridge in bridge_routes:
-                bridge_candidate = _route_candidate(
+            ):
+                bridge_choice = _route_choice(
                     bridge,
                     item,
+                    target,
                     client,
                     now,
                     gas_estimator,
@@ -451,17 +533,20 @@ def _route_choices(
                     expected_destination=target_asset,
                     expected_amount=bridge_amount,
                     recipient=item.deposit_address,
+                    steps=(("bridge", bridge),),
                     purpose="bridge_after_swap",
                 )
-                candidate = combine_candidates(swap_candidate, bridge_candidate)
-                choice = _RouteChoice(
-                    candidate,
-                    (("swap_to_native", swap), ("bridge", bridge)),
-                    target,
+                candidate = combine_candidates(swap_candidate, bridge_choice.candidate)
+                result.append(
+                    _RouteChoice(
+                        candidate,
+                        (("swap_to_native", swap), ("bridge", bridge)),
+                        target,
+                    )
                 )
-                (routes_by_target if candidate.is_valid else failed).append(
-                    choice if candidate.is_valid else candidate
-                )
+            return result
+
+        collect(bridge_target)
     return routes_by_target, failed
 
 
@@ -513,6 +598,7 @@ def _route_choice(
     expected_amount: int,
     recipient: str,
     steps: tuple[tuple[str, LifiRoute], ...],
+    purpose: str | None = None,
 ) -> _RouteChoice:
     candidate = _route_candidate(
         route,
@@ -524,7 +610,7 @@ def _route_choice(
         expected_destination=expected_destination,
         expected_amount=expected_amount,
         recipient=recipient,
-        purpose=steps[-1][0],
+        purpose=purpose or steps[-1][0],
     )
     if candidate.is_valid and candidate.destination_amount is not None:
         if candidate.destination_amount < target.minimum_raw:
@@ -568,6 +654,21 @@ def _route_candidate(
         gas_complete = False
         priced_estimates = ()
     prices = _route_prices(route)
+    for asset in (expected_source, expected_destination):
+        if asset.chain_id == 1 and asset.decimals == 18 and (
+            asset.is_native
+            or asset.contract_address == "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        ):
+            checked = _token_price(client, asset)
+            if checked is None:
+                return candidate_from_values(
+                    route_ids=(route.route_id,), source_asset=expected_source,
+                    destination_asset=expected_destination, source_amount=expected_amount,
+                    destination_amount=route.to_amount_min, source_price=None,
+                    destination_price=None, wallet_paid_gas=(), gas_estimate_complete=False,
+                    now=now(), max_price_age=_PRICE_MAX_AGE,
+                )
+            prices[asset] = checked
     if item.source_price is not None:
         prices[item.asset] = item.source_price
     for estimate in priced_estimates:
@@ -591,8 +692,7 @@ def _route_candidate(
         prices=prices,
         wallet_paid_gas=priced_estimates,
         replace_route_gas=(
-            isinstance(gas_estimator, PlannerGasEstimator)
-            and bool(priced_estimates)
+            isinstance(gas_estimator, PlannerGasEstimator) and bool(priced_estimates)
         ),
     )
 
@@ -616,6 +716,11 @@ def _request_routes(
     )
     try:
         routes = client.routes(request)
+    except StageDeadlineExceeded:
+        raise
+    except (TimeoutError, httpx.TimeoutException):
+        check_deadline()
+        return ()
     except (OSError, ValueError, httpx.HTTPError):
         return ()
     return tuple(sorted(routes, key=lambda route: route.route_id))
@@ -625,7 +730,14 @@ def _estimate_extra_gas(estimator: GasEstimator | None, **kwargs) -> tuple[FeeQu
     if estimator is None:
         return None
     try:
+        check_deadline()
         result = estimator(**kwargs)
+        check_deadline()
+    except StageDeadlineExceeded:
+        raise
+    except (TimeoutError, httpx.TimeoutException):
+        check_deadline()
+        return None
     except Exception:
         return None
     if result is None:
@@ -689,6 +801,11 @@ def _token_price(client: QuoteClient, asset: AssetIdentity) -> QuotePrice | None
         if not isinstance(evidence, LifiPriceEvidence) or evidence.asset != asset:
             return None
         return _quote_price(evidence)
+    except StageDeadlineExceeded:
+        raise
+    except (TimeoutError, httpx.TimeoutException):
+        check_deadline()
+        return None
     except (OSError, ValueError, TypeError, InvalidOperation, httpx.HTTPError):
         return None
 
@@ -697,7 +814,10 @@ def _quote_price(evidence: LifiPriceEvidence) -> QuotePrice:
     if evidence.price_usd is None:
         raise ValueError("price evidence has no value")
     observed_at = _time(evidence.timestamp)
-    return QuotePrice(evidence.asset, evidence.price_usd, observed_at)
+    return QuotePrice(
+        evidence.asset, evidence.price_usd, observed_at,
+        evidence.source, evidence.reported_price_usd,
+    )
 
 
 def _usd_value(
@@ -708,10 +828,7 @@ def _usd_value(
 ) -> Decimal | None:
     if price is None or price.asset != asset:
         return None
-    if (
-        price.observed_at > now
-        or now - price.observed_at > _PRICE_MAX_AGE
-    ):
+    if price.observed_at > now or now - price.observed_at > _PRICE_MAX_AGE:
         return None
     try:
         token_amount = raw_to_decimal(amount, asset)
@@ -720,9 +837,7 @@ def _usd_value(
         with localcontext() as context:
             context.prec = max(
                 context.prec,
-                len(token_amount.as_tuple().digits)
-                + len(unit_price.as_tuple().digits)
-                + 2,
+                len(token_amount.as_tuple().digits) + len(unit_price.as_tuple().digits) + 2,
             )
             return token_amount * unit_price
     except (ValueError, InvalidOperation):
@@ -757,6 +872,8 @@ def _route_data(route: LifiRoute) -> dict:
                     "asset": _asset_data(price.asset),
                     "price_usd": price.price_usd,
                     "timestamp": price.timestamp,
+                    "source": price.source,
+                    "reported_price_usd": price.reported_price_usd,
                 }
                 for price in evidence.prices
             ],
@@ -785,14 +902,10 @@ def _candidate_data(candidate: ConsolidationCandidate) -> dict:
         "source_asset": _asset_data(candidate.source_asset),
         "destination_asset": _asset_data(candidate.destination_asset),
         "source_amount": (
-            str(candidate.source_amount)
-            if candidate.source_amount is not None
-            else None
+            str(candidate.source_amount) if candidate.source_amount is not None else None
         ),
         "destination_amount": (
-            str(candidate.destination_amount)
-            if candidate.destination_amount is not None
-            else None
+            str(candidate.destination_amount) if candidate.destination_amount is not None else None
         ),
         "reason": candidate.reason,
         "valuation": _valuation_data(candidate),
@@ -815,6 +928,8 @@ def _valuation_data(candidate: ConsolidationCandidate) -> dict:
                 "raw_amount": str(item.raw_amount),
                 "asset": _asset_data(item.price.asset) if item.price else None,
                 "price_usd": _decimal(item.price.usd_per_token) if item.price else None,
+                "source": item.price.source if item.price else None,
+                "reported_price_usd": item.price.reported_usd_per_token if item.price else None,
                 "observed_at": item.price.observed_at.isoformat() if item.price else None,
             }
             for item in candidate.gas_estimates

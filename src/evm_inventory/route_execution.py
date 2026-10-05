@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -57,9 +58,24 @@ from .live_plan import _route_data, _valuation_data
 from .models import AssetIdentity
 from .planner_gas import PlannerGasEstimator
 from .rpc import quantity
+from .stages import (
+    Deadline,
+    StageDeadlineExceeded,
+    budget_sleep,
+    check_deadline,
+    current_deadline,
+    deadline_scope,
+)
 from .transport import Transport
 from .valuation import FeeQuote, QuotePrice, raw_to_decimal
-from .workbook import WalletWorkbookRow
+from .wallet_lifi import WalletLifiClients
+from .weth import WETH_WITHDRAW_TOOL, withdraw_transaction_fields
+from .workbook import (
+    DEPOSIT_ADDRESS_WARNING,
+    WalletWorkbookRow,
+    require_trusted_deposit_addresses,
+    require_unique_deposit_addresses,
+)
 
 _MAX_PRICE_AGE = timedelta(minutes=5)
 _BRIDGE_STATUS_POLL_SECONDS = 15
@@ -95,21 +111,24 @@ class _DepositBackground:
         step = self.journal.latest_step(position_id=position_id, step_key="direct_deposit")
         if step is None or not step["tx_hash"]:
             raise ValueError("seen deposit has no durable transaction hash")
-        started_ms = int(
-            datetime.fromisoformat(step["created_at"])
-            .replace(tzinfo=UTC)
-            .timestamp() * 1000
-        ) - 60_000
+        started_ms = (
+            int(datetime.fromisoformat(step["created_at"]).replace(tzinfo=UTC).timestamp() * 1000)
+            - 60_000
+        )
         future = self.pool.submit(
             self.bitget.wait_for_deposit,
-            tx_hash=step["tx_hash"], started_ms=started_ms,
+            tx_hash=step["tx_hash"],
+            started_ms=started_ms,
             coin=str(entry["target"]["coin"]),
-            chain=str(entry["target"]["chain"]), recipient=recipient,
+            chain=str(entry["target"]["chain"]),
+            recipient=recipient,
             minimum_raw=int(entry["target"]["minimum_raw"]),
             stop_event=self.stop_event,
         )
         self.watches[position_id] = (
-            future, int(position["group_id"]), int(step["id"]),
+            future,
+            int(position["group_id"]),
+            int(step["id"]),
             _exact_money(loss_usd, "pending deposit loss"),
         )
 
@@ -132,9 +151,7 @@ class _DepositBackground:
         step_id = self.watches[position_id][2]
         self.journal.record_step_state(step_id, "manual_review")
         self.journal.record_position_state(position_id, "manual_review", reason=reason)
-        self.journal.record_group_state(
-            group_id, "manual_review_group_halted", reason=reason
-        )
+        self.journal.record_group_state(group_id, "manual_review_group_halted", reason=reason)
         self.stop_event.set()
 
     def finish(self) -> int:
@@ -180,9 +197,7 @@ def _asset_from_data(value: object) -> AssetIdentity:
     if not isinstance(value, dict):
         raise ValueError("route asset identity is missing")
     try:
-        return AssetIdentity(
-            int(value["chain_id"]), str(value["asset_id"]), int(value["decimals"])
-        )
+        return AssetIdentity(int(value["chain_id"]), str(value["asset_id"]), int(value["decimals"]))
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("route asset identity is invalid") from exc
 
@@ -206,14 +221,10 @@ def _rpc_url(rpc_urls: dict[int, str], chain_id: int) -> str:
     return value
 
 
-def _asset_balance(
-    rpc: ExecutionRpc, *, url: str, asset: AssetIdentity, wallet: str
-) -> int:
+def _asset_balance(rpc: ExecutionRpc, *, url: str, asset: AssetIdentity, wallet: str) -> int:
     if asset.is_native:
         return _native_balance(rpc, url=url, wallet=wallet)
-    return _token_balance(
-        rpc, url=url, token=asset.contract_address, wallet=wallet
-    )
+    return _token_balance(rpc, url=url, token=asset.contract_address, wallet=wallet)
 
 
 def _quote_price(jumper: LifiClient, asset: AssetIdentity) -> QuotePrice:
@@ -227,16 +238,16 @@ def _quote_price(jumper: LifiClient, asset: AssetIdentity) -> QuotePrice:
         raise ValueError("requote_required:price_evidence_invalid") from exc
     if observed.tzinfo is None or not price.is_finite() or price <= 0:
         raise ValueError("requote_required:price_evidence_invalid")
-    return QuotePrice(asset, price, observed.astimezone(UTC))
+    return QuotePrice(
+        asset, price, observed.astimezone(UTC), evidence.source, evidence.reported_price_usd
+    )
 
 
 def _token_quote_price(jumper: LifiClient, asset: AssetIdentity) -> QuotePrice:
     return _quote_price(jumper, asset)
 
 
-def _gas_fee_quote(
-    raw_amount: int, native_asset: AssetIdentity, jumper: LifiClient
-) -> FeeQuote:
+def _gas_fee_quote(raw_amount: int, native_asset: AssetIdentity, jumper: LifiClient) -> FeeQuote:
     return FeeQuote(raw_amount, _quote_price(jumper, native_asset))
 
 
@@ -272,6 +283,8 @@ def _require_live_target(
         raise ValueError("requote_required:live_target_validation_unavailable")
     try:
         live = revalidate(target, recipient=wallet.bitget_deposit_address)
+    except StageDeadlineExceeded:
+        raise
     except Exception as exc:
         raise ValueError("requote_required:live_target_validation_failed") from exc
     if (
@@ -480,9 +493,7 @@ def execute_group_entries(
         )
         for index in range(start, len(entries)):
             target_state = (
-                current_position_state
-                if index == start and current_position_state
-                else state
+                current_position_state if index == start and current_position_state else state
             )
             current = journal.position(positions[index]["id"])
             if current["state"] not in {
@@ -492,13 +503,23 @@ def execute_group_entries(
                 "manual_review_group_threshold_exceeded",
                 "manual_review_group_halted",
             }:
-                journal.record_position_state(
-                    positions[index]["id"], target_state, reason=reason
-                )
+                journal.record_position_state(positions[index]["id"], target_state, reason=reason)
             counts[target_state] = counts.get(target_state, 0) + 1
         journal.record_group_state(group["id"], group_state, reason=reason)
 
+    def yield_stage(position_id: int, exc: StageDeadlineExceeded) -> dict[str, int]:
+        counts["pending" if journal.has_broadcast(position_id) else "deferred"] = 1
+        journal.record_position_state(
+            position_id, journal.position(position_id)["state"], reason=str(exc)
+        )
+        journal.record_group_state(group["id"], "active", reason=str(exc))
+        return counts
+
     for index, entry in enumerate(entries):
+        if current_deadline() is not None and current_deadline().expired:
+            return yield_stage(
+                positions[index]["id"], StageDeadlineExceeded("stage_deadline_exceeded")
+            )
         if before_step is not None:
             before_step()
         position_id = positions[index]["id"]
@@ -522,14 +543,19 @@ def execute_group_entries(
             if position_state == "deposit_pending" or (saved and saved["tx_hash"]):
                 try:
                     result = submit_step(
-                        {**entry, "_journal_position_id": position_id},
+                        {
+                            **(journal.checkpoint(position_id, "direct_prepared") or entry),
+                            "_journal_position_id": position_id,
+                        },
                         {"kind": "direct_deposit"},
                     )
                     if result.get("state") == "deposit_pending":
-                        realized = Decimal(journal.account_position_loss(
-                            position_id,
-                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
-                        ))
+                        realized = Decimal(
+                            journal.account_position_loss(
+                                position_id,
+                                loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
+                            )
+                        )
                         journal.record_position_state(
                             position_id, "deposit_pending", reason=result.get("reason")
                         )
@@ -537,10 +563,12 @@ def execute_group_entries(
                         continue
                     if result.get("state") != "completed":
                         raise ValueError("deposit reconciliation returned no result")
-                    realized = Decimal(journal.account_position_loss(
-                        position_id,
-                        loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
-                    ))
+                    realized = Decimal(
+                        journal.account_position_loss(
+                            position_id,
+                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(entry))),
+                        )
+                    )
                     journal.record_position_state(position_id, "completed")
                     counts["completed"] += 1
                     continue
@@ -550,7 +578,13 @@ def execute_group_entries(
                     counts["manual_review"] += 1
                     halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
                     return counts
+                except StageDeadlineExceeded as exc:
+                    return yield_stage(position_id, exc)
                 except Exception as exc:
+                    if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
+                        return yield_stage(
+                            position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
+                        )
                     journal.record_position_state(
                         position_id, "deposit_pending", reason=_execution_reason(exc)
                     )
@@ -558,27 +592,33 @@ def execute_group_entries(
                     journal.record_group_state(group["id"], "deposit_pending")
                     return counts
         try:
-            fresh = preflight(entry)
+            saved_preflight = journal.checkpoint(position_id, "prepared")
+            if saved_preflight is not None and journal.has_broadcast(position_id):
+                fresh = saved_preflight
+            else:
+                fresh = preflight(entry)
             if not isinstance(fresh, dict):
                 raise ValueError("route preflight returned no fresh plan")
             current_loss = _entry_loss(fresh)
-            future_loss = _exact_sum(
-                _entry_loss(item) for item in entries[index + 1 :]
-            )
+            future_loss = _exact_sum(_entry_loss(item) for item in entries[index + 1 :])
         except EthereumGasDeferred as exc:
             journal.record_position_state(position_id, "gas_deferred", reason=exc.reason)
             journal.record_group_state(group["id"], "gas_deferred", reason=exc.reason)
             counts["gas_deferred"] += 1
             return counts
+        except StageDeadlineExceeded as exc:
+            return yield_stage(position_id, exc)
         except Exception as exc:
+            if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
+                return yield_stage(
+                    position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
+                )
             reason = _execution_reason(exc)
             journal.record_position_state(position_id, "manual_review", reason=reason)
             counts["manual_review"] += 1
             halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
             if index + 1 == len(entries):
-                journal.record_group_state(
-                    group["id"], "manual_review_group_halted", reason=reason
-                )
+                journal.record_group_state(group["id"], "manual_review_group_halted", reason=reason)
             return counts
 
         projected = _exact_sum((realized, current_loss, future_loss))
@@ -603,15 +643,11 @@ def execute_group_entries(
             counts["manual_review"] += 1
             halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
             if index + 1 == len(entries):
-                journal.record_group_state(
-                    group["id"], "manual_review_group_halted", reason=reason
-                )
+                journal.record_group_state(group["id"], "manual_review_group_halted", reason=reason)
             return counts
 
         def check_dependent_route_loss(position_loss: Decimal) -> None:
-            dependent_projection = _exact_sum(
-                (realized, position_loss, future_loss)
-            )
+            dependent_projection = _exact_sum((realized, position_loss, future_loss))
             dependent_pct = _exact_percentage(dependent_projection, source_usd)
             journal.record_group_projection(
                 group["id"],
@@ -619,15 +655,16 @@ def execute_group_entries(
                 projected_loss_pct=_decimal_string(dependent_pct),
             )
             if dependent_projection > budget_usd:
-                raise GroupLossLimitExceeded(
-                    "loss_threshold_exceeded_after_intermediate_bridge"
-                )
+                raise GroupLossLimitExceeded("loss_threshold_exceeded_after_intermediate_bridge")
 
+        journal.save_checkpoint(position_id, "prepared", fresh)
         first_step = steps[0]
         if first_step.get("kind") == "swap_to_native":
-            journal.record_position_state(position_id, "swap_submitted")
+            saved_swap = journal.checkpoint(position_id, "swap_result")
+            if saved_swap is None:
+                journal.record_position_state(position_id, "swap_submitted")
             try:
-                swap_result = submit_step(
+                swap_result = saved_swap or submit_step(
                     {
                         **fresh,
                         "_journal_position_id": position_id,
@@ -639,19 +676,26 @@ def execute_group_entries(
                     raise ValueError("source swap did not confirm")
                 actual_asset = str(swap_result["actual_asset_id"])
                 actual_balance = _raw_amount(swap_result["actual_balance_raw"])
-                realized = _add_realized(
-                    realized, swap_result.get("realized_loss_usd", "0")
-                )
+                if saved_swap is None:
+                    realized = _add_realized(realized, swap_result.get("realized_loss_usd", "0"))
+                    journal.save_checkpoint(position_id, "swap_result", swap_result)
                 journal.record_group_realized_loss(
                     group["id"], realized_loss_usd=_decimal_string(realized)
                 )
-                journal.record_position_state(
-                    position_id,
-                    "source_asset_converted_bridge_pending",
-                    actual_asset_id=actual_asset,
-                    actual_balance_raw=actual_balance,
-                )
+                if saved_swap is None:
+                    journal.record_position_state(
+                        position_id,
+                        "source_asset_converted_bridge_pending",
+                        actual_asset_id=actual_asset,
+                        actual_balance_raw=actual_balance,
+                    )
+            except StageDeadlineExceeded as exc:
+                return yield_stage(position_id, exc)
             except Exception as exc:
+                if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
+                    return yield_stage(
+                        position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
+                    )
                 reason = _execution_reason(exc)
                 journal.record_position_state(position_id, "manual_review", reason=reason)
                 counts["manual_review"] += 1
@@ -668,21 +712,23 @@ def execute_group_entries(
             try:
                 if requote_after_swap is None or original_bridge is None:
                     raise ValueError("post-swap bridge re-quote is unavailable")
-                replacement = requote_after_swap(fresh, actual_balance)
+                saved_replacement = journal.checkpoint(position_id, "replacement")
+                replacement = saved_replacement or requote_after_swap(fresh, actual_balance)
                 if not isinstance(replacement, dict):
                     raise ValueError("post-swap bridge re-quote returned no route")
                 old_route = original_bridge.get("route", {})
                 new_route = replacement.get("route", replacement)
                 evidence = new_route.get("evidence", {})
-                journal.record_requote_after_swap(
-                    position_id,
-                    old_route_id=str(old_route["id"]),
-                    old_payload_hash=str(old_route["evidence"]["payload_sha256"]),
-                    new_route_id=str(new_route["id"]),
-                    new_payload_hash=str(evidence["payload_sha256"]),
-                    input_amount_raw=_raw_amount(new_route.get("from_amount")),
-                    actual_asset_id=actual_asset,
-                )
+                if saved_replacement is None:
+                    journal.record_requote_after_swap(
+                        position_id,
+                        old_route_id=str(old_route["id"]),
+                        old_payload_hash=str(old_route["evidence"]["payload_sha256"]),
+                        new_route_id=str(new_route["id"]),
+                        new_payload_hash=str(evidence["payload_sha256"]),
+                        input_amount_raw=_raw_amount(new_route.get("from_amount")),
+                        actual_asset_id=actual_asset,
+                    )
                 next_steps = [first_step, replacement]
                 fresh = {
                     **fresh,
@@ -691,7 +737,14 @@ def execute_group_entries(
                     "_actual_asset_id": actual_asset,
                     "_actual_balance_raw": str(actual_balance),
                 }
-                fresh = preflight(fresh)
+                saved_bridge = journal.checkpoint(position_id, "bridge_prepared")
+                if saved_bridge is not None and journal.has_broadcast(position_id):
+                    fresh = saved_bridge
+                else:
+                    fresh = preflight(fresh)
+                journal.save_checkpoint(position_id, "replacement", replacement)
+                journal.save_checkpoint(position_id, "bridge_prepared", fresh)
+                replacement = fresh["steps"][-1]
                 current_loss = _entry_loss(fresh)
                 projected = _exact_sum((realized, current_loss, future_loss))
                 projected_pct = _exact_percentage(projected, source_usd)
@@ -721,11 +774,11 @@ def execute_group_entries(
                     },
                     replacement,
                 )
+                if bridge_result.get("state") == "deposit_pending":
+                    return yield_stage(position_id, StageDeadlineExceeded("deposit_pending"))
                 if bridge_result.get("state") not in {"confirmed", "completed"}:
                     raise ValueError("replacement bridge did not confirm")
-                realized = _add_realized(
-                    realized, bridge_result.get("realized_loss_usd", "0")
-                )
+                realized = _add_realized(realized, bridge_result.get("realized_loss_usd", "0"))
                 journal.record_group_realized_loss(
                     group["id"], realized_loss_usd=_decimal_string(realized)
                 )
@@ -737,7 +790,13 @@ def execute_group_entries(
                     reason=reason,
                 )
                 return counts
+            except StageDeadlineExceeded as exc:
+                return yield_stage(position_id, exc)
             except Exception as exc:
+                if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
+                    return yield_stage(
+                        position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
+                    )
                 reason = _execution_reason(exc)
                 current = journal.position(position_id)
                 if current["state"] != "manual_review_after_swap":
@@ -763,9 +822,7 @@ def execute_group_entries(
             for step in steps:
                 try:
                     if step.get("kind") == "direct_deposit":
-                        journal.record_position_state(
-                            position_id, "direct_deposit_submitted"
-                        )
+                        journal.record_position_state(position_id, "direct_deposit_submitted")
                     else:
                         journal.record_position_state(position_id, "bridge_submitted")
                     result = submit_step(
@@ -776,14 +833,13 @@ def execute_group_entries(
                         },
                         step,
                     )
-                    if (
-                        step.get("kind") == "direct_deposit"
-                        and result.get("state") == "deposit_pending"
-                    ):
-                        realized = Decimal(journal.account_position_loss(
-                            position_id,
-                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(fresh))),
-                        ))
+                    if result.get("state") == "deposit_pending":
+                        realized = Decimal(
+                            journal.account_position_loss(
+                                position_id,
+                                loss_usd=str(result.get("realized_loss_usd", _entry_loss(fresh))),
+                            )
+                        )
                         journal.record_position_state(
                             position_id, "deposit_pending", reason=result.get("reason")
                         )
@@ -792,14 +848,14 @@ def execute_group_entries(
                     if result.get("state") not in {"confirmed", "completed"}:
                         raise ValueError("route step did not confirm")
                     if step.get("kind") == "direct_deposit":
-                        realized = Decimal(journal.account_position_loss(
-                            position_id,
-                            loss_usd=str(result.get("realized_loss_usd", _entry_loss(fresh))),
-                        ))
-                    else:
-                        realized = _add_realized(
-                            realized, result.get("realized_loss_usd", "0")
+                        realized = Decimal(
+                            journal.account_position_loss(
+                                position_id,
+                                loss_usd=str(result.get("realized_loss_usd", _entry_loss(fresh))),
+                            )
                         )
+                    else:
+                        realized = _add_realized(realized, result.get("realized_loss_usd", "0"))
                         journal.record_group_realized_loss(
                             group["id"], realized_loss_usd=_decimal_string(realized)
                         )
@@ -814,24 +870,16 @@ def execute_group_entries(
                 except EthereumGasDeferred as exc:
                     if step.get("kind") != "direct_deposit":
                         reason = _execution_reason(exc)
-                        journal.record_position_state(
-                            position_id, "manual_review", reason=reason
-                        )
+                        journal.record_position_state(position_id, "manual_review", reason=reason)
                         counts["manual_review"] += 1
-                        halt_remaining(
-                            index + 1, state="manual_review_group_halted", reason=reason
-                        )
+                        halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
                         if index + 1 == len(entries):
                             journal.record_group_state(
                                 group["id"], "manual_review_group_halted", reason=reason
                             )
                         return counts
-                    journal.record_position_state(
-                        position_id, "gas_deferred", reason=exc.reason
-                    )
-                    journal.record_group_state(
-                        group["id"], "gas_deferred", reason=exc.reason
-                    )
+                    journal.record_position_state(position_id, "gas_deferred", reason=exc.reason)
+                    journal.record_group_state(group["id"], "gas_deferred", reason=exc.reason)
                     counts["gas_deferred"] += 1
                     return counts
                 except (DepositNotSeen, DepositSettlementFailed) as exc:
@@ -840,7 +888,13 @@ def execute_group_entries(
                     counts["manual_review"] += 1
                     halt_remaining(index + 1, state="manual_review_group_halted", reason=reason)
                     return counts
+                except StageDeadlineExceeded as exc:
+                    return yield_stage(position_id, exc)
                 except Exception as exc:
+                    if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
+                        return yield_stage(
+                            position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
+                        )
                     reason = _execution_reason(exc)
                     if step.get("kind") == "direct_deposit":
                         saved = journal.latest_step(
@@ -855,9 +909,7 @@ def execute_group_entries(
                                 group["id"], "deposit_pending", reason=reason
                             )
                             return counts
-                    journal.record_position_state(
-                        position_id, "manual_review", reason=reason
-                    )
+                    journal.record_position_state(position_id, "manual_review", reason=reason)
                     counts["manual_review"] += 1
                     halt_remaining(
                         index + 1,
@@ -875,8 +927,7 @@ def execute_group_entries(
             counts["completed"] += 1
 
     has_pending = any(
-        journal.position(position["id"])["state"] == "deposit_pending"
-        for position in positions
+        journal.position(position["id"])["state"] == "deposit_pending" for position in positions
     )
     journal.record_group_state(group["id"], "deposit_pending" if has_pending else "completed")
     return counts
@@ -959,7 +1010,8 @@ def resume_routes_read_only(*, journal_path: Path) -> dict[str, object]:
         "bridge_timeout": step_counts.get("bridge_timeout", 0),
         "manual_review": step_counts.get("manual_review", 0),
         "pending": sum(
-            count for state, count in step_counts.items()
+            count
+            for state, count in step_counts.items()
             if state not in {"bridge_timeout", "manual_review", "credited", "completed"}
         ),
     }
@@ -972,8 +1024,8 @@ def execute_entries(
     rpc_urls: dict[int, str],
     journal_path: Path,
     execute: bool,
-    delay_min_seconds: int = 1800,
-    delay_max_seconds: int = 10800,
+    delay_min_seconds: int = 0,
+    delay_max_seconds: int = 0,
     sleep=time.sleep,
     rng: random.Random | None = None,
     wallet_batches: tuple[tuple[str, ...], ...] | None = None,
@@ -982,15 +1034,29 @@ def execute_entries(
     preflight_entry: Callable[[dict], dict] | None = None,
     submit_route_step: Callable[[dict, dict], dict] | None = None,
     requote_bridge: Callable[[dict, int], dict] | None = None,
+    stage_seconds: float = 30,
+    allow_duplicate_deposit_addresses: bool = False,
+    trust_deposit_addresses: bool = False,
 ) -> dict[str, int]:
     """Execute one wallet at a time; refuses unless the caller set ``execute=True``."""
 
+    require_trusted_deposit_addresses(trust_deposit_addresses)
     if not execute:
         raise ValueError("refusing to broadcast without --execute")
+    print(DEPOSIT_ADDRESS_WARNING, file=sys.stderr, flush=True)
+    if allow_duplicate_deposit_addresses:
+        print(
+            "Проверка уникальности депозитных адресов отключена явным флагом.",
+            file=sys.stderr, flush=True,
+        )
+    require_unique_deposit_addresses(
+        ((row.row_number, row.bitget_deposit_address) for row in wallets.values()),
+        allow_duplicates=allow_duplicate_deposit_addresses,
+    )
     if delay_min_seconds < 0 or delay_max_seconds < delay_min_seconds:
         raise ValueError("invalid execution delay range")
     now_ms = now_ms or _utc_now_ms
-    _validate_route_quote_freshness(entries, now_ms=now_ms)
+    Deadline(stage_seconds, "execution")  # validate before allocating clients
     _validate_final_deposit_targets(entries)
     v4_entries = [
         entry
@@ -1008,6 +1074,7 @@ def execute_entries(
             preflight_entry=preflight_entry,
             submit_route_step=submit_route_step,
             requote_bridge=requote_bridge,
+            stage_seconds=stage_seconds,
         )
     if v4_entries:
         return _execute_live_groups(
@@ -1021,11 +1088,13 @@ def execute_entries(
             delay_max_seconds=delay_max_seconds,
             sleep=sleep,
             rng=rng,
+            stage_seconds=stage_seconds,
         )
+    _validate_route_quote_freshness(entries, now_ms=now_ms)
     rng = rng or random.Random()
     transport = Transport(interval=0.2)
     rpc = ExecutionRpc(transport)
-    jumper = LifiClient(httpx.Client(timeout=30))
+    lifi_clients = WalletLifiClients(wallets.values())
     bitget = _bitget_client()
     summary = {"submitted": 0, "skipped": 0, "failed": 0, "deferred": 0}
     by_wallet: dict[str, list[dict]] = {}
@@ -1046,75 +1115,89 @@ def execute_entries(
                     if source is None:
                         summary["skipped"] += len(wallet_entries)
                         continue
-                    for entry in wallet_entries:
-                        _validate_route_quote_freshness([entry], now_ms=now_ms)
-                        if entry["status"] in {"direct_deposit", "post_bridge_deposit"}:
-                            _revalidate_final_deposit_target(bitget, entry, source)
-                        operation_id = journal.create_operation(
-                            wallet=wallet, action=str(entry["status"])
-                        )
-                        position = journal.get_or_create_position(
-                            position_key=_position_key(entry), wallet=wallet
-                        )
-                        try:
-                            started_ms = int(time.time() * 1000)
-                            tx_hash = _execute_entry(
-                                entry=entry,
-                                wallet=source,
-                                rpc=rpc,
-                                jumper=jumper,
-                                rpc_urls=rpc_urls,
-                                now_ms=now_ms,
-                                journal=journal,
-                                position_id=position["id"],
+                    jumper = lifi_clients.for_wallet(wallet)
+                    with deadline_scope(Deadline(stage_seconds, "execution")):
+                        for entry in wallet_entries:
+                            operation_id = journal.create_operation(
+                                wallet=wallet, action=str(entry["status"])
                             )
-                            journal.record_transaction(operation_id, tx_hash)
-                            if approval_tx_hash := getattr(tx_hash, "approval_tx_hash", None):
-                                journal.record_approval_hash(operation_id, approval_tx_hash)
-                            if entry.get("settlement") == "wallet":
-                                journal.record_deposit_status(operation_id, "staged")
-                            elif entry["status"] in {"direct_deposit", "post_bridge_deposit"}:
-                                status = bitget.wait_for_deposit(
-                                    tx_hash=tx_hash,
-                                    started_ms=started_ms,
-                                    coin=str(entry["target"]["coin"]),
-                                    chain=str(entry["target"]["chain"]),
-                                    recipient=source.bitget_deposit_address,
-                                    minimum_raw=int(entry["target"]["minimum_raw"]),
+                            position = journal.get_or_create_position(
+                                position_key=_position_key(entry), wallet=wallet
+                            )
+                            if not journal.has_broadcast(position["id"]):
+                                _validate_route_quote_freshness([entry], now_ms=now_ms)
+                            try:
+                                check_deadline()
+                                if not journal.has_broadcast(position["id"]):
+                                    _validate_route_quote_freshness([entry], now_ms=now_ms)
+                                    if entry["status"] in {"direct_deposit", "post_bridge_deposit"}:
+                                        _revalidate_final_deposit_target(bitget, entry, source)
+                                started_ms = int(time.time() * 1000)
+                                tx_hash = _execute_entry(
+                                    entry=entry,
+                                    wallet=source,
+                                    rpc=rpc,
+                                    jumper=jumper,
+                                    rpc_urls=rpc_urls,
+                                    now_ms=now_ms,
+                                    journal=journal,
+                                    position_id=position["id"],
                                 )
+                                journal.record_transaction(operation_id, tx_hash)
+                                if approval_tx_hash := getattr(tx_hash, "approval_tx_hash", None):
+                                    journal.record_approval_hash(operation_id, approval_tx_hash)
+                                if entry.get("settlement") == "wallet":
+                                    journal.record_deposit_status(operation_id, "staged")
+                                elif entry["status"] in {"direct_deposit", "post_bridge_deposit"}:
+                                    status = bitget.wait_for_deposit(
+                                        tx_hash=tx_hash,
+                                        started_ms=started_ms,
+                                        coin=str(entry["target"]["coin"]),
+                                        chain=str(entry["target"]["chain"]),
+                                        recipient=source.bitget_deposit_address,
+                                        minimum_raw=int(entry["target"]["minimum_raw"]),
+                                    )
+                                    journal.record_deposit_status(
+                                        operation_id, (status or "timeout").lower()
+                                    )
+                                summary["submitted"] += 1
+                            except StageDeadlineExceeded as exc:
+                                if journal.has_broadcast(position["id"]):
+                                    summary["pending"] = summary.get("pending", 0) + 1
+                                else:
+                                    journal.record_deferred(operation_id, str(exc))
+                                    summary["deferred"] += 1
+                                break
+                            except AmbiguousBroadcast as exc:
+                                journal.record_transaction(operation_id, exc.tx_hash)
+                                summary["submitted"] += 1
+                            except RouteQuoteExpired as exc:
+                                if exc.approval_tx_hash is None:
+                                    journal.record_deferred(operation_id, str(exc))
+                                else:
+                                    journal.record_approval_completed_route_deferred(
+                                        operation_id, exc.approval_tx_hash, str(exc)
+                                    )
+                                summary["deferred"] += 1
+                            except EthereumGasDeferred as exc:
+                                if exc.approval_tx_hash is None:
+                                    journal.record_deferred(operation_id, exc.reason)
+                                else:
+                                    journal.record_approval_completed_route_deferred(
+                                        operation_id, exc.approval_tx_hash, exc.reason
+                                    )
+                                summary["deferred"] += 1
+                            except Exception as exc:
                                 journal.record_deposit_status(
-                                    operation_id, (status or "timeout").lower()
+                                    operation_id, "execution_failed", f"{type(exc).__name__}: {exc}"
                                 )
-                            summary["submitted"] += 1
-                        except AmbiguousBroadcast as exc:
-                            journal.record_transaction(operation_id, exc.tx_hash)
-                            summary["submitted"] += 1
-                        except RouteQuoteExpired as exc:
-                            if exc.approval_tx_hash is None:
-                                journal.record_deferred(operation_id, str(exc))
-                            else:
-                                journal.record_approval_completed_route_deferred(
-                                    operation_id, exc.approval_tx_hash, str(exc)
-                                )
-                            summary["deferred"] += 1
-                        except EthereumGasDeferred as exc:
-                            if exc.approval_tx_hash is None:
-                                journal.record_deferred(operation_id, exc.reason)
-                            else:
-                                journal.record_approval_completed_route_deferred(
-                                    operation_id, exc.approval_tx_hash, exc.reason
-                                )
-                            summary["deferred"] += 1
-                        except Exception as exc:
-                            journal.record_deposit_status(
-                                operation_id, "execution_failed", f"{type(exc).__name__}: {exc}"
-                            )
-                            summary["failed"] += 1
+                                summary["failed"] += 1
                     if wallet != wallet_order[-1]:
                         sleep(rng.randint(delay_min_seconds, delay_max_seconds))
                 if batch_index != len(batches) - 1 and batch:
                     sleep(rng.randint(delay_min_seconds, delay_max_seconds))
     finally:
+        lifi_clients.close()
         transport.close()
     return summary
 
@@ -1140,6 +1223,7 @@ def _execute_injected_groups(
     preflight_entry: Callable[[dict], dict],
     submit_route_step: Callable[[dict, dict], dict],
     requote_bridge: Callable[[dict, int], dict] | None,
+    stage_seconds: float = 30,
 ) -> dict[str, int]:
     groups: dict[str, list[dict]] = {}
     for entry in entries:
@@ -1147,16 +1231,21 @@ def _execute_injected_groups(
         key = str(group.get("key") or f"{entry['wallet']}:{entry['chain_id']}")
         groups.setdefault(key, []).append(entry)
     summary: dict[str, int] = {}
+    deadlines: dict[str, Deadline] = {}
     with Journal(journal_path) as journal:
         for key in sorted(groups):
-            result = execute_group_entries(
-                groups[key],
-                journal=journal,
-                max_route_loss_pct=max_route_loss_pct,
-                preflight=preflight_entry,
-                submit_step=submit_route_step,
-                requote_after_swap=requote_bridge,
+            wallet_deadline = deadlines.setdefault(
+                str(groups[key][0]["wallet"]).lower(), Deadline(stage_seconds, "execution")
             )
+            with deadline_scope(wallet_deadline):
+                result = execute_group_entries(
+                    groups[key],
+                    journal=journal,
+                    max_route_loss_pct=max_route_loss_pct,
+                    preflight=preflight_entry,
+                    submit_step=submit_route_step,
+                    requote_after_swap=requote_bridge,
+                )
             for state, count in result.items():
                 if state != "group_id" and isinstance(count, int):
                     summary[state] = summary.get(state, 0) + count
@@ -1175,28 +1264,33 @@ def _execute_live_groups(
     delay_max_seconds: int,
     sleep: Callable[[float], None],
     rng: random.Random | None,
+    stage_seconds: float = 30,
 ) -> dict[str, int]:
     transport = Transport(interval=0.2)
     rpc = ExecutionRpc(transport)
-    lifi_http = httpx.Client(timeout=30)
-    jumper = LifiClient(lifi_http)
+    lifi_clients = WalletLifiClients(wallets.values())
     bitget = _bitget_client()
-    gas_estimator = PlannerGasEstimator(rpc, rpc_urls, jumper)
     groups: dict[str, list[dict]] = {}
     for entry in entries:
         group = entry["group"]
         group_key = str(group.get("key") or f"{entry['wallet']}:{entry['chain_id']}")
         groups.setdefault(group_key, []).append(entry)
     summary: dict[str, int] = {}
+    deadlines: dict[str, Deadline] = {}
     randomizer = rng or random.Random()
     ordered_groups = sorted(groups)
     randomizer.shuffle(ordered_groups)
+    wallet_order = list(
+        dict.fromkeys(str(groups[key][0]["wallet"]).lower() for key in ordered_groups)
+    )
+    ordered_groups.sort(key=lambda key: wallet_order.index(str(groups[key][0]["wallet"]).lower()))
     previous_wallet: str | None = None
 
     try:
-        with Journal(journal_path) as journal, _DepositBackground(
-            bitget=bitget, journal=journal
-        ) as background:
+        with (
+            Journal(journal_path) as journal,
+            _DepositBackground(bitget=bitget, journal=journal) as background,
+        ):
             for group_key in ordered_groups:
                 background.raise_if_failed()
                 group_entries = groups[group_key]
@@ -1208,6 +1302,8 @@ def _execute_live_groups(
                 if previous_wallet is not None and previous_wallet != wallet_address:
                     sleep(randomizer.randint(delay_min_seconds, delay_max_seconds))
                 previous_wallet = wallet_address
+                jumper = lifi_clients.for_wallet(wallet_address)
+                gas_estimator = PlannerGasEstimator(rpc, rpc_urls, jumper)
 
                 def preflight(entry: dict) -> dict:
                     return _preflight_live_entry(
@@ -1223,6 +1319,7 @@ def _execute_live_groups(
 
                 def submit(entry: dict, step: dict) -> dict:
                     background.raise_if_failed()
+
                     def requote_dependent(
                         original: dict, asset: AssetIdentity, amount: int
                     ) -> dict:
@@ -1255,7 +1352,7 @@ def _execute_live_groups(
                         journal=journal,
                         now_ms=now_ms,
                     )
-                    if result.get("state") == "deposit_pending":
+                    if result.get("state") == "deposit_pending" and current_deadline() is None:
                         background.watch(
                             entry=entry,
                             position_id=int(entry["_journal_position_id"]),
@@ -1275,15 +1372,19 @@ def _execute_live_groups(
                         now_ms=now_ms,
                     )
 
-                result = execute_group_entries(
-                    group_entries,
-                    journal=journal,
-                    max_route_loss_pct=max_route_loss_pct,
-                    preflight=preflight,
-                    submit_step=submit,
-                    requote_after_swap=requote,
-                    before_step=background.raise_if_failed,
+                wallet_deadline = deadlines.setdefault(
+                    wallet_address, Deadline(stage_seconds, "execution")
                 )
+                with deadline_scope(wallet_deadline):
+                    result = execute_group_entries(
+                        group_entries,
+                        journal=journal,
+                        max_route_loss_pct=max_route_loss_pct,
+                        preflight=preflight,
+                        submit_step=submit,
+                        requote_after_swap=requote,
+                        before_step=background.raise_if_failed,
+                    )
                 for state, count in result.items():
                     if state != "group_id" and isinstance(count, int):
                         summary[state] = summary.get(state, 0) + count
@@ -1291,7 +1392,7 @@ def _execute_live_groups(
             summary["completed"] = summary.get("completed", 0) + settled
             summary["deposit_pending"] = summary.get("deposit_pending", 0) - settled
     finally:
-        lifi_http.close()
+        lifi_clients.close()
         transport.close()
     return summary
 
@@ -1333,9 +1434,7 @@ def _preflight_live_entry(
         if balance < target.minimum_raw and not asset.is_native:
             raise ValueError("requote_required:below_target_minimum")
         native = native_asset_identity(asset.chain_id)
-        fee = _gas_fee_quote(
-            request.max_total_fee_wei, native, jumper
-        )
+        fee = _gas_fee_quote(request.max_total_fee_wei, native, jumper)
         price = _token_quote_price(jumper, asset)
         candidate = candidate_from_values(
             route_ids=(),
@@ -1482,8 +1581,7 @@ def _refresh_route_step(
     if source_amount is not None:
         available = source_amount
     elif not (
-        step.get("kind") == "bridge"
-        and entry.get("steps", [])[0].get("kind") == "swap_to_native"
+        step.get("kind") == "bridge" and entry.get("steps", [])[0].get("kind") == "swap_to_native"
     ):
         available = _asset_balance(
             gas_estimator.rpc,
@@ -1495,9 +1593,7 @@ def _refresh_route_step(
         available = amount
     if available < amount:
         raise ValueError("requote_required:insufficient_spendable_balance")
-    prepared_requests = tuple(
-        jumper.step_transaction(raw_step) for raw_step in live.raw_steps
-    )
+    prepared_requests = tuple(jumper.step_transaction(raw_step) for raw_step in live.raw_steps)
     extra_gas = gas_estimator.estimate_prepared_route(
         route=live,
         wallet=wallet.public_address,
@@ -1597,9 +1693,7 @@ def _requote_from_intermediate(
                 recipient=wallet.bitget_deposit_address,
                 input_amount=amount,
             )
-            prepared = tuple(
-                jumper.step_transaction(raw_step) for raw_step in route.raw_steps
-            )
+            prepared = tuple(jumper.step_transaction(raw_step) for raw_step in route.raw_steps)
             extra_gas = gas_estimator.estimate_prepared_route(
                 route=route,
                 wallet=wallet.public_address,
@@ -1662,9 +1756,7 @@ def _requote_bridge_after_swap(
     gas_estimator: PlannerGasEstimator,
     now_ms: Callable[[], int],
 ) -> dict:
-    planned_bridge = next(
-        (step for step in entry["steps"] if step.get("kind") == "bridge"), None
-    )
+    planned_bridge = next((step for step in entry["steps"] if step.get("kind") == "bridge"), None)
     if planned_bridge is None:
         raise ValueError("requote_required:planned_bridge_missing")
     route_data = planned_bridge["route"]
@@ -1770,6 +1862,12 @@ def _requote_bridge_after_swap(
     return result
 
 
+def _pending_bridge_sleep(sleep: Callable[[float], None]) -> None:
+    if current_deadline() is not None:
+        raise StageDeadlineExceeded("bridge_pending")
+    budget_sleep(_BRIDGE_STATUS_POLL_SECONDS, sleep=sleep)
+
+
 def _await_cross_chain_transfer(
     *,
     jumper: LifiClient,
@@ -1800,6 +1898,7 @@ def _await_cross_chain_transfer(
             journal.record_step_state(step_id, "awaiting_bridge")
 
     while True:
+        check_deadline()
         try:
             status = jumper.transaction_status(
                 tx_hash=tx_hash,
@@ -1808,20 +1907,22 @@ def _await_cross_chain_transfer(
                 bridge=bridge,
             )
         except httpx.TransportError:
-            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            _pending_bridge_sleep(sleep)
             continue
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in {408, 429, 500, 502, 503, 504}:
                 raise
-            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            _pending_bridge_sleep(sleep)
             continue
+        except StageDeadlineExceeded:
+            raise
         except TimeoutError:
-            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            _pending_bridge_sleep(sleep)
             continue
         state = str(status.get("status", "")).upper()
         substatus = str(status.get("substatus", "")).upper()
         if state == "NOT_FOUND":
-            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            _pending_bridge_sleep(sleep)
             continue
         sending = status.get("sending")
         if not isinstance(sending, dict):
@@ -1833,7 +1934,7 @@ def _await_cross_chain_transfer(
         if isinstance(observed_sender, str) and observed_sender.lower() != sender.lower():
             raise ValueError("lifi_bridge_status_sender_mismatch")
         if state == "PENDING":
-            sleep(_BRIDGE_STATUS_POLL_SECONDS)
+            _pending_bridge_sleep(sleep)
             continue
         if state != "DONE" or substatus not in {"COMPLETED", "PARTIAL"}:
             raise ValueError(f"lifi_bridge_terminal_status:{state}:{substatus}")
@@ -1877,7 +1978,7 @@ def _await_cross_chain_transfer(
                 wallet=recipient,
             )
             if observed_balance < baseline_raw + received_raw:
-                sleep(_BRIDGE_STATUS_POLL_SECONDS)
+                _pending_bridge_sleep(sleep)
                 continue
 
         if step_id is not None:
@@ -1900,21 +2001,13 @@ def _actual_gas_paid_usd(
     total = Decimal(0)
     native_prices: dict[int, QuotePrice] = {}
     for chain_id, tx_hash in tx_hashes:
-        receipt = rpc.call(
-            _rpc_url(rpc_urls, chain_id), "eth_getTransactionReceipt", [tx_hash]
-        )
+        receipt = rpc.call(_rpc_url(rpc_urls, chain_id), "eth_getTransactionReceipt", [tx_hash])
         if not isinstance(receipt, dict):
             raise ValueError("route_step_receipt_missing")
         if receipt.get("gasUsed") is None or receipt.get("effectiveGasPrice") is None:
             raise ValueError("route_step_receipt_gas_cost_missing")
-        gas_raw = (
-            quantity(receipt["gasUsed"])
-            * quantity(receipt["effectiveGasPrice"])
-            + (
-                quantity(receipt["l1Fee"])
-                if receipt.get("l1Fee") is not None
-                else 0
-            )
+        gas_raw = quantity(receipt["gasUsed"]) * quantity(receipt["effectiveGasPrice"]) + (
+            quantity(receipt["l1Fee"]) if receipt.get("l1Fee") is not None else 0
         )
         if gas_raw <= 0:
             continue
@@ -1923,9 +2016,7 @@ def _actual_gas_paid_usd(
             price = _quote_price(jumper, native_asset_identity(chain_id))
             native_prices[chain_id] = price
         assert isinstance(price.usd_per_token, Decimal)
-        total = _exact_sum(
-            (total, raw_to_decimal(gas_raw, price.asset) * price.usd_per_token)
-        )
+        total = _exact_sum((total, raw_to_decimal(gas_raw, price.asset) * price.usd_per_token))
     return total
 
 
@@ -1943,16 +2034,40 @@ def _submit_live_step(
 ) -> dict:
     position_id = int(entry["_journal_position_id"])
     if step.get("kind") == "direct_deposit":
+        journal.save_checkpoint(position_id, "direct_prepared", entry)
         saved = journal.latest_step(position_id=position_id, step_key="direct_deposit")
         if saved is not None and saved["tx_hash"]:
             tx_hash = str(saved["tx_hash"])
-            started_ms = int(
-                datetime.fromisoformat(saved["created_at"])
-                .replace(tzinfo=UTC)
-                .timestamp() * 1000
-            ) - 60_000
+            started_ms = (
+                int(
+                    datetime.fromisoformat(saved["created_at"]).replace(tzinfo=UTC).timestamp()
+                    * 1000
+                )
+                - 60_000
+            )
+            if current_deadline() is not None:
+                wait_for_receipt(
+                    rpc,
+                    url=_rpc_url(
+                        rpc_urls,
+                        int(saved["chain_id"]) if "chain_id" in saved else int(entry["chain_id"]),
+                    ),
+                    tx_hash=tx_hash,
+                )
             # Recovery observes the known transaction; it never prepares or signs another.
         else:
+            if entry.get("_observation_restore") and current_deadline() is not None:
+                entry = _preflight_live_entry(
+                    entry,
+                    wallet=wallet,
+                    rpc=rpc,
+                    rpc_urls=rpc_urls,
+                    jumper=jumper,
+                    bitget=bitget,
+                    gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper),
+                    now_ms=now_ms,
+                )
+                journal.save_checkpoint(position_id, "direct_prepared", entry)
             request = entry.get("_direct_transaction")
             if not isinstance(request, TransactionRequest):
                 raise ValueError("direct deposit preflight is missing a transaction")
@@ -1968,9 +2083,7 @@ def _submit_live_step(
                 position_id=position_id,
                 prepared_request=request,
             )
-            saved = journal.latest_step(
-                position_id=position_id, step_key="direct_deposit"
-            )
+            saved = journal.latest_step(position_id=position_id, step_key="direct_deposit")
         try:
             status = bitget.wait_for_deposit_seen(
                 tx_hash=tx_hash,
@@ -1980,9 +2093,17 @@ def _submit_live_step(
                 recipient=wallet.bitget_deposit_address,
                 minimum_raw=int(entry["target"]["minimum_raw"]),
             )
+        except StageDeadlineExceeded:
+            raise
         except Exception as exc:
             raise DepositNotSeen(_execution_reason(exc)) from exc
         normalized_status = str(status or "").lower()
+        if not normalized_status and current_deadline() is not None:
+            return {
+                "state": "deposit_pending",
+                "reason": "bitget_deposit_not_seen",
+                "realized_loss_usd": str(entry["valuation"]["loss_usd"]),
+            }
         if not normalized_status:
             raise DepositNotSeen("bitget_deposit_not_seen")
         if normalized_status in {"fail", "failed"}:
@@ -1993,7 +2114,10 @@ def _submit_live_step(
             if saved["state"] == "submitted":
                 journal.record_step_state(saved["id"], "deposit_seen")
             if normalized_status == "success" and saved["state"] in {
-                "submitted", "deposit_seen", "confirmed", "awaiting_bridge"
+                "submitted",
+                "deposit_seen",
+                "confirmed",
+                "awaiting_bridge",
             }:
                 journal.record_step_state(saved["id"], "credited")
         realized_before = _exact_money(
@@ -2001,14 +2125,17 @@ def _submit_live_step(
             "realized loss before direct deposit",
         )
         loss_usd = _decimal_string(
-            _exact_sum((
-                realized_before,
-                _exact_money(entry["valuation"]["loss_usd"], "direct deposit loss"),
-            ))
+            _exact_sum(
+                (
+                    realized_before,
+                    _exact_money(entry["valuation"]["loss_usd"], "direct deposit loss"),
+                )
+            )
         )
         if normalized_status == "pending":
             return {
-                "state": "deposit_pending", "reason": "bitget_seen_pending",
+                "state": "deposit_pending",
+                "reason": "bitget_seen_pending",
                 "realized_loss_usd": loss_usd,
             }
         return {
@@ -2041,9 +2168,26 @@ def _submit_live_step(
         if route_steps[index + 1].source != route_step.destination:
             raise ValueError("requote_required:route_step_identity_mismatch")
 
-    initial_native = None
+    progress_key = f"route:{step.get('kind')}:{route_data['id']}"
+    progress = journal.checkpoint(position_id, progress_key) or {}
+    continuation = progress.get("continuation")
+    if isinstance(continuation, dict):
+        continuation.update({key: value for key, value in entry.items() if callable(value)})
+        continuation["_observation_restore"] = True
+        return _submit_live_step(
+            continuation,
+            continuation["steps"][0],
+            wallet=wallet,
+            rpc=rpc,
+            rpc_urls=rpc_urls,
+            jumper=jumper,
+            bitget=bitget,
+            journal=journal,
+            now_ms=now_ms,
+        )
+    initial_native = progress.get("initial_native")
     destination = _asset_from_data(route_data["evidence"]["destination"])
-    if step.get("kind") == "swap_to_native":
+    if step.get("kind") == "swap_to_native" and initial_native is None:
         initial_native = _asset_balance(
             rpc,
             url=_rpc_url(rpc_urls, destination.chain_id),
@@ -2053,13 +2197,13 @@ def _submit_live_step(
 
     carried_asset_id = entry.get("_actual_asset_id")
     carried_amount = (
-        int(entry["_actual_balance_raw"])
-        if entry.get("_actual_balance_raw") is not None
-        else None
+        int(entry["_actual_balance_raw"]) if entry.get("_actual_balance_raw") is not None else None
     )
     tx_hash = None
-    paid_native_gas = 0
-    confirmed_hashes: list[tuple[int, str]] = []
+    carried_asset_id = progress.get("carried_asset_id", carried_asset_id)
+    carried_amount = progress.get("carried_amount", carried_amount)
+    paid_native_gas = progress.get("paid_native_gas", 0)
+    confirmed_hashes: list[tuple[int, str]] = progress.get("confirmed_hashes", [])
     sleep = entry.get("_sleep", time.sleep)
     realized_before = _exact_money(
         entry.get("_realized_loss_before_current_usd", "0"),
@@ -2075,13 +2219,22 @@ def _submit_live_step(
             or normalized.from_amount is None
         ):
             raise ValueError("requote_required:route_step_evidence_mismatch")
+        if index < progress.get("next_index", 0):
+            continue
         step_amount = normalized.from_amount
         step_source = normalized.source
-        available = _asset_balance(
-            rpc,
-            url=_rpc_url(rpc_urls, step_source.chain_id),
-            asset=step_source,
-            wallet=wallet.public_address,
+        step_key = f"{step.get('kind')}:{route_data['id']}:{index}"
+        known_step = journal.latest_step(position_id=position_id, step_key=step_key)
+        known_broadcast = known_step is not None and bool(known_step["tx_hash"])
+        available = (
+            step_amount
+            if known_broadcast
+            else _asset_balance(
+                rpc,
+                url=_rpc_url(rpc_urls, step_source.chain_id),
+                asset=step_source,
+                wallet=wallet.public_address,
+            )
         )
         if carried_asset_id == step_source.contract_address and carried_amount is not None:
             available = min(available, carried_amount)
@@ -2104,8 +2257,10 @@ def _submit_live_step(
             route_entry["_actual_asset_id"] = carried_asset_id
             route_entry["_actual_balance_raw"] = str(carried_amount)
 
-        output_baseline = None
-        if index < len(route_steps) - 1:
+        output_baseline = (
+            progress.get("output_baseline") if progress.get("index") == index else None
+        )
+        if index < len(route_steps) - 1 and output_baseline is None:
             output_baseline = _asset_balance(
                 rpc,
                 url=_rpc_url(rpc_urls, normalized.destination.chain_id),
@@ -2118,6 +2273,36 @@ def _submit_live_step(
                 raise ValueError("requote_required:intermediate_bridge_evidence_missing")
             route_entry["_bridge_balance_baseline_raw"] = str(output_baseline)
             route_entry["_bridge_expected_delta_raw"] = str(normalized.to_amount)
+        progress.update(
+            initial_native=initial_native,
+            index=index,
+            output_baseline=output_baseline,
+            carried_asset_id=carried_asset_id,
+            carried_amount=carried_amount,
+            paid_native_gas=paid_native_gas,
+            confirmed_hashes=confirmed_hashes,
+        )
+        journal.save_checkpoint(position_id, progress_key, progress)
+        if not known_broadcast and current_deadline() is not None:
+            # Saved routes authorize observation only. A new signature gets
+            # exact evidence, fee, current price age and deposit checks again.
+            candidate, refreshed = _refresh_route_step(
+                entry,
+                step,
+                wallet=wallet,
+                jumper=jumper,
+                gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper),
+                now=datetime.fromtimestamp(now_ms() / 1000, tz=UTC),
+                bitget=bitget,
+                source_amount=int(route_data["evidence"]["input_amount"]),
+            )
+            group_check = entry.get("_check_group_loss")
+            if callable(group_check):
+                group_check(
+                    _exact_sum((realized_before, _exact_money(candidate.loss_usd, "route loss")))
+                )
+            prepared_request = refreshed["_prepared_requests"][index]
+            step.update(refreshed)
         tx_hash = _execute_entry(
             entry=route_entry,
             wallet=wallet,
@@ -2142,15 +2327,9 @@ def _submit_live_step(
             )
             if not isinstance(receipt, dict):
                 raise ValueError("route_step_receipt_missing")
-            paid_native_gas += (
-                quantity(receipt.get("gasUsed"))
-                * quantity(receipt.get("effectiveGasPrice"))
-                + (
-                    quantity(receipt["l1Fee"])
-                    if receipt.get("l1Fee") is not None
-                    else 0
-                )
-            )
+            paid_native_gas += quantity(receipt.get("gasUsed")) * quantity(
+                receipt.get("effectiveGasPrice")
+            ) + (quantity(receipt["l1Fee"]) if receipt.get("l1Fee") is not None else 0)
 
         if is_cross_chain:
             recipient = normalized.recipient
@@ -2208,8 +2387,7 @@ def _submit_live_step(
                     (
                         max(
                             Decimal(0),
-                            _exact_money(source_value, "route source value")
-                            - output_value,
+                            _exact_money(source_value, "route source value") - output_value,
                         ),
                         actual_gas_usd,
                     )
@@ -2235,9 +2413,7 @@ def _submit_live_step(
                 elif next_step.get("kind") == "direct_deposit":
                     new_route_id = "direct-deposit"
                     new_payload_hash = sha256(
-                        json.dumps(
-                            next_step, sort_keys=True, separators=(",", ":")
-                        ).encode("utf-8")
+                        json.dumps(next_step, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     ).hexdigest()
                 else:
                     raise ValueError("requote_required:dependent_route_evidence_missing")
@@ -2261,6 +2437,8 @@ def _submit_live_step(
                     "_check_group_loss": group_loss_check,
                     "_sleep": sleep,
                 }
+                progress["continuation"] = dynamic_entry
+                journal.save_checkpoint(position_id, progress_key, progress)
                 return _submit_live_step(
                     dynamic_entry,
                     next_step,
@@ -2294,6 +2472,15 @@ def _submit_live_step(
                 actual_asset_id=carried_asset_id,
                 actual_balance_raw=carried_amount,
             )
+
+        progress.update(
+            next_index=index + 1,
+            carried_asset_id=carried_asset_id,
+            carried_amount=carried_amount,
+            paid_native_gas=paid_native_gas,
+            confirmed_hashes=confirmed_hashes,
+        )
+        journal.save_checkpoint(position_id, progress_key, progress)
 
     candidate_map = entry.get("_step_candidates", {})
     candidate = candidate_map.get(route_data["id"])
@@ -2368,9 +2555,7 @@ def _execute_entry(
     require_ethereum_planned_gas_price_valid(request)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     generated_native_cap = (
-        entry.get("_actual_balance_raw")
-        if entry.get("_actual_asset_id") == "native"
-        else None
+        entry.get("_actual_balance_raw") if entry.get("_actual_asset_id") == "native" else None
     )
     if generated_native_cap is not None:
         cap = _raw_amount(generated_native_cap)
@@ -2409,6 +2594,7 @@ def _execute_entry(
                 _validate_route_quote_freshness([entry], now_ms=now_ms)
             except ValueError as exc:
                 raise RouteQuoteExpired(str(exc), approval_tx_hash) from exc
+        check_deadline()
         raw = sign_transaction(
             request,
             private_key=wallet.private_key,
@@ -2420,8 +2606,14 @@ def _execute_entry(
         raise
     if journal is not None and position_id is not None:
         tx_hash = broadcast_durable_transaction(
-            rpc, url=url, journal=journal, position_id=position_id, step_key=step_key,
-            nonce=nonce, calldata=request.data, signed_transaction=raw,
+            rpc,
+            url=url,
+            journal=journal,
+            position_id=position_id,
+            step_key=step_key,
+            nonce=nonce,
+            calldata=request.data,
+            signed_transaction=raw,
             tx_hash=signed_transaction_hash(raw),
             balance_baseline_raw=entry.get("_bridge_balance_baseline_raw"),
             expected_delta_raw=entry.get("_bridge_expected_delta_raw"),
@@ -2489,11 +2681,7 @@ def _exact_product(left: Decimal, right: Decimal) -> Decimal:
 
 
 def _exact_percentage(numerator: Decimal, denominator: Decimal) -> Decimal:
-    precision = (
-        len(numerator.as_tuple().digits)
-        + len(denominator.as_tuple().digits)
-        + 50
-    )
+    precision = len(numerator.as_tuple().digits) + len(denominator.as_tuple().digits) + 50
     with localcontext() as context:
         context.prec = max(context.prec, precision)
         return numerator / denominator * Decimal(100)
@@ -2568,17 +2756,27 @@ def _approve_if_needed(
     route_step_key: str = "route_ready",
 ) -> str | None:
     spender = entry["route"]["step"].get("estimate", {}).get("approvalAddress")
+    if entry["route"]["step"].get("tool") == WETH_WITHDRAW_TOOL:
+        chain, contract, calldata = withdraw_transaction_fields(entry["route"]["step"])
+        if (request.chain_id, request.to.lower(), request.data.lower(), request.value) != (
+            chain, contract, calldata, 0
+        ):
+            raise ValueError("canonical WETH withdrawal transaction mismatch")
+        return None
     asset_id = str(entry["asset_id"])
     amount = int(entry["raw_balance"])
     if not isinstance(spender, str):
         raise ValueError("Jumper route is missing an approval address")
-    allowed = token_allowance(
-        rpc,
-        url=url,
-        token=asset_id,
-        owner=wallet.public_address,
-        spender=spender,
-    ) >= amount
+    allowed = (
+        token_allowance(
+            rpc,
+            url=url,
+            token=asset_id,
+            owner=wallet.public_address,
+            spender=spender,
+        )
+        >= amount
+    )
     if allowed:
         return None
     approval_step_key = f"approval:{route_step_key}"
@@ -2592,13 +2790,16 @@ def _approve_if_needed(
         )
         if recovered is not None:
             wait_for_receipt(rpc, url=url, tx_hash=recovered)
-            if token_allowance(
-                rpc,
-                url=url,
-                token=asset_id,
-                owner=wallet.public_address,
-                spender=spender,
-            ) < amount:
+            if (
+                token_allowance(
+                    rpc,
+                    url=url,
+                    token=asset_id,
+                    owner=wallet.public_address,
+                    spender=spender,
+                )
+                < amount
+            ):
                 raise ValueError("approval confirmed without sufficient token allowance")
             return recovered
     approval = approve_transaction(
@@ -2614,6 +2815,7 @@ def _approve_if_needed(
     require_native_reserve(balance=balance, gas_cost=approval.max_total_fee_wei)
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
     require_ethereum_gas_below_limit(rpc, url=url, request=approval)
+    check_deadline()
     raw = sign_transaction(
         approval,
         private_key=wallet.private_key,
@@ -2667,7 +2869,9 @@ def _wait_for_staged_balance(
         amount = _token_balance(rpc, url=url, token=token, wallet=wallet)
         if amount >= expected_minimum:
             return amount
-        time.sleep(poll_seconds)
+        if current_deadline() is not None:
+            raise StageDeadlineExceeded("staged_balance_pending")
+        budget_sleep(poll_seconds)
     raise TimeoutError("staged USDC did not arrive before timeout")
 
 
@@ -2693,7 +2897,7 @@ def _validate_final_deposit_targets(entries: list[dict]) -> None:
 def _revalidate_final_deposit_target(
     bitget: BitgetClient, entry: dict, wallet: WalletWorkbookRow
 ) -> None:
-    """Use live exchange metadata/address at the last safe point before signing."""
+    """Recheck exchange metadata/minimum before signing; trust the workbook address."""
 
     # Test doubles intentionally need only the deposit-status interface.  The
     # concrete client always provides this live re-admission method.

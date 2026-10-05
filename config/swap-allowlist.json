@@ -5,6 +5,7 @@
     {"chain_id": 10, "network": "OP Mainnet", "asset_id": "native", "symbol": "ETH", "action": "swap"},
     {"chain_id": 100, "network": "Gnosis", "asset_id": "native", "symbol": "XDAI", "action": "swap"},
     {"chain_id": 130, "network": "Unichain", "asset_id": "native", "symbol": "ETH", "action": "swap"},
+    {"chain_id": 137, "network": "Polygon PoS", "asset_id": "native", "symbol": "POL", "action": "swap"},
     {"chain_id": 1868, "network": "Soneium", "asset_id": "native", "symbol": "ETH", "action": "swap"},
     {"chain_id": 8453, "network": "Base", "asset_id": "native", "symbol": "ETH", "action": "swap"},
     {"chain_id": 42161, "network": "Arbitrum One", "asset_id": "native", "symbol": "ETH", "action": "swap"},
