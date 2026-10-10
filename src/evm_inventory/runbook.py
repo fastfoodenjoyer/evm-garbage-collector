@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from .execution_policy import SequentialSchedule
+from .network_policy import EXCLUDED_NETWORKS
 from .route_plan import DepositTarget, Position, classify_position
 
 _TARGETS = (
@@ -29,6 +30,8 @@ def create_route_plan(
     policy = _allowlist_policy(allowlist_path)
     with Path(balances_path).open(newline="") as stream:
         for row in csv.DictReader(stream):
+            if int(row["chain_id"]) in EXCLUDED_NETWORKS:
+                continue
             raw_balance = int(row["raw_balance"])
             if raw_balance <= 0:
                 continue

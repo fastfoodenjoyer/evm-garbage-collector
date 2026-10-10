@@ -9,7 +9,9 @@ import os
 import re
 import sqlite3
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -22,6 +24,7 @@ from .models import ConfigError
 from .planner_gas import PlannerGasEstimator
 from .report import export_current
 from .route_execution import execute_entries, resume_routes_read_only
+from .route_targets import load_target_policy
 from .routing_settings import load_routing_settings
 from .rpc import RpcReader
 from .runbook import create_route_plan
@@ -39,6 +42,52 @@ from .workbook import (
 )
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_progress(plan: dict) -> dict:
+    pending = []
+    for entry in plan.get("entries", []):
+        for item in entry.get("search", {}).get("pending", []):
+            row = {
+                "wallet": entry.get("wallet"),
+                "chain_id": entry.get("chain_id"),
+                "asset_id": entry.get("asset_id"),
+                **item,
+            }
+            retry = item.get("retry_at")
+            if isinstance(retry, (int, float)):
+                instant = datetime.fromtimestamp(retry, UTC)
+                row["retry_at_utc"] = instant.isoformat()
+                row["retry_at_moscow"] = instant.astimezone(ZoneInfo("Europe/Moscow")).isoformat()
+            pending.append(row)
+    metrics = list(plan.get("lifi_requests", {}).values())
+    counts = {
+        name: sum(m.get("pair_" + name, 0) for m in metrics)
+        for name in ("completed", "pending", "expired", "errors", "no_route")
+    }
+    total = sum(m.get("logical_pairs", 0) for m in metrics)
+    return {
+        "directions": {
+            "total": total,
+            "processed": counts["completed"],
+            "remaining": counts["pending"] + counts["expired"] + counts["errors"],
+            **counts,
+        },
+        "pending": pending,
+        "lifi_requests": plan.get("lifi_requests", {}),
+        "relay_requests": plan.get("relay_requests", {}),
+        "relay_summary": plan.get("relay_summary", {}),
+        "search_scope": plan.get("search_scope", {}),
+        "quote_timing": plan.get("quote_timing", {}),
+        "errors": plan.get("route_diagnostics", []) + plan.get("gas_diagnostics", []) + [
+            {
+                "wallet": e["wallet"], "chain_id": e["chain_id"],
+                "provider": "relay", "search": e["search"],
+            }
+            for e in plan.get("entries", [])
+            if e.get("routing_provider") == "relay" and e.get("search", {}).get("errors")
+        ],
+    }
 
 
 def _dotenv_value(raw: str, line_number: int) -> str:
@@ -102,8 +151,21 @@ def _progress(message: str) -> None:
 def _emit_error_diagnostic(exc: BaseException) -> None:
     print(
         "diagnostic: " + json.dumps(exception_diagnostic(exc), ensure_ascii=False),
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
+
+
+def _quote_stage_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("quote target seconds must be a number") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            "quote target seconds must be finite and greater than zero"
+        )
+    return seconds
 
 
 def _stage_seconds(value: str) -> float:
@@ -141,7 +203,8 @@ def main(argv=None):
         workbook_dry_run_parser = sub.add_parser("workbook-dry-run")
         workbook_dry_run_parser.add_argument("--workbook", required=True)
         workbook_dry_run_parser.add_argument(
-            "--allow-duplicate-deposit-addresses", action="store_true",
+            "--allow-duplicate-deposit-addresses",
+            action="store_true",
             help="Allow repeated Bitget deposit addresses in the entire workbook",
         )
         route_plan_parser = sub.add_parser("route-plan")
@@ -156,12 +219,19 @@ def main(argv=None):
         quote_routes_parser.add_argument("--db", required=True)
         quote_routes_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
         quote_routes_parser.add_argument("--catalog")
+        quote_routes_parser.add_argument("--route-targets", default="config/route-targets.json")
         quote_routes_parser.add_argument("--quote-floor", default="0.01")
-        quote_routes_parser.add_argument("--stage-seconds", type=_stage_seconds, default=30)
+        quote_routes_parser.add_argument(
+            "--stage-seconds",
+            type=_quote_stage_seconds,
+            default=30,
+            help="Soft time target per wallet; warn and continue comparison after this time",
+        )
         quote_routes_parser.add_argument("--workers", type=int, default=16)
         quote_routes_parser.add_argument("--target-workers", type=int, default=8)
         quote_routes_parser.add_argument(
-            "--allow-duplicate-deposit-addresses", action="store_true",
+            "--allow-duplicate-deposit-addresses",
+            action="store_true",
             help="Allow repeated Bitget deposit addresses in the entire workbook",
         )
         quote_routes_parser.add_argument(
@@ -190,11 +260,13 @@ def main(argv=None):
         execute_parser.add_argument("--db", required=True)
         execute_parser.add_argument("--execute", action="store_true")
         execute_parser.add_argument(
-            "--trust-deposit-addresses", action="store_true",
+            "--trust-deposit-addresses",
+            action="store_true",
             help="Confirm workbook deposit addresses were checked and belong to Bitget",
         )
         execute_parser.add_argument(
-            "--allow-duplicate-deposit-addresses", action="store_true",
+            "--allow-duplicate-deposit-addresses",
+            action="store_true",
             help="Allow repeated Bitget deposit addresses in the entire workbook",
         )
         execute_parser.add_argument("--stage-seconds", type=_stage_seconds, default=30)
@@ -207,20 +279,34 @@ def main(argv=None):
         args = parser.parse_args(argv)
 
         if args.cmd == "quote-defi":
-            print(json.dumps(quote_defi(
-                wallets_path=Path(args.wallets), workbook_path=Path(args.workbook),
-                db_path=Path(args.db), output_path=Path(args.output),
-                catalog_path=Path(args.catalog) if args.catalog else None,
-            )))
+            print(
+                json.dumps(
+                    quote_defi(
+                        wallets_path=Path(args.wallets),
+                        workbook_path=Path(args.workbook),
+                        db_path=Path(args.db),
+                        output_path=Path(args.output),
+                        catalog_path=Path(args.catalog) if args.catalog else None,
+                    )
+                )
+            )
             return 0
         if args.cmd == "execute-defi":
             catalog = load_catalog(Path(args.catalog) if args.catalog else None)
-            print(json.dumps(execute_defi(
-                plan_path=Path(args.plan), plan_sha256=args.plan_sha256,
-                action_id=args.action_id, workbook_path=Path(args.workbook),
-                db_path=Path(args.db), max_gas_wei=args.max_gas_wei,
-                execute=args.execute, rpc_urls=_execution_rpc_urls(catalog),
-            )))
+            print(
+                json.dumps(
+                    execute_defi(
+                        plan_path=Path(args.plan),
+                        plan_sha256=args.plan_sha256,
+                        action_id=args.action_id,
+                        workbook_path=Path(args.workbook),
+                        db_path=Path(args.db),
+                        max_gas_wei=args.max_gas_wei,
+                        execute=args.execute,
+                        rpc_urls=_execution_rpc_urls(catalog),
+                    )
+                )
+            )
             return 0
         if args.cmd == "workbook-template":
             output = Path(args.output)
@@ -228,10 +314,14 @@ def main(argv=None):
             print(json.dumps({"status": "created", "workbook": str(output)}))
             return 0
         if args.cmd == "workbook-dry-run":
-            print(json.dumps(dry_run_workbook(
-                Path(args.workbook),
-                allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
-            )))
+            print(
+                json.dumps(
+                    dry_run_workbook(
+                        Path(args.workbook),
+                        allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
+                    )
+                )
+            )
             return 0
         if args.cmd == "route-plan":
             plan = create_route_plan(Path(args.balances), quote_floor_raw=args.quote_floor_raw)
@@ -242,6 +332,7 @@ def main(argv=None):
             return 0
         if args.cmd == "quote-routes":
             routing_settings = load_routing_settings()
+            target_policy = load_target_policy(Path(args.route_targets))
             ordinal_ranges = parse_ordinal_ranges(args.wallet_ranges)
             wallet_rows = load_wallet_workbook(
                 Path(args.workbook),
@@ -251,12 +342,12 @@ def main(argv=None):
                 allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
             )
             wallet_range_batches(wallet_rows, ordinal_ranges)
-            addresses = {
-                item.public_address: item.bitget_deposit_address for item in wallet_rows
-            }
+            addresses = {item.public_address: item.bitget_deposit_address for item in wallet_rows}
             catalog = load_catalog(Path(args.catalog) if args.catalog else None)
             transport = Transport(interval=0)
-            quote_client = WalletLifiClients(wallet_rows)
+            quote_client = WalletLifiClients(
+                wallet_rows, db_path=Path(args.db), policy_digest=target_policy.digest
+            )
             try:
                 gas_estimator = PlannerGasEstimator(
                     RpcReader(transport), _execution_rpc_urls(catalog), quote_client
@@ -266,6 +357,7 @@ def main(argv=None):
                     deposit_addresses=addresses,
                     allowlist_path=Path(args.allowlist),
                     quote_floor=args.quote_floor,
+                    target_policy=target_policy,
                     wallet_addresses=set(addresses),
                     max_route_loss_pct=routing_settings.max_route_loss_pct,
                     client=quote_client,
@@ -280,7 +372,16 @@ def main(argv=None):
             Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
             with Store(args.db) as store:
                 store.save_run_artifact("route_quote", Path(args.output).read_bytes())
-            print(json.dumps({"status": "quoted", "output": str(args.output), **plan["summary"]}))
+            print(
+                json.dumps(
+                    {
+                        "status": "quoted",
+                        "output": str(args.output),
+                        **plan["summary"],
+                        **_quote_progress(plan),
+                    }
+                )
+            )
             return 0
         if args.cmd == "execute-routes":
             require_trusted_deposit_addresses(args.trust_deposit_addresses)
@@ -293,7 +394,8 @@ def main(argv=None):
             catalog = load_catalog(Path(args.catalog))
             rpc_urls = _execution_rpc_urls(catalog)
             wallet_rows = load_wallet_workbook(
-                Path(args.workbook), ordinal_ranges=ordinal_ranges,
+                Path(args.workbook),
+                ordinal_ranges=ordinal_ranges,
                 allow_duplicate_deposit_addresses=args.allow_duplicate_deposit_addresses,
             )
             batches = wallet_range_batches(wallet_rows, ordinal_ranges)
@@ -304,9 +406,7 @@ def main(argv=None):
                 for entry in plan["entries"]
                 if str(entry.get("wallet", "")).lower() in selected_wallets
             ]
-            wallet_batches = tuple(
-                tuple(row.public_address for row in batch) for batch in batches
-            )
+            wallet_batches = tuple(tuple(row.public_address for row in batch) for batch in batches)
             execution = plan.get("execution", {})
             with Store(args.db) as store:
                 store.save_run_artifact("route_quote", plan_bytes)
@@ -406,6 +506,7 @@ def main(argv=None):
         print(f"error: unexpected {type(exc).__name__}", file=sys.stderr)
         _emit_error_diagnostic(exc)
         return 1
+
 
 def _execution_rpc_urls(catalog) -> dict[int, str]:
     """Prefer Alchemy for execution preflight and broadcast when it maps the chain."""

@@ -12,11 +12,16 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol
 
-from .diagnostics import redact_text
+from .celo import CELO_CHAIN_ID, lifi_token_address
+from .diagnostics import exception_diagnostic, redact_text
+from .lifi_http import LifiRequestLimit
 from .models import AssetIdentity
+from .network_policy import uses_excluded_network
+from .quote_jobs import JobInProgress, QuoteJobs, quote_job_key
 from .stages import budget_sleep, http_request
 from .weth import (
     WETH_WITHDRAW_TOOL,
@@ -24,6 +29,9 @@ from .weth import (
     unwrap_route_payload,
     withdraw_transaction_fields,
 )
+
+_QUOTE_LOCKS: dict[tuple[str, str, str], Any] = {}
+_QUOTE_LOCKS_GUARD = Lock()
 
 
 class _Response(Protocol):
@@ -35,9 +43,16 @@ class _Response(Protocol):
 class _HttpClient(Protocol):
     def post(self, url: str, *, json: dict, headers: dict, timeout: float) -> _Response: ...
 
-    def get(
-        self, url: str, *, params: dict, headers: dict, timeout: float
-    ) -> _Response: ...
+    def get(self, url: str, *, params: dict, headers: dict, timeout: float) -> _Response: ...
+
+
+def _response_timestamp(response) -> str:
+    observed = getattr(response, "headers", {}).get("x-inventory-observed-at")
+    return (
+        datetime.fromtimestamp(float(observed), UTC).isoformat()
+        if observed is not None
+        else _utc_timestamp()
+    )
 
 
 class LifiError(ValueError):
@@ -54,6 +69,8 @@ class LifiRouteRequest:
     from_address: str
     to_address: str
     slippage: float = 0.005
+    from_token_decimals: int | None = None
+    to_token_decimals: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,29 +218,104 @@ class LifiClient:
     token_endpoint = "https://li.quest/v1/token"
     status_endpoint = "https://li.quest/v1/status"
 
-    def __init__(self, http_client: _HttpClient):
+    def __init__(
+        self, http_client: _HttpClient, *, policy_digest: str = "", catalog_digest: str = ""
+    ):
+        self.policy_digest = policy_digest
+        self.catalog_digest = catalog_digest
         self.http_client = http_client
         self.route_rate_error: str | None = None
         self.route_diagnostics: list[dict] = []
         self._diagnostic_lock = Lock()
+        self.route_observed_at: dict[LifiRouteRequest, str] = {}
+        self._job_states: dict[str, str] = {}
+        self._persisted_job_hits = 0
+        db_path = getattr(http_client, "db_path", None)
+        scope = getattr(http_client, "scope", None)
+        self.quote_jobs = (
+            QuoteJobs(db_path, scope, clock=getattr(http_client, "clock", None))
+            if db_path is not None and scope is not None
+            else None
+        )
+
+    def supported_chain_ids(self) -> frozenset[int]:
+        """Read current LI.FI support once per planning client (HTTP cache retains its age)."""
+        with self._diagnostic_lock:
+            cached = getattr(self, "_supported_chains", None)
+            if cached is not None:
+                return cached
+            response = http_request(
+                self.http_client,
+                "get",
+                "https://li.quest/v1/chains",
+                params={},
+                headers={},
+                timeout=30,
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or not isinstance(body.get("chains"), list):
+                raise LifiError("LI.FI chains response is malformed")
+            chains = body["chains"]
+            if not chains or any(
+                not isinstance(c, dict)
+                or isinstance(c.get("id"), bool)
+                or not isinstance(c.get("id"), int)
+                for c in chains
+            ):
+                raise LifiError("LI.FI chains response has invalid chain IDs")
+            self._supported_chains = frozenset(
+                c["id"] for c in chains if c.get("chainType") == "EVM"
+            )
+            return self._supported_chains
+
+    @property
+    def quote_job_metrics(self) -> dict[str, int]:
+        with self._diagnostic_lock:
+            states = tuple(self._job_states.values())
+            return {
+                "persisted_job_hits": self._persisted_job_hits,
+                "logical_pairs": len(states),
+                "pair_completed": sum(state in ("complete", "no_route") for state in states),
+                "pair_no_route": states.count("no_route"),
+                "pair_pending": sum(
+                    state in ("pending", "inflight", "quota_wait") for state in states
+                ),
+                "pair_errors": states.count("error"),
+                "pair_quota_wait": states.count("quota_wait"),
+                "pair_expired": states.count("expired"),
+            }
+
+    def _job_state(self, key: str, state: str):
+        with self._diagnostic_lock:
+            self._job_states[key] = state
+
+    def record_search(self, key: str, data: dict):
+        method = getattr(self.http_client, "record_search", None)
+        if method is not None:
+            method(key, data)
 
     def routes(self, request: LifiRouteRequest) -> tuple[LifiRoute, ...]:
         if is_unwrap_request(request):
-            source = self.token_price(AssetIdentity(
-                request.from_chain_id, request.from_token_address, 18
-            ))
+            source = self.token_price(
+                AssetIdentity(request.from_chain_id, request.from_token_address, 18)
+            )
             native = self.token_price(AssetIdentity(request.from_chain_id, "native", 18))
-            return (_route_from_dict(unwrap_route_payload(
-                request, source.price_usd, native.price_usd
-            )),)
+            route = _route_from_dict(
+                unwrap_route_payload(request, source.price_usd, native.price_usd)
+            )
+            self.route_observed_at[request] = route.evidence.quote_timestamp
+            return (route,)
         payload = {
             "fromAddress": request.from_address,
             "toAddress": request.to_address,
             "fromAmount": request.from_amount,
             "fromChainId": request.from_chain_id,
-            "fromTokenAddress": request.from_token_address,
+            "fromTokenAddress": lifi_token_address(
+                request.from_chain_id, request.from_token_address
+            ),
             "toChainId": request.to_chain_id,
-            "toTokenAddress": request.to_token_address,
+            "toTokenAddress": lifi_token_address(request.to_chain_id, request.to_token_address),
             "options": {
                 "integrator": "jumper.exchange",
                 "order": "CHEAPEST",
@@ -233,38 +325,144 @@ class LifiClient:
             },
         }
         try:
-            response = self._post(payload)
+            routes = self._read_routes(request, payload)
+            return tuple(self._price_missing_gas_tokens(route) for route in routes)
         except Exception as error:
             with self._diagnostic_lock:
-                self.route_diagnostics.append({
-                    "from_chain_id": request.from_chain_id,
-                    "to_chain_id": request.to_chain_id,
-                    "from_asset": request.from_token_address,
-                    "to_asset": request.to_token_address,
-                    "error": type(error).__name__, "detail": redact_text(str(error))[:500],
-                })
+                self.route_diagnostics.append(
+                    {
+                        "from_chain_id": request.from_chain_id,
+                        "to_chain_id": request.to_chain_id,
+                        "from_asset": request.from_token_address,
+                        "to_asset": request.to_token_address,
+                        "error": type(error).__name__,
+                        "detail": redact_text(str(error)),
+                        "diagnostic": exception_diagnostic(error),
+                    }
+                )
             raise
-        body = response.json()
+
+    @staticmethod
+    def _parse_routes(body, retrieved_at):
         if not isinstance(body, dict) or not isinstance(body.get("routes"), list):
             raise LifiError("LI.FI response does not contain routes")
-        retrieved_at = _utc_timestamp()
-        routes = tuple(
+        return tuple(
             _route_from_dict(item, quote_timestamp=retrieved_at)
             for item in body["routes"]
+            if not uses_excluded_network(item)
         )
-        return tuple(self._price_missing_gas_tokens(route) for route in routes)
+
+    def _read_routes(self, request: LifiRouteRequest, payload: dict) -> tuple[LifiRoute, ...]:
+        jobs = self.quote_jobs
+        if jobs is None:
+            response = self._post(payload)
+            observed = _response_timestamp(response)
+            routes = self._parse_routes(response.json(), observed)
+            self.route_observed_at[request] = observed
+            return routes
+        complete_request = {
+            "endpoint": self.endpoint,
+            "payload": payload,
+            "from_token_decimals": request.from_token_decimals,
+            "to_token_decimals": request.to_token_decimals,
+            "catalog_digest": self.catalog_digest,
+        }
+        key = quote_job_key(jobs.scope, complete_request, self.policy_digest)
+        lock_key = (str(Path(jobs.db_path).resolve()), jobs.scope, key)
+        with _QUOTE_LOCKS_GUARD:
+            lock = _QUOTE_LOCKS.setdefault(lock_key, Lock())
+        with lock:
+            self._job_state(key, "pending")
+            row = jobs.read(key)
+            if row and row["state"] in ("complete", "no_route"):
+                return self._cached_job_routes(row, request)
+            search_key = (
+                f"{request.from_address.lower()}:{request.from_chain_id}:"
+                f"{request.from_token_address.lower()}:{self.policy_digest}:{self.catalog_digest}"
+            )
+            try:
+                token = jobs.claim(key, complete_request, self.policy_digest, search_key=search_key)
+            except JobInProgress as error:
+                self._job_state(
+                    key,
+                    "error"
+                    if error.reason in ("error", "bad_request")
+                    else "quota_wait"
+                    if error.reason == "quota_wait"
+                    else "pending",
+                )
+                if error.reason in ("complete", "no_route"):
+                    row = jobs.read(key)
+                    if row and row["state"] in ("complete", "no_route"):
+                        return self._cached_job_routes(row, request)
+                raise
+            self._job_state(key, "inflight")
+            try:
+                with jobs.heartbeat(token):
+                    response = self._post(payload, cache_namespace=key)
+                    body = response.json()
+                    observed = _response_timestamp(response)
+                    routes = self._parse_routes(body, observed)
+                    self.route_observed_at[request] = observed
+                    if not jobs.finish(token, body, _parse_timestamp(observed).timestamp()):
+                        raise JobInProgress(reason="job_in_progress")
+                    self._job_state(key, "no_route" if body["routes"] == [] else "complete")
+                    return routes
+            except Exception as error:
+                quota_wait = isinstance(error, LifiRequestLimit)
+                self._job_state(
+                    key,
+                    "quota_wait"
+                    if quota_wait
+                    else "pending"
+                    if isinstance(error, JobInProgress)
+                    else "error",
+                )
+                jobs.fail(
+                    token,
+                    error,
+                    state="quota_wait" if quota_wait else "error",
+                    retry_at=getattr(error, "retry_at", None),
+                )
+                raise
+
+    def _cached_job_routes(self, row: dict, request: LifiRouteRequest) -> tuple[LifiRoute, ...]:
+        with self._diagnostic_lock:
+            self._persisted_job_hits += 1
+            self._job_states[row["job_key"]] = row["state"]
+        observed = datetime.fromtimestamp(row["observed_at"], UTC).isoformat()
+        routes = self._parse_routes(row["result_json"], observed)
+        self.route_observed_at[request] = observed
+        return routes
 
     def token_price(self, asset: AssetIdentity) -> LifiPriceEvidence:
+        """Record concrete price failures before callers fall back to missing prices."""
+        try:
+            return self._token_price(asset)
+        except Exception as error:
+            with self._diagnostic_lock:
+                self.route_diagnostics.append(
+                    {
+                        "operation": "token_price",
+                        "chain_id": getattr(asset, "chain_id", None),
+                        "asset": getattr(asset, "contract_address", None),
+                        "decimals": getattr(asset, "decimals", None),
+                        "error": type(error).__name__,
+                        "detail": redact_text(str(error)),
+                        "diagnostic": exception_diagnostic(error),
+                    }
+                )
+            raise
+
+    def _token_price(self, asset: AssetIdentity) -> LifiPriceEvidence:
         """Fetch the USD price for one exact LI.FI token identity, without side effects."""
 
         if not isinstance(asset, AssetIdentity):
             raise ValueError("LI.FI token price identity is invalid")
-        token = (
-            "0x0000000000000000000000000000000000000000"
-            if asset.is_native
-            else asset.contract_address
-        )
-        response = http_request(self.http_client, 'get',
+        token = lifi_token_address(asset.chain_id, asset.contract_address)
+        response = http_request(
+            self.http_client,
+            "get",
             self.token_endpoint,
             params={"chain": asset.chain_id, "token": token},
             headers={"x-lifi-integrator": "jumper.exchange"},
@@ -299,21 +497,27 @@ class LifiClient:
         # native ETH and canonical WETH have nevertheless returned a wrong
         # positive price with correct identity metadata. Cross-check exact
         # canonical WETH, whose unit is one ETH, through a separate provider.
-        if asset.chain_id == 1 and asset.decimals == 18 and (
-            asset.is_native
-            or asset.contract_address == "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        if (
+            asset.chain_id == 1
+            and asset.decimals == 18
+            and (
+                asset.is_native
+                or asset.contract_address == "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+            )
         ):
             reference, observed_at = self._ethereum_reference_price()
             if abs(parsed_price / reference - 1) > Decimal("0.20"):
                 return LifiPriceEvidence(
                     asset, str(reference), observed_at, "defillama:ethereum:canonical_weth", price
                 )
-        return LifiPriceEvidence(asset, price, _utc_timestamp(), "lifi", price)
+        return LifiPriceEvidence(asset, price, _response_timestamp(response), "lifi", price)
 
     def _ethereum_reference_price(self) -> tuple[Decimal, str]:
         key = "ethereum:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
         response = http_request(
-            self.http_client, "get", "https://coins.llama.fi/prices/current/" + key,
+            self.http_client,
+            "get",
+            "https://coins.llama.fi/prices/current/" + key,
             timeout=5,
         )
         response.raise_for_status()
@@ -329,9 +533,12 @@ class LifiClient:
             age = datetime.now(UTC) - observed
             if (
                 coin["decimals"] != 18
-                or not price.is_finite() or price <= 0
-                or not confidence.is_finite() or confidence < Decimal("0.90")
-                or age < timedelta(0) or age > timedelta(minutes=5)
+                or not price.is_finite()
+                or price <= 0
+                or not confidence.is_finite()
+                or confidence < Decimal("0.90")
+                or age < timedelta(0)
+                or age > timedelta(minutes=5)
             ):
                 raise ValueError("invalid or stale Ethereum reference price")
         except (KeyError, TypeError, InvalidOperation, OverflowError) as exc:
@@ -361,7 +568,9 @@ class LifiClient:
             raise ValueError("LI.FI status chain identity is invalid")
         if not isinstance(bridge, str) or not bridge.strip():
             raise ValueError("LI.FI status bridge identity is invalid")
-        response = http_request(self.http_client, 'get',
+        response = http_request(
+            self.http_client,
+            "get",
             self.status_endpoint,
             params={
                 "txHash": tx_hash,
@@ -416,7 +625,7 @@ class LifiClient:
         evidence = replace(route.evidence, prices=tuple(prices))
         return replace(route, gas_costs=tuple(gas_costs), evidence=evidence)
 
-    def _post(self, payload: dict) -> _Response:
+    def _post(self, payload: dict, *, cache_namespace: str | None = None) -> _Response:
         if self.route_rate_error is not None:
             raise LifiError(self.route_rate_error)
         headers = {
@@ -426,8 +635,20 @@ class LifiClient:
         }
         for attempt in range(3):
             try:
-                response = http_request(self.http_client, 'post',
-                    self.endpoint, json=payload, headers=headers, timeout=30
+                internal = (
+                    {"cache_namespace": cache_namespace}
+                    if cache_namespace is not None
+                    and getattr(self.http_client, "supports_cache_namespace", False)
+                    else {}
+                )
+                response = http_request(
+                    self.http_client,
+                    "post",
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=30,
+                    **internal,
                 )
                 if getattr(response, "status_code", None) == 429:
                     self.route_rate_error = "route_api_rate_limited"
@@ -441,8 +662,11 @@ class LifiClient:
                 return response
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status not in {429, 500, 502, 503, 504} or attempt == 2:
+                if status not in {500, 502, 503, 504} or attempt == 2:
                     raise
+                record_retry = getattr(self.http_client, "record_retry", None)
+                if record_retry is not None:
+                    record_retry()
                 budget_sleep(0.5 * (2**attempt), sleep=time.sleep)
         raise AssertionError("unreachable")
 
@@ -470,6 +694,8 @@ class LifiClient:
             raise ValueError("Jumper transaction request is malformed") from exc
 
     def _post_step(self, step: dict[str, Any]) -> _Response:
+        if self.route_rate_error is not None:
+            raise LifiError(self.route_rate_error)
         headers = {
             "referer": "https://jumper.exchange/",
             "origin": "https://jumper.exchange",
@@ -477,25 +703,31 @@ class LifiClient:
         }
         for attempt in range(3):
             try:
-                response = http_request(self.http_client, 'post',
+                response = http_request(
+                    self.http_client,
+                    "post",
                     self.endpoint.rsplit("/", 1)[0] + "/stepTransaction",
                     json=step,
                     headers=headers,
                     timeout=30,
                 )
+                if getattr(response, "status_code", None) == 429:
+                    self.route_rate_error = "route_api_rate_limited"
+                    raise LifiError(self.route_rate_error)
                 response.raise_for_status()
                 return response
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status not in {429, 500, 502, 503, 504} or attempt == 2:
+                if status not in {500, 502, 503, 504} or attempt == 2:
                     raise
+                record_retry = getattr(self.http_client, "record_retry", None)
+                if record_retry is not None:
+                    record_retry()
                 budget_sleep(0.5 * (2**attempt), sleep=time.sleep)
         raise AssertionError("unreachable")
 
 
-def _route_from_dict(
-    value: object, *, quote_timestamp: str | None = None
-) -> LifiRoute:
+def _route_from_dict(value: object, *, quote_timestamp: str | None = None) -> LifiRoute:
     if not isinstance(value, dict):
         raise LifiError("LI.FI route is invalid")
     try:
@@ -511,9 +743,7 @@ def _route_from_dict(
             action = _bridge_action_from_step(first_step)
         except ValueError:
             action = None
-        evidence_step_gas, evidence_step_fees = _step_estimate_costs(
-            steps, include_nested=True
-        )
+        evidence_step_gas, evidence_step_fees = _step_estimate_costs(steps, include_nested=True)
         route_gas_costs = _gas_costs(value["gasCosts"]) if "gasCosts" in value else ()
         route_fee_costs = _fee_costs(value["feeCosts"]) if "feeCosts" in value else ()
         gas_costs, gas_reasons = _hierarchical_costs(steps, "gasCosts", _gas_costs)
@@ -532,29 +762,19 @@ def _route_from_dict(
             raise ValueError("LI.FI route ID is required")
         from_amount = _required_integer(value["fromAmount"], "route amount")
         to_amount = _required_nonnegative_integer(value["toAmount"], "route output amount")
-        to_amount_min = _required_nonnegative_integer(
-            value["toAmountMin"], "route minimum output"
-        )
+        to_amount_min = _required_nonnegative_integer(value["toAmountMin"], "route minimum output")
         if to_amount_min > to_amount:
-            raise LifiError(
-                "LI.FI route minimum output cannot exceed quoted output"
-            )
+            raise LifiError("LI.FI route minimum output cannot exceed quoted output")
         snapshot_time = quote_timestamp or _utc_timestamp()
         steps_evidence = _normalize_steps(steps)
         route_steps = tuple(step for step in steps_evidence if not step.is_substep)
         normalized_steps = tuple(step for step in steps_evidence if step.source is not None)
         if not route_steps or any(step.normalization_error for step in route_steps):
             detail = next(
-                (
-                    step.normalization_error
-                    for step in route_steps
-                    if step.normalization_error
-                ),
+                (step.normalization_error for step in route_steps if step.normalization_error),
                 "step is malformed",
             )
-            raise LifiError(
-                f"LI.FI route has an unnormalizable executable step: {detail}"
-            )
+            raise LifiError(f"LI.FI route has an unnormalizable executable step: {detail}")
         top_level_steps = tuple(step for step in normalized_steps if not step.is_substep)
         if not top_level_steps or not top_level_steps[-1].destination:
             raise ValueError("LI.FI route endpoints are missing")
@@ -651,10 +871,7 @@ def validate_bridge_route(
         raise ValueError("LI.FI route final recipient does not match top-level step")
     if final_step.to_amount is not None and final_step.to_amount != evidence.output_amount:
         raise ValueError("LI.FI route output amount does not match final top-level step")
-    if (
-        evidence.source != expected_source
-        or evidence.destination != expected_destination
-    ):
+    if evidence.source != expected_source or evidence.destination != expected_destination:
         raise ValueError(
             "LI.FI route source identity or destination identity does not match expectation"
         )
@@ -718,8 +935,7 @@ def _validate_route_evidence_integrity(route: LifiRoute) -> None:
         or evidence.payload_sha256 != expected_evidence.payload_sha256
         or evidence.canonical_payload_json != expected_evidence.canonical_payload_json
         or evidence.costs_complete != expected_evidence.costs_complete
-        or evidence.costs_incomplete_reason
-        != expected_evidence.costs_incomplete_reason
+        or evidence.costs_incomplete_reason != expected_evidence.costs_incomplete_reason
     ):
         raise LifiError("LI.FI route evidence integrity failed: normalized evidence changed")
     if len(route.gas_costs) != len(expected.gas_costs):
@@ -733,9 +949,7 @@ def _validate_route_evidence_integrity(route: LifiRoute) -> None:
             and expected_cost.price_usd is None
             and actual_cost.price_usd == extra_price.price_usd
             and actual_cost.price_timestamp == extra_price.timestamp
-            for expected_cost, actual_cost in zip(
-                expected.gas_costs, route.gas_costs, strict=True
-            )
+            for expected_cost, actual_cost in zip(expected.gas_costs, route.gas_costs, strict=True)
         ):
             raise LifiError("LI.FI route evidence integrity failed: unexpected price added")
     for expected_cost, actual_cost in zip(expected.gas_costs, route.gas_costs, strict=True):
@@ -778,11 +992,9 @@ def _bridge_action_from_step(step: dict[str, Any]) -> LifiBridgeAction:
             source=source,
             destination=destination,
             from_amount=_required_integer(action["fromAmount"], "step amount"),
-                recipient=(
-                    _address(action["toAddress"])
-                    if action.get("toAddress") is not None
-                    else None
-                ),
+            recipient=(
+                _address(action["toAddress"]) if action.get("toAddress") is not None else None
+            ),
             raw_step=step,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -792,7 +1004,10 @@ def _bridge_action_from_step(step: dict[str, Any]) -> LifiBridgeAction:
 def _identity_from_token(chain_id: object, token: object) -> AssetIdentity:
     if not isinstance(token, dict):
         raise ValueError("LI.FI token is malformed")
+    chain_id = _required_integer(chain_id, "chain ID")
     address = token.get("address")
+    if chain_id == CELO_CHAIN_ID and isinstance(address, str):
+        address = lifi_token_address(CELO_CHAIN_ID, address)
     if isinstance(address, str) and address.lower() == "0x0000000000000000000000000000000000000000":
         address = "native"
     return AssetIdentity(_required_integer(chain_id, "chain ID"), address, token.get("decimals"))
@@ -868,9 +1083,7 @@ def _normalize_steps(steps: list[dict[str, Any]]) -> tuple[LifiStepEvidence, ...
                 raise ValueError("action is missing")
             source = _identity_from_token(action["fromChainId"], action["fromToken"])
             destination = _identity_from_token(action["toChainId"], action["toToken"])
-            raw_amount = _required_nonnegative_integer(
-                action["fromAmount"], "step input amount"
-            )
+            raw_amount = _required_nonnegative_integer(action["fromAmount"], "step input amount")
             step_type = step.get("type")
             provider = step.get("tool")
             if not isinstance(step_type, str) or not step_type.strip():
@@ -896,12 +1109,8 @@ def _normalize_steps(steps: list[dict[str, Any]]) -> tuple[LifiStepEvidence, ...
                     ),
                     recipient=_address(recipient) if recipient is not None else None,
                     payload_sha256=_payload_sha256(step),
-                    source_price_usd=_optional_string(
-                        action["fromToken"].get("priceUSD")
-                    ),
-                    destination_price_usd=_optional_string(
-                        action["toToken"].get("priceUSD")
-                    ),
+                    source_price_usd=_optional_string(action["fromToken"].get("priceUSD")),
+                    destination_price_usd=_optional_string(action["toToken"].get("priceUSD")),
                     source_price_timestamp=_price_timestamp(action["fromToken"]),
                     destination_price_timestamp=_price_timestamp(action["toToken"]),
                     is_substep=is_substep,
@@ -1001,6 +1210,7 @@ def _route_prices(
 
 def _costs_cover(parent, children) -> bool:
     """A parent aggregate must cover each child's exact token and raw amount."""
+
     def totals(costs):
         result = {}
         for cost in costs:

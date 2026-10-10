@@ -277,12 +277,12 @@ def test_candidate_loss_adds_wallet_paid_gas_but_not_provider_fee_items():
     assert candidate.loss_usd == Decimal("3.001")
 
 
-def test_candidate_rejects_incomplete_lifi_cost_evidence():
+def test_candidate_rejects_unpriced_nested_cost_evidence():
     candidate = _route_candidate(
         _route(costs_complete=False),
     )
 
-    assert candidate.reason == "incomplete_cost_evidence"
+    assert candidate.reason == "missing_gas_price"
     assert candidate.loss_pct is None
 
 

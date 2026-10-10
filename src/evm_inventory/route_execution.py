@@ -56,6 +56,7 @@ from .lifi import (
 )
 from .live_plan import _route_data, _valuation_data
 from .models import AssetIdentity
+from .network_policy import uses_excluded_network
 from .planner_gas import PlannerGasEstimator
 from .rpc import quantity
 from .stages import (
@@ -391,6 +392,28 @@ def revalidate_route_evidence(
     return current
 
 
+def _account_confirmed_local_unwrap_loss(journal: Journal, position_id: int, entry: dict) -> None:
+    """Retain paid conversion costs when a dependent deposit halts the group."""
+    if not entry.get("local_unwrap"):
+        return
+    for step in entry.get("steps", []):
+        if step.get("kind") != "unwrap_to_native":
+            continue
+        progress = (
+            journal.checkpoint(position_id, f"route:unwrap_to_native:{step['route']['id']}") or {}
+        )
+        result = progress.get("unwrap_result")
+        if not isinstance(result, dict):
+            continue
+        confirmed_loss = _exact_money(result["realized_loss_usd"], "unwrap loss")
+        direct = journal.latest_step(position_id=position_id, step_key="direct_deposit")
+        if direct is not None and direct["tx_hash"]:
+            prepared = journal.checkpoint(position_id, "direct_prepared")
+            if prepared is not None:
+                confirmed_loss = _exact_sum((confirmed_loss, _entry_loss(prepared)))
+        journal.account_position_loss(position_id, loss_usd=_decimal_string(confirmed_loss))
+
+
 def execute_group_entries(
     entries: list[dict],
     *,
@@ -408,6 +431,8 @@ def execute_group_entries(
     position state before it moves on to another balance.
     """
 
+    if any(uses_excluded_network(entry) for entry in entries):
+        return {"excluded": len(entries)}
     if not entries:
         return {"completed": 0}
     first = entries[0]
@@ -491,6 +516,8 @@ def execute_group_entries(
             if state == "manual_review_after_swap"
             else "manual_review_group_halted"
         )
+        for index in range(max(0, start - 1), len(entries)):
+            _account_confirmed_local_unwrap_loss(journal, positions[index]["id"], entries[index])
         for index in range(start, len(entries)):
             target_state = (
                 current_position_state if index == start and current_position_state else state
@@ -847,7 +874,7 @@ def execute_group_entries(
                         break
                     if result.get("state") not in {"confirmed", "completed"}:
                         raise ValueError("route step did not confirm")
-                    if step.get("kind") == "direct_deposit":
+                    if step.get("kind") == "direct_deposit" or fresh.get("local_unwrap"):
                         realized = Decimal(
                             journal.account_position_loss(
                                 position_id,
@@ -1040,6 +1067,17 @@ def execute_entries(
 ) -> dict[str, int]:
     """Execute one wallet at a time; refuses unless the caller set ``execute=True``."""
 
+    excluded_groups = {
+        str(entry.get("group", {}).get("key"))
+        for entry in entries
+        if uses_excluded_network(entry) and isinstance(entry.get("group"), dict)
+    }
+    entries = [
+        entry for entry in entries
+        if not uses_excluded_network(entry)
+        and not (isinstance(entry.get("group"), dict)
+                 and str(entry["group"].get("key")) in excluded_groups)
+    ]
     require_trusted_deposit_addresses(trust_deposit_addresses)
     if not execute:
         raise ValueError("refusing to broadcast without --execute")
@@ -1057,6 +1095,34 @@ def execute_entries(
         raise ValueError("invalid execution delay range")
     now_ms = now_ms or _utc_now_ms
     Deadline(stage_seconds, "execution")  # validate before allocating clients
+    relay_entries = [e for e in entries if e.get("routing_provider") == "relay"]
+    if relay_entries:
+        if preflight_entry is not None or submit_route_step is not None:
+            raise ValueError("Relay execution cannot use LI.FI injected step callbacks")
+        from .relay_execution import execute_relay_entries
+
+        relay_summary = execute_relay_entries(
+            relay_entries, wallets=wallets, rpc_urls=rpc_urls,
+            journal_path=journal_path, bitget=_bitget_client(),
+            target_validator=_require_live_target, position_key=_position_key,
+            max_route_loss_pct=max_route_loss_pct, stage_seconds=stage_seconds,
+            execute=execute, trust_deposit_addresses=trust_deposit_addresses,
+        )
+        remaining = [e for e in entries if e.get("routing_provider") != "relay"]
+        if remaining:
+            other = execute_entries(
+                remaining, wallets=wallets, rpc_urls=rpc_urls,
+                journal_path=journal_path, execute=execute,
+                delay_min_seconds=delay_min_seconds, delay_max_seconds=delay_max_seconds,
+                sleep=sleep, rng=rng, wallet_batches=wallet_batches, now_ms=now_ms,
+                max_route_loss_pct=max_route_loss_pct, requote_bridge=requote_bridge,
+                stage_seconds=stage_seconds,
+                allow_duplicate_deposit_addresses=allow_duplicate_deposit_addresses,
+                trust_deposit_addresses=trust_deposit_addresses,
+            )
+            for key, value in other.items():
+                relay_summary[key] = relay_summary.get(key, 0) + value
+        return relay_summary
     _validate_final_deposit_targets(entries)
     v4_entries = [
         entry
@@ -1094,7 +1160,7 @@ def execute_entries(
     rng = rng or random.Random()
     transport = Transport(interval=0.2)
     rpc = ExecutionRpc(transport)
-    lifi_clients = WalletLifiClients(wallets.values())
+    lifi_clients = WalletLifiClients(wallets.values(), db_path=journal_path, purpose="execution")
     bitget = _bitget_client()
     summary = {"submitted": 0, "skipped": 0, "failed": 0, "deferred": 0}
     by_wallet: dict[str, list[dict]] = {}
@@ -1268,7 +1334,7 @@ def _execute_live_groups(
 ) -> dict[str, int]:
     transport = Transport(interval=0.2)
     rpc = ExecutionRpc(transport)
-    lifi_clients = WalletLifiClients(wallets.values())
+    lifi_clients = WalletLifiClients(wallets.values(), db_path=journal_path, purpose="execution")
     bitget = _bitget_client()
     groups: dict[str, list[dict]] = {}
     for entry in entries:
@@ -1408,7 +1474,17 @@ def _preflight_live_entry(
     gas_estimator: PlannerGasEstimator,
     now_ms: Callable[[], int],
 ) -> dict:
-    _require_live_target(entry, wallet=wallet, bitget=bitget)
+    target = _require_live_target(entry, wallet=wallet, bitget=bitget)
+    if entry.get("local_unwrap") and entry["status"] != "direct_deposit":
+        steps = entry.get("steps", [])
+        if (
+            target.chain_id != int(entry["chain_id"])
+            or target.asset_id != "native"
+            or target.decimals != 18
+        ):
+            raise ValueError("requote_required:local_unwrap_target_invalid")
+        if len(steps) != 1 or steps[0].get("kind") != "unwrap_to_native":
+            raise ValueError("requote_required:local_unwrap_steps_invalid")
     now = datetime.fromtimestamp(now_ms() / 1000, UTC)
     if entry["status"] == "direct_deposit":
         asset = AssetIdentity(
@@ -1512,6 +1588,40 @@ def _preflight_live_entry(
     candidate = candidates[0]
     for next_candidate in candidates[1:]:
         candidate = combine_candidates(candidate, next_candidate)
+    if entry.get("local_unwrap"):
+        native = native_asset_identity(target.chain_id)
+        direct_gas = gas_estimator(
+            purpose="direct_deposit",
+            route=None,
+            wallet=wallet.public_address,
+            source_asset=native,
+            target=target,
+            amount=candidate.destination_amount,
+            recipient=wallet.bitget_deposit_address,
+        )
+        price = _quote_price(jumper, native)
+        direct_candidate = candidate_from_values(
+            route_ids=(),
+            source_asset=native,
+            destination_asset=native,
+            source_amount=candidate.destination_amount,
+            destination_amount=candidate.destination_amount,
+            source_price=price,
+            destination_price=price,
+            wallet_paid_gas=direct_gas or (),
+            gas_estimate_complete=direct_gas is not None,
+            now=now,
+            max_price_age=_MAX_PRICE_AGE,
+        )
+        _require_valid_candidate(direct_candidate)
+        candidate = combine_candidates(candidate, direct_candidate)
+        gas_cap = sum(fee.raw_amount for fee in candidates[0].gas_estimates)
+        direct_cap = sum(fee.raw_amount for fee in direct_gas)
+        if (
+            candidate.destination_amount - gas_cap - GAS_RESERVE_MULTIPLIER * direct_cap
+            < target.minimum_raw
+        ):
+            raise ValueError("requote_required:below_target_minimum")
     _require_valid_candidate(candidate)
     fresh = {**entry, "steps": fresh_steps}
     fresh["_candidate"] = candidate
@@ -1545,9 +1655,29 @@ def _refresh_route_step(
         raise ValueError("requote_required:actual_asset_identity_changed")
     recipient = (
         wallet.public_address
-        if step.get("kind") == "swap_to_native"
+        if step.get("kind") in {"swap_to_native", "unwrap_to_native"}
         else wallet.bitget_deposit_address
     )
+    planned = _route_from_dict(
+        json.loads(evidence["canonical_payload_json"]),
+        quote_timestamp=evidence["quote_timestamp"],
+    )
+    if step.get("kind") == "unwrap_to_native":
+        if not entry.get("local_unwrap") or len(planned.raw_steps) != 1:
+            raise ValueError("requote_required:local_unwrap_steps_invalid")
+        withdraw_transaction_fields(planned.raw_steps[0])
+        target = _require_live_target(entry, wallet=wallet, bitget=bitget)
+        if (
+            destination != native_asset_identity(int(entry["chain_id"]))
+            or source
+            != AssetIdentity(int(entry["chain_id"]), str(entry["asset_id"]), int(entry["decimals"]))
+            or amount != int(entry["raw_balance"])
+            or planned.raw_steps[0]["action"]["fromAddress"].lower()
+            != wallet.public_address.lower()
+            or (target.chain_id, target.asset_id, target.decimals)
+            != (destination.chain_id, destination.contract_address, destination.decimals)
+        ):
+            raise ValueError("requote_required:local_unwrap_identity_invalid")
     live = step.get("_live_route")
     if not isinstance(live, LifiRoute):
         request = LifiRouteRequest(
@@ -1566,10 +1696,6 @@ def _refresh_route_step(
         )
         if live is None:
             raise ValueError("requote_required:route_id_changed")
-    planned = _route_from_dict(
-        json.loads(evidence["canonical_payload_json"]),
-        quote_timestamp=evidence["quote_timestamp"],
-    )
     revalidate_route_evidence(
         planned,
         live,
@@ -1612,7 +1738,7 @@ def _refresh_route_step(
         replace_route_gas=bool(extra_gas),
     )
     _require_valid_candidate(candidate)
-    if step.get("kind") != "swap_to_native":
+    if step.get("kind") not in {"swap_to_native", "unwrap_to_native"}:
         _require_target_minimum(entry, bitget, wallet, candidate)
     fresh_step = {
         **step,
@@ -2020,6 +2146,78 @@ def _actual_gas_paid_usd(
     return total
 
 
+def _continue_local_unwrap(
+    entry: dict,
+    result: dict,
+    *,
+    position_id: int,
+    progress_key: str,
+    progress: dict,
+    wallet: WalletWorkbookRow,
+    rpc: ExecutionRpc,
+    rpc_urls: dict[int, str],
+    jumper: LifiClient,
+    bitget: BitgetClient,
+    journal: Journal,
+    now_ms: Callable[[], int],
+) -> dict:
+    """Persist the withdrawal output before preparing its dependent deposit."""
+    target = _require_live_target(entry, wallet=wallet, bitget=bitget)
+    native = native_asset_identity(int(entry["chain_id"]))
+    if (target.chain_id, target.asset_id, target.decimals) != (
+        native.chain_id,
+        native.contract_address,
+        native.decimals,
+    ):
+        raise ValueError("requote_required:local_unwrap_target_invalid")
+    amount = _raw_amount(result["actual_balance_raw"])
+    if result["actual_asset_id"] != native.contract_address:
+        raise ValueError("requote_required:local_unwrap_output_invalid")
+    progress["unwrap_result"] = result
+    journal.save_checkpoint(position_id, progress_key, progress)
+    journal.record_position_state(
+        position_id,
+        "source_asset_converted_bridge_pending",
+        actual_asset_id=native.contract_address,
+        actual_balance_raw=amount,
+    )
+    requote = entry.get("_requote_after_intermediate")
+    if not callable(requote):
+        raise ValueError("requote_required:local_unwrap_deposit_preflight_unavailable")
+    dynamic = requote(entry, native, amount)
+    if (
+        not isinstance(dynamic, dict)
+        or dynamic.get("status") != "direct_deposit"
+        or len(dynamic.get("steps", [])) != 1
+        or dynamic["steps"][0].get("kind") != "direct_deposit"
+        or dynamic.get("_actual_asset_id") != native.contract_address
+        or _raw_amount(dynamic.get("_actual_balance_raw")) > amount
+    ):
+        raise ValueError("requote_required:local_unwrap_deposit_shape_invalid")
+    accrued = _exact_money(result["realized_loss_usd"], "unwrap loss")
+    group_check = entry.get("_check_group_loss")
+    if callable(group_check):
+        group_check(_exact_sum((accrued, _entry_loss(dynamic))))
+    dynamic.update(
+        _journal_position_id=position_id,
+        _realized_loss_before_current_usd=_decimal_string(accrued),
+    )
+    dynamic.update({key: value for key, value in entry.items() if callable(value)})
+    progress["continuation"] = dynamic
+    journal.save_checkpoint(position_id, progress_key, progress)
+    return _submit_live_step(
+        dynamic,
+        dynamic["steps"][0],
+        wallet=wallet,
+        rpc=rpc,
+        rpc_urls=rpc_urls,
+        jumper=jumper,
+        bitget=bitget,
+        journal=journal,
+        now_ms=now_ms,
+    )
+
+
 def _submit_live_step(
     entry: dict,
     step: dict,
@@ -2056,7 +2254,9 @@ def _submit_live_step(
                 )
             # Recovery observes the known transaction; it never prepares or signs another.
         else:
-            if entry.get("_observation_restore") and current_deadline() is not None:
+            if entry.get("_observation_restore") and (
+                current_deadline() is not None or entry.get("local_unwrap")
+            ):
                 entry = _preflight_live_entry(
                     entry,
                     wallet=wallet,
@@ -2185,9 +2385,16 @@ def _submit_live_step(
             journal=journal,
             now_ms=now_ms,
         )
+    if step.get("kind") == "unwrap_to_native" and progress.get("unwrap_result"):
+        return _continue_local_unwrap(
+            entry, progress["unwrap_result"], position_id=position_id,
+            progress_key=progress_key, progress=progress, wallet=wallet, rpc=rpc,
+            rpc_urls=rpc_urls, jumper=jumper, bitget=bitget, journal=journal,
+            now_ms=now_ms,
+        )
     initial_native = progress.get("initial_native")
     destination = _asset_from_data(route_data["evidence"]["destination"])
-    if step.get("kind") == "swap_to_native" and initial_native is None:
+    if step.get("kind") in {"swap_to_native", "unwrap_to_native"} and initial_native is None:
         initial_native = _asset_balance(
             rpc,
             url=_rpc_url(rpc_urls, destination.chain_id),
@@ -2296,6 +2503,16 @@ def _submit_live_step(
                 bitget=bitget,
                 source_amount=int(route_data["evidence"]["input_amount"]),
             )
+            if step.get("kind") == "unwrap_to_native":
+                local_fresh = _preflight_live_entry(
+                    entry, wallet=wallet, rpc=rpc, rpc_urls=rpc_urls,
+                    jumper=jumper, bitget=bitget,
+                    gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper),
+                    now_ms=now_ms,
+                )
+                candidate = local_fresh["_candidate"]
+                refreshed = local_fresh["steps"][0]
+                entry["_step_candidates"] = local_fresh["_step_candidates"]
             group_check = entry.get("_check_group_loss")
             if callable(group_check):
                 group_check(
@@ -2494,7 +2711,7 @@ def _submit_live_step(
             _exact_sum((realized_before, _exact_money(candidate.loss_usd, "route loss")))
         ),
     }
-    if step.get("kind") == "swap_to_native":
+    if step.get("kind") in {"swap_to_native", "unwrap_to_native"}:
         final_native = _asset_balance(
             rpc,
             url=_rpc_url(rpc_urls, destination.chain_id),
@@ -2503,11 +2720,20 @@ def _submit_live_step(
         )
         net_output = final_native - int(initial_native)
         generated_output = net_output + paid_native_gas
+        if step.get("kind") == "unwrap_to_native":
+            net_output = min(net_output, int(evidence.input_amount) - paid_native_gas)
+            generated_output = net_output + paid_native_gas
         if generated_output <= 0 or net_output <= 0:
             raise ValueError("source_swap_generated_no_native_asset")
         result["actual_asset_id"] = destination.contract_address
         result["actual_balance_raw"] = str(net_output)
         result["generated_output_raw"] = str(generated_output)
+    if step.get("kind") == "unwrap_to_native":
+        return _continue_local_unwrap(
+            entry, result, position_id=position_id, progress_key=progress_key,
+            progress=progress, wallet=wallet, rpc=rpc, rpc_urls=rpc_urls,
+            jumper=jumper, bitget=bitget, journal=journal, now_ms=now_ms,
+        )
     return result
 
 

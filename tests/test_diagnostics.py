@@ -27,3 +27,50 @@ def test_provider_diagnostic_preserves_cause_and_masks_credentials():
     assert provider["response_headers"]["x-api-key"] == "[REDACTED_SECRET]"
     assert proxy not in str(diagnostic)
     assert private_key not in str(diagnostic)
+
+
+def test_scan_keeps_provider_error_through_cooldown_and_export(tmp_path):
+    import csv
+    import json
+
+    from test_scanner import RPC, scope
+
+    from evm_inventory.report import export_current
+    from evm_inventory.scanner import scan
+    from evm_inventory.store import Store
+    from evm_inventory.transport import RequestError
+
+    class BrokenRPC(RPC):
+        def block(self, *args):
+            raise RequestError('network_error', diagnostic={
+                'attempts': [{'exception_type': 'ConnectError', 'exception': 'DNS lookup failed'}]
+            })
+
+    with Store(tmp_path / 'db.sqlite') as store:
+        result = scan(store, scope(), rpc=BrokenRPC())
+        failure = store.assets()[0]['result']
+        assert 'DNS lookup failed' in str(failure['diagnostic'])
+        assert 'DNS lookup failed' in str(result['error_details'])
+        export_current(store, tmp_path / 'report')
+    rows = list(csv.DictReader((tmp_path / 'report/checks.csv').open()))
+    assert 'DNS lookup failed' in str(json.loads(rows[0]['diagnostic']))
+
+
+def test_provider_only_is_not_counted_as_failed(tmp_path):
+    from test_scanner import RPC, D, Discover, scope
+
+    from evm_inventory.report import _coverage
+    from evm_inventory.scanner import scan
+    from evm_inventory.store import Store
+
+    config = scope()
+    config['catalog']['networks'][0]['alchemy_network'] = 'opt-mainnet'
+    discovery = Discover([([{'address': D, 'decimals': 6, 'reported_raw_balance': '10'}], None)])
+    with Store(tmp_path / 'db.sqlite') as store:
+        result = scan(store, config, rpc=RPC(), discovery=discovery)
+        assert result['discovered_failed'] == 0
+        assert result['discovered_provider_only'] == 1
+        assets = store.assets()
+        coverage = _coverage(store, [r for r in assets if r['kind'] == 'mandatory'], assets)
+        assert coverage[0]['discovered_verification_failures'] == 0
+        assert coverage[0]['discovered_provider_only'] == 1

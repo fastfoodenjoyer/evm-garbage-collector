@@ -22,6 +22,8 @@ class Discovery:
         self.paused = None
 
     def page(self, wallet, network, cursor=None):
+        # Portfolio uses matic-mainnet; the RPC catalog uses polygon-mainnet.
+        network = {"polygon-mainnet": "matic-mainnet"}.get(network, network)
         if not self.enabled:
             raise RequestError("discovery_disabled")
         if self.stopped:
@@ -51,12 +53,13 @@ class Discovery:
             if exc.code == "provider_access_denied":
                 self.stopped = exc.code
             elif exc.code in {"rate_limited", "network_error", "provider_unavailable"}:
-                self.paused = RequestError(exc.code, exc.retry_after or time.time() + 300)
+                self.paused = RequestError(exc.code, exc.retry_after or time.time() + 300,
+                                           diagnostic=exc.diagnostic)
                 raise self.paused from None
             raise
         # Network errors are independent of HTTP status and of per-token metadata errors.
         if data.get("error"):
-            raise RequestError("discovery_partial")
+            raise RequestError("discovery_partial", diagnostic={"provider_error": data["error"]})
         if not isinstance(data.get("data"), dict) or not isinstance(
             data["data"].get("tokens"), list
         ):
@@ -76,7 +79,14 @@ class Discovery:
             if not isinstance(token_address, str):
                 raise RequestError("discovery_invalid_address")
             if token_address.lower() != wallet.lower() or token.get("network") != network:
-                raise RequestError("discovery_wrong_scope")
+                mismatches = {}
+                if token_address.lower() != wallet.lower():
+                    mismatches["address"] = {"expected": wallet, "actual": token_address}
+                if token.get("network") != network:
+                    mismatches["network"] = {"expected": network, "actual": token.get("network")}
+                raise RequestError("discovery_wrong_scope", diagnostic={
+                    "mismatches": mismatches, "contract": contract,
+                })
             raw = token.get("tokenBalance")
             if not isinstance(raw, str) or not re.fullmatch(r"0x[0-9a-fA-F]{1,64}", raw):
                 raise RequestError("discovery_invalid_balance")

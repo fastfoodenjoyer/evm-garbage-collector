@@ -40,6 +40,11 @@ REASON_CODES = frozenset(
         "missing_route_evidence",
         "missing_source_price",
         "no_eligible_candidate",
+        "route_search_incomplete",
+        "quota_wait",
+        "no_enabled_deposit_target",
+        "lifi_request_budget_exceeded",
+        "route_api_rate_limited",
         "price_identity_mismatch",
         "recipient_mismatch",
         "route_identity_mismatch",
@@ -69,6 +74,7 @@ class ConsolidationCandidate:
     reason: str | None = None
     gas_estimate_complete: bool = False
     gas_estimates: tuple[FeeQuote, ...] = ()
+    price_expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "route_ids", tuple(self.route_ids))
@@ -306,10 +312,7 @@ def candidate_from_route(
         or route.route_id != evidence.route_id
     ):
         return _rejected(**base, reason="step_identity_mismatch")
-    if (
-        final_step.to_amount is not None
-        and evidence.min_output_amount > final_step.to_amount
-    ):
+    if final_step.to_amount is not None and evidence.min_output_amount > final_step.to_amount:
         return _rejected(**base, reason="invalid_candidate")
 
     price_book: dict[AssetIdentity, QuotePrice] = {}
@@ -402,14 +405,10 @@ def combine_candidates(
     assert second.conservative_destination_usd is not None
     assert first.wallet_paid_gas_usd is not None
     assert second.wallet_paid_gas_usd is not None
-    gas_usd = exact_decimal_sum(
-        (first.wallet_paid_gas_usd, second.wallet_paid_gas_usd)
-    )
+    gas_usd = exact_decimal_sum((first.wallet_paid_gas_usd, second.wallet_paid_gas_usd))
     slippage_loss = max(
         Decimal(0),
-        exact_decimal_difference(
-            first.source_usd, second.conservative_destination_usd
-        ),
+        exact_decimal_difference(first.source_usd, second.conservative_destination_usd),
     )
     loss_usd = exact_decimal_sum((slippage_loss, gas_usd))
     if first.source_usd <= 0:
@@ -482,23 +481,15 @@ def admit_group(
     try:
         source_value = _decimal(source_usd, "group source USD")
     except ValueError:
-        return _group_rejected(
-            "invalid_source_value", candidate_tuple, source_usd=None
-        )
+        return _group_rejected("invalid_source_value", candidate_tuple, source_usd=None)
     if source_value < 0:
-        return _group_rejected(
-            "invalid_source_value", candidate_tuple, source_usd=source_value
-        )
+        return _group_rejected("invalid_source_value", candidate_tuple, source_usd=source_value)
     try:
         loss_limit = _decimal(max_loss_pct, "maximum loss percent")
     except ValueError:
-        return _group_rejected(
-            "invalid_loss_limit", candidate_tuple, source_usd=source_value
-        )
+        return _group_rejected("invalid_loss_limit", candidate_tuple, source_usd=source_value)
     if loss_limit <= 0 or loss_limit > 100:
-        return _group_rejected(
-            "invalid_loss_limit", candidate_tuple, source_usd=source_value
-        )
+        return _group_rejected("invalid_loss_limit", candidate_tuple, source_usd=source_value)
     if source_value == 0:
         return _group_rejected("zero_source_value", candidate_tuple, source_usd=source_value)
     if not candidate_tuple:
@@ -512,9 +503,7 @@ def admit_group(
                 source_usd=source_value,
             )
     total_loss = exact_decimal_sum(
-        candidate.loss_usd
-        for candidate in candidate_tuple
-        if candidate.loss_usd is not None
+        candidate.loss_usd for candidate in candidate_tuple if candidate.loss_usd is not None
     )
     loss_pct = exact_percentage(total_loss, source_value)
     if loss_pct > loss_limit:
@@ -540,10 +529,14 @@ def _candidate_order_key(candidate: ConsolidationCandidate) -> tuple[object, ...
     assert candidate.loss_pct is not None and candidate.loss_usd is not None
     destination = candidate.destination_asset
     identity = (
-        destination.chain_id,
-        destination.contract_address,
-        destination.decimals,
-    ) if destination is not None else (0, "", 0)
+        (
+            destination.chain_id,
+            destination.contract_address,
+            destination.decimals,
+        )
+        if destination is not None
+        else (0, "", 0)
+    )
     return candidate.loss_pct, candidate.loss_usd, identity, candidate.route_ids
 
 
@@ -558,8 +551,11 @@ def _quote_for_gas(
 
 def _price_from_lifi_evidence(item: LifiPriceEvidence) -> QuotePrice:
     return QuotePrice(
-        item.asset, item.price_usd, _parse_timestamp(item.timestamp),
-        item.source, item.reported_price_usd,
+        item.asset,
+        item.price_usd,
+        _parse_timestamp(item.timestamp),
+        item.source,
+        item.reported_price_usd,
     )
 
 

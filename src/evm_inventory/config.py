@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import Catalog, ConfigError, Network, Token
+from .network_policy import EXCLUDED_NETWORKS
 
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SNAPSHOT_SETTINGS = frozenset({
@@ -146,6 +147,7 @@ def load_catalog(path: Path | None = None) -> Catalog:
         raise ConfigError("catalog networks must be an array")
     networks = tuple(
         _network_from_dict(item, index) for index, item in enumerate(data["networks"], start=1)
+        if not isinstance(item, dict) or item.get("chain_id") not in EXCLUDED_NETWORKS
     )
     catalog = Catalog(
         networks=networks,
@@ -276,6 +278,8 @@ def add_allowlisted_tokens(scope: dict[str, Any], path: Path) -> dict[str, Any]:
             continue
         if not isinstance(chain_id, int) or not isinstance(address, str):
             raise ConfigError("execution allowlist asset has invalid chain or address")
+        if chain_id in EXCLUDED_NETWORKS:
+            continue
         network = networks.get(chain_id)
         if network is None:
             raise ConfigError(f"execution allowlist chain {chain_id} is absent from catalog")

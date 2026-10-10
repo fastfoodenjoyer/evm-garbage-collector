@@ -147,7 +147,8 @@ def test_live_plan_rejects_route_without_a_complete_gas_estimate(tmp_path):
 
     assert len(quotes.requests) == 1
     assert plan["entries"][0]["status"] == "manual_review"
-    assert plan["entries"][0]["reason"] == "missing_gas_estimate"
+    assert plan["entries"][0]["reason"] == "route_search_incomplete"
+    assert "missing_gas_estimate" in plan["entries"][0]["search"]["errors"]
 
 
 def test_live_plan_quotes_ohno_only_on_blast_with_the_configured_allowlist(tmp_path):
@@ -208,7 +209,7 @@ def test_live_plan_queries_each_enabled_bitget_target_without_bridge_mappings(tm
         (request.to_chain_id, request.to_token_address) for request in quotes.requests
     } == {
         (target.chain_id, target.asset_id) for target in targets
-    } | {(10, "0x0000000000000000000000000000000000000000")}
+    }
     assert plan["entries"]
 
 
@@ -217,7 +218,7 @@ DESTINATION = "0x" + "b" * 40
 WALLET = "0x" + "1" * 40
 
 
-def test_live_plan_leaves_non_stable_at_source_native_pending_actual_output(tmp_path):
+def test_live_plan_does_not_fan_out_nonstable_via_native(tmp_path):
     balances = _balances(tmp_path, chain_id=10, asset_id=SOURCE, raw_balance=2_000_000, decimals=6)
     class RecordingQuotes:
         def __init__(self):
@@ -237,7 +238,7 @@ def test_live_plan_leaves_non_stable_at_source_native_pending_actual_output(tmp_
     )
 
     assert plan["entries"][0]["status"] == "manual_review"
-    assert len(client.requests) == 2
+    assert len(client.requests) == 1
 
 
 def test_live_plan_v4_queries_each_target_and_selects_lowest_total_loss(tmp_path):
@@ -289,56 +290,28 @@ def test_live_plan_v4_queries_each_target_and_selects_lowest_total_loss(tmp_path
     assert entry["route"]["evidence"]["payload_sha256"]
 
 
-def test_live_plan_v4_quotes_swap_to_native_then_bridges_actual_minimum_output(tmp_path):
+def test_live_plan_nonstable_uses_one_aggregated_quote_to_target(tmp_path):
     source = AssetIdentity(10, SOURCE, 6)
-    native = AssetIdentity(10, "native", 18)
     target = BitgetDepositTarget("USDC", 8453, DESTINATION, 1)
-    balances = _balance_rows(
-        tmp_path,
-        [
-            {
-                "wallet": WALLET,
-                "chain_id": source.chain_id,
-                "asset_id": source.contract_address,
-                "raw_balance": 100_000_000,
-                "decimals": source.decimals,
-                "symbol": "TOKEN",
-                "status": "success",
-            }
-        ],
-    )
+    balances = _balance_rows(tmp_path, [dict(wallet=WALLET, chain_id=10, asset_id=SOURCE,
+        raw_balance=100_000_000, decimals=6, symbol="TOKEN", status="success")])
 
     def quote(request):
-        if request.to_chain_id == source.chain_id:
-            assert request.to_token_address == _lifi_address(native)
-            assert request.to_address == WALLET
-            return (_quoted_route(request, route_id="swap-native", output_amount=5 * 10**16),)
-        assert request.from_token_address == _lifi_address(native)
-        assert request.from_amount == str(5 * 10**16 - 1)
+        assert request.from_token_address == source.contract_address
         assert request.to_chain_id == target.chain_id
         assert request.to_token_address == target.asset_id
         assert request.to_address == "0x" + "d" * 40
-        return (_quoted_route(request, route_id="bridge-target", output_amount=96_000_000),)
+        return (_quoted_route(request, route_id="aggregated-target", output_amount=96_000_000),)
 
     quotes = _RecordingQuotes(quote)
-    plan = create_live_plan(
-        balances,
-        deposit_addresses={WALLET: "0x" + "d" * 40},
-        allowlist_path=_allowlist(tmp_path, [(10, SOURCE, "swap")]),
-        client=quotes,
-        targets=(target,),
-        gas_estimator=lambda **_kwargs: (),
-        now_ms=lambda: int(NOW.timestamp() * 1000),
-    )
-
-    assert len(quotes.requests) == 2
+    plan = create_live_plan(balances, deposit_addresses={WALLET: "0x" + "d" * 40},
+        allowlist_path=_allowlist(tmp_path, [(10, SOURCE, "swap")]), client=quotes,
+        targets=(target,), gas_estimator=lambda **kw: (),
+        now_ms=lambda: int(NOW.timestamp() * 1000))
+    assert len(quotes.requests) == 1
     entry = plan["entries"][0]
     assert entry["status"] == "route_ready"
-    assert [step["route"]["id"] for step in entry["steps"]] == [
-        "swap-native",
-        "bridge-target",
-    ]
-    assert entry["steps"][1]["route"]["from_amount"] == str(5 * 10**16 - 1)
+    assert [step["route"]["id"] for step in entry["steps"]] == ["aggregated-target"]
 
 
 def test_live_plan_group_limit_ignores_denied_review_dust_and_missing_address(tmp_path):
@@ -430,7 +403,7 @@ def test_live_plan_group_limit_ignores_denied_review_dust_and_missing_address(tm
         "dust",
         "missing_deposit_address",
     }
-    assert len(quotes.requests) == 2
+    assert len(quotes.requests) == 1
 
 
 def test_live_plan_prices_direct_deposit_gas_and_does_not_request_a_route(tmp_path):

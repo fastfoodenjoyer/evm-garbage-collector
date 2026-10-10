@@ -87,3 +87,40 @@ def test_transport_rate_limit_does_not_start_retries_after_budget():
     assert calls[0] <= 0.05
     assert len(sleeps) == 1 and sleeps[0] <= 0.05
     transport.close()
+
+
+def test_soft_budget_warns_once_and_keeps_request_timeout(caplog):
+    from evm_inventory.stages import network_slot, request_timeout
+
+    deadline = Deadline(0.01, "quote", hard_limit=False)
+    with deadline_scope(deadline):
+        assert request_timeout(20) == 3
+        time.sleep(0.02)
+        with network_slot():
+            deadline.check()
+            assert request_timeout(20) == 3
+            assert not deadline.expired
+            assert deadline.remaining() is None
+    assert deadline.budget_exceeded
+    assert len(caplog.records) == 1
+
+
+def test_soft_budget_keeps_singleflight_alive_after_target():
+    from evm_inventory.lifi import LifiPriceEvidence
+    from evm_inventory.models import AssetIdentity
+    from evm_inventory.quote_parallel import CachedQuoteClient, complete_parallel
+
+    calls = []
+
+    class Quotes:
+        def token_price(self, asset):
+            calls.append(asset)
+            time.sleep(0.04)
+            return LifiPriceEvidence(asset, "1", "2026-10-06T00:00:00+00:00")
+
+    asset = AssetIdentity(10, "native", 18)
+    client = CachedQuoteClient(Quotes(), workers=4)
+    with deadline_scope(Deadline(0.01, "quote", hard_limit=False)):
+        result = complete_parallel(client.token_price, [asset] * 4, workers=4)
+    assert len(result) == 4
+    assert calls == [asset]

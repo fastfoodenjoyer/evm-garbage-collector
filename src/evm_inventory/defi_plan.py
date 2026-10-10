@@ -10,6 +10,7 @@ from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+from .network_policy import EXCLUDED_NETWORKS
 from .rabby import encode_action
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -58,6 +59,8 @@ def create_defi_plan(
             if not isinstance(protocol_id, str) or not isinstance(chain, str):
                 raise ValueError("Rabby protocol identity is missing")
             chain_id = chain_ids.get(chain)
+            if chain_id in EXCLUDED_NETWORKS:
+                continue
             positions = protocol.get("portfolio_item_list")
             if not isinstance(positions, list):
                 raise ValueError("Rabby protocol positions are missing")

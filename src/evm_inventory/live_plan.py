@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
@@ -11,12 +12,14 @@ from copy import copy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
+from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
 
 import httpx
 
 from .bitget_catalog import BitgetDepositTarget, deposit_targets, fetch_public_coins
+from .celo import lifi_token_address, normalize_celo_balances
 from .consolidation import (
     ConsolidationCandidate,
     GroupAdmission,
@@ -26,13 +29,28 @@ from .consolidation import (
     combine_candidates,
     select_candidate,
 )
+from .diagnostics import exception_diagnostic
 from .fee_planner import native_asset_identity
-from .lifi import LifiPriceEvidence, LifiRoute, LifiRouteRequest
+from .lifi import (
+    LifiClient,
+    LifiPriceEvidence,
+    LifiRoute,
+    LifiRouteRequest,
+    _route_from_dict,
+    validate_bridge_route,
+)
+from .lifi_quota import LifiRequestLimit
 from .models import AssetIdentity, ConfigError
+from .network_policy import EXCLUDED_NETWORKS
 from .planner_gas import PlannerGasEstimator
+from .quote_jobs import JobInProgress
 from .quote_parallel import CachedQuoteClient, complete_parallel
+from .relay import SOURCE_CHAINS as RELAY_SOURCE_CHAINS
+from .relay import quote_relay_entry
+from .route_targets import TargetPolicy, load_target_policy, resolve_targets
 from .stages import Deadline, StageDeadlineExceeded, check_deadline, deadline_scope, run_parallel
 from .valuation import FeeQuote, QuotePrice, raw_to_decimal
+from .weth import WETH_CONTRACTS, unwrap_route_payload
 
 _PRICE_MAX_AGE = timedelta(minutes=5)
 _ASSET_ACTIONS = frozenset({"swap", "unwrap", "review", "deny"})
@@ -44,6 +62,19 @@ class QuoteClient(Protocol):
     def routes(self, request: LifiRouteRequest) -> tuple[LifiRoute, ...]: ...
 
     def token_price(self, asset: AssetIdentity) -> LifiPriceEvidence: ...
+
+
+class RouteSearchIncomplete(ValueError):
+    """A required quote could not be obtained; optimality is unproven."""
+
+    def __init__(self, reason, error):
+        self.reason = reason
+        self.retry_at = getattr(error, "retry_at", None)
+        self.diagnostic = exception_diagnostic(error)
+        super().__init__(reason)
+
+    def data(self):
+        return {"reason": self.reason, "retry_at": self.retry_at, "diagnostic": self.diagnostic}
 
 
 class GasEstimator(Protocol):
@@ -59,6 +90,7 @@ class _Input:
     deposit_address: str | None
     source_price: QuotePrice | None
     source_usd: Decimal | None
+    native_target: BitgetDepositTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +98,32 @@ class _RouteChoice:
     candidate: ConsolidationCandidate
     steps: tuple[tuple[str, LifiRoute], ...]
     target: BitgetDepositTarget
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchResult:
+    choices: tuple[_RouteChoice, ...]
+    failed: tuple[ConsolidationCandidate, ...]
+    complete: bool
+    quoted: int
+    prepared: int
+    pruned: int
+    errors: tuple[str, ...] = ()
+    pending: tuple[dict, ...] = ()
+    evidence_expires_at: datetime | None = None
+
+    def data(self):
+        return {
+            "complete": self.complete,
+            "quoted": self.quoted,
+            "prepared": self.prepared,
+            "pruned": self.pruned,
+            "errors": list(self.errors),
+            "pending": list(self.pending),
+            "evidence_expires_at": (
+                self.evidence_expires_at.isoformat() if self.evidence_expires_at else None
+            ),
+        }
 
 
 def create_live_plan(
@@ -77,6 +135,7 @@ def create_live_plan(
     max_route_loss_pct: Decimal = Decimal("15"),
     client: QuoteClient | None = None,
     targets: tuple[BitgetDepositTarget, ...] | None = None,
+    target_policy: TargetPolicy | None = None,
     wallet_addresses: set[str] | None = None,
     now_ms: Callable[[], int] | None = None,
     gas_estimator: GasEstimator | None = None,
@@ -95,8 +154,8 @@ def create_live_plan(
     limit = _loss_limit(max_route_loss_pct)
     floor = _quote_floor(quote_floor)
     actions = _actions(allowlist_path)
-    if isinstance(stage_seconds, bool) or not 0 < stage_seconds <= 30:
-        raise ConfigError("quote stage_seconds must be greater than zero and at most 30")
+    if isinstance(stage_seconds, bool) or not math.isfinite(stage_seconds) or stage_seconds <= 0:
+        raise ConfigError("quote stage_seconds must be finite and greater than zero")
     if (
         isinstance(workers, bool)
         or not isinstance(workers, int)
@@ -107,6 +166,20 @@ def create_live_plan(
     ):
         raise ConfigError("quote workers must be 1..32 and target_workers 1..8")
     enabled_targets = targets
+    if target_policy is None:
+        target_policy = (
+            TargetPolicy.from_targets(targets)
+            if targets
+            else load_target_policy(Path("config/route-targets.json"))
+        )
+    search_scope = {
+        "policy_digest": target_policy.digest,
+        "requested_targets": [t.data() for t in target_policy.targets],
+        "enabled_targets": [],
+        "unavailable_targets": [],
+        "mode": "configured_targets",
+        "global_cheapest": False,
+    }
     if client is None:
         raise ConfigError("LI.FI client with wallet proxy is required")
     quote_client = client
@@ -118,16 +191,28 @@ def create_live_plan(
     excluded_entries: list[dict] = []
     executable: list[_Input] = []
     with balances_path.open(newline="") as stream:
-        for row in csv.DictReader(stream):
+        for row in normalize_celo_balances(csv.DictReader(stream)):
+            if int(row["chain_id"]) in EXCLUDED_NETWORKS:
+                continue
             if (
                 selected_wallets is not None
                 and row.get("wallet", "").lower() not in selected_wallets
             ):
                 continue
-            if row.get("status") != "success" or int(row["raw_balance"]) <= 0:
+            if row.get("status") != "success" or (
+                int(row["raw_balance"]) <= 0 and not row.get("balance_conflict")
+            ):
                 continue
             base = _base(row)
             asset = AssetIdentity(base["chain_id"], base["asset_id"], base["decimals"])
+            if row.get("balance_conflict"):
+                excluded_entries.append(
+                    {
+                        **_manual(base, "conflicting_native_balance"),
+                        "conflicting_amounts": row["conflicting_amounts"],
+                    }
+                )
+                continue
             action = actions.get((asset.chain_id, asset.contract_address), "deny")
             if action == "deny":
                 excluded_entries.append({**base, "status": "denied"})
@@ -144,8 +229,11 @@ def create_live_plan(
 
     entries = list(excluded_entries)
     wallets = sorted({wallet for wallet, _chain in groups})
+    quote_timing = {}
     for wallet in wallets:
-        deadline = Deadline(seconds=stage_seconds, label="quote")
+        deadline = Deadline(seconds=stage_seconds, label=f"quote:{wallet}", hard_limit=False)
+        timing = {"target_seconds": stage_seconds, "elapsed_seconds": 0, "budget_exceeded": False}
+        quote_timing[wallet] = timing
         select_client = getattr(quote_client, "for_wallet", None)
         scoped_client = select_client(wallet) if select_client is not None else quote_client
         wallet_client = CachedQuoteClient(scoped_client, workers=target_workers)
@@ -190,14 +278,86 @@ def create_live_plan(
                         for _key, items in wallet_groups
                         for item in items
                     )
+                    timing.update(
+                        elapsed_seconds=deadline.elapsed, budget_exceeded=deadline.budget_exceeded
+                    )
                     continue
                 enabled_targets = tuple(catalog.completed[0])
             wallet_targets = tuple(
                 sorted(
-                    enabled_targets,
+                    (
+                        target
+                        for target in enabled_targets
+                        if target.chain_id not in EXCLUDED_NETWORKS
+                    ),
                     key=lambda item: (item.chain_id, item.asset_id, item.coin, item.chain),
                 )
             )
+
+            resolution = resolve_targets(target_policy, wallet_targets)
+            support_method = getattr(scoped_client, "supported_chain_ids", None)
+            supported = None
+            if support_method is not None:
+                try:
+                    supported = support_method()
+                except Exception as error:
+                    entries.extend(
+                        {
+                            **_manual(item.base, "lifi_chain_catalog_unavailable"),
+                            "diagnostic": exception_diagnostic(error),
+                        }
+                        for _key, items in wallet_groups
+                        for item in items
+                    )
+                    timing.update(
+                        elapsed_seconds=deadline.elapsed, budget_exceeded=deadline.budget_exceeded
+                    )
+                    continue
+                supported_groups = []
+                for key, items in wallet_groups:
+                    if key[1] not in supported:
+                        relay_factory = getattr(quote_client, "relay_for_wallet", None)
+                        if key[1] in RELAY_SOURCE_CHAINS and relay_factory is not None:
+                            relay_client = relay_factory(wallet)
+                            entries.extend(
+                                quote_relay_entry(
+                                    item.base, relay_client, resolution.enabled,
+                                    loss_limit=limit, quote_floor=floor,
+                                    deposit_address=item.deposit_address,
+                                )
+                                for item in items
+                            )
+                        else:
+                            entries.extend(
+                                {
+                                    **_manual(item.base, "unsupported_by_lifi"),
+                                    "routing_provider": "lifi",
+                                    "alternative_provider_required": True,
+                                }
+                                for item in items
+                            )
+                    else:
+                        supported_groups.append((key, items))
+                wallet_groups = supported_groups
+            route_targets = tuple(
+                t for t in resolution.enabled if supported is None or t.chain_id in supported
+            )
+            search_scope.update(
+                enabled_targets=[_target_data(t) for t in route_targets],
+                unavailable_targets=list(resolution.unavailable)
+                + [
+                    {**_target_data(t), "reason": "unsupported_by_lifi"}
+                    for t in resolution.enabled
+                    if supported is not None and t.chain_id not in supported
+                ],
+            )
+            if isinstance(scoped_client, LifiClient):
+                scoped_client.policy_digest = target_policy.digest
+                scoped_client.catalog_digest = sha256(
+                    json.dumps(
+                        [_target_data(target) for target in wallet_targets], sort_keys=True
+                    ).encode()
+                ).hexdigest()
 
             def plan_group(job):
                 group_key, group_items = job
@@ -211,6 +371,7 @@ def create_live_plan(
                     valuation_now,
                     wallet_gas_estimator,
                     quoted_at,
+                    route_targets=route_targets,
                 )
 
             results = run_parallel(plan_group, wallet_groups, deadline=deadline, workers=workers)
@@ -222,9 +383,35 @@ def create_live_plan(
                     reason = (
                         "stage_deadline_exceeded"
                         if index in results.pending or isinstance(error, StageDeadlineExceeded)
-                        else "quote_group_failed"
+                        else getattr(error, "reason", "quote_group_failed")
                     )
-                    entries.extend(_manual(item.base, reason) for item in group_items)
+                    entries.extend(
+                        {
+                            **_manual(
+                                item.base,
+                                "quota_wait"
+                                if reason in {"quota_wait", "provider_cooldown"}
+                                else "route_search_incomplete",
+                            ),
+                            "search": {
+                                "complete": False,
+                                "errors": [reason],
+                                "pending": [
+                                    {
+                                        "reason": reason,
+                                        "retry_at": getattr(error, "retry_at", None),
+                                        "diagnostic": exception_diagnostic(error),
+                                    }
+                                ]
+                                if error is not None
+                                else [],
+                            },
+                        }
+                        for item in group_items
+                    )
+
+        deadline.check()
+        timing.update(elapsed_seconds=deadline.elapsed, budget_exceeded=deadline.budget_exceeded)
 
     for entry in entries:
         entry["quoted_at"] = quoted_at
@@ -236,6 +423,7 @@ def create_live_plan(
             tuple(step.get("route", {}).get("id", "") for step in item.get("steps", ())),
         )
     )
+    _invalidate_expired_comparisons(entries, valuation_now())
     counts = Counter(entry["status"] for entry in entries)
     return {
         "version": 4,
@@ -250,11 +438,70 @@ def create_live_plan(
         "summary": dict(sorted(counts.items())),
         "gas_diagnostics": list(getattr(gas_estimator, "diagnostics", ())),
         "route_diagnostics": list(getattr(quote_client, "route_diagnostics", ())),
+        "lifi_requests": getattr(quote_client, "request_metrics", {}),
+        "relay_requests": getattr(quote_client, "relay_request_metrics", {}),
+        "relay_summary": {
+            "positions": sum(e.get("routing_provider") == "relay" for e in entries),
+            "quotes_available": sum(e.get("quote_status") == "available" for e in entries),
+            "candidates": sum(len(e.get("relay_candidates", [])) for e in entries),
+            "execution_supported": any(
+                e.get("routing_provider") == "relay" and e.get("execution_supported")
+                for e in entries
+            ),
+        },
+        "quote_timing": quote_timing,
+        "search_scope": search_scope,
         "entries": entries,
     }
 
 
-def _prepare_group(group_key, items, targets, client, limit, floor, now, gas_estimator, quoted_at):
+def _invalidate_expired_comparisons(entries: list[dict], now: datetime) -> None:
+    expired_groups = {
+        entry["group"]["key"]
+        for entry in entries
+        if isinstance(entry.get("group"), dict)
+        and (
+            entry.get("status") in {"direct_deposit", "route_ready"}
+            or entry.get("search", {}).get("complete") is True
+        )
+        and entry.get("search", {}).get("evidence_expires_at")
+        and now > _time(entry["search"]["evidence_expires_at"])
+    }
+    for entry in entries:
+        group = entry.get("group")
+        if not isinstance(group, dict) or group["key"] not in expired_groups:
+            continue
+        search = entry.get("search", {})
+        search.update(
+            complete=False, errors=sorted(set((*search.get("errors", []), "stale_quote")))
+        )
+        entry["search"] = search
+        entry["status"] = "manual_review"
+        entry["reason"] = "stale_quote"
+        entry["group"] = {**group, "status": "manual_review", "reason": "stale_quote"}
+        if "best_candidate" in entry:
+            entry["provisional_candidate"] = entry.pop("best_candidate")
+        elif "valuation" in entry:
+            entry["provisional_candidate"] = {
+                "valuation": entry["valuation"],
+                "steps": entry.get("steps", []),
+                "target": entry.get("target"),
+            }
+        for key in (
+            "target",
+            "deposit_address",
+            "steps",
+            "route",
+            "valuation",
+            "reservations",
+            "local_unwrap",
+        ):
+            entry.pop(key, None)
+
+
+def _prepare_group(
+    group_key, items, targets, client, limit, floor, now, gas_estimator, quoted_at, *, route_targets
+):
     prices = complete_parallel(
         lambda item: _token_price(client, item.asset), items, workers=client.workers
     )
@@ -270,7 +517,9 @@ def _prepare_group(group_key, items, targets, client, limit, floor, now, gas_est
                 "source": price.source,
                 "reported_price_usd": price.reported_usd_per_token,
                 "observed_at": price.observed_at.isoformat(),
-            } if price is not None else None,
+            }
+            if price is not None
+            else None,
             "source_usd": _decimal(source_usd),
             "quote_floor_usd": _decimal(floor),
         }
@@ -282,13 +531,28 @@ def _prepare_group(group_key, items, targets, client, limit, floor, now, gas_est
             excluded.append({**item.base, "status": "missing_deposit_address"})
             continue
         target = _target(item.asset, targets)
-        if target is not None and int(item.base["raw_balance"]) < target.minimum_raw:
-            excluded.append(_manual(item.base, "direct_deposit_below_minimum", target))
-            continue
-        prepared.append(replace(item, target=target, source_price=price, source_usd=source_usd))
+        native_target = None
+        if item.asset.decimals == 18 and item.asset.contract_address == WETH_CONTRACTS.get(
+            item.asset.chain_id
+        ):
+            native_target = _target(
+                native_asset_identity(item.asset.chain_id),
+                (target for target in targets if target.coin.upper() == "ETH"),
+            )
+        prepared.append(
+            replace(
+                item,
+                target=target,
+                source_price=price,
+                source_usd=source_usd,
+                native_target=native_target,
+            )
+        )
     if prepared:
         excluded.extend(
-            _plan_group(group_key, prepared, targets, client, limit, now, gas_estimator, quoted_at)
+            _plan_group(
+                group_key, prepared, route_targets, client, limit, now, gas_estimator, quoted_at
+            )
         )
     return excluded
 
@@ -315,7 +579,9 @@ def _plan_group(
     }
     for item in items:
         check_deadline()
-        choices, failed = direct_by_id[id(item)]
+        search = direct_by_id[id(item)]
+        item.base["search"] = search.data()
+        choices, failed = search.choices, search.failed
         best = select_candidate(choice.candidate for choice in choices)
         if best is None:
             failed_candidate = _best_failed(failed)
@@ -333,12 +599,41 @@ def _plan_group(
                     now=now(),
                     max_price_age=_PRICE_MAX_AGE,
                 )
-                if getattr(client, "route_rate_error", None):
-                    failed_candidate = _with_reason(failed_candidate, "route_api_rate_limited")
+            if getattr(client, "route_rate_error", None):
+                failed_candidate = _with_reason(
+                    failed_candidate, str(client.route_rate_error).split(":", 1)[0]
+                )
             choices_by_item.append((item, None, failed_candidate))
         else:
             selected = next(choice for choice in choices if choice.candidate is best)
             choices_by_item.append((item, selected, best))
+
+    final_now = now()
+    for item, selected, candidate in choices_by_item:
+        if selected is None:
+            continue
+        reason = _selected_choice_freshness(item, selected, candidate, final_now)
+        if reason is not None:
+            search = direct_by_id[id(item)]
+            search = replace(
+                search, complete=False, errors=tuple(sorted(set((*search.errors, reason))))
+            )
+            direct_by_id[id(item)] = search
+            item.base["search"] = search.data()
+
+    for item in items:
+        search = direct_by_id[id(item)]
+        record = getattr(client, "record_search", None)
+        if record is not None:
+            record(
+                f"{item.base['wallet']}:{item.asset.chain_id}:{item.asset.contract_address}",
+                {
+                    **search.data(),
+                    "amount_raw": item.base["raw_balance"],
+                    "targets": [_target_data(target) for target in targets],
+                    "quoted_at": quoted_at,
+                },
+            )
 
     source_values = [item.source_usd for item in items]
     group_source_usd = (
@@ -347,7 +642,24 @@ def _plan_group(
         else None
     )
     admission_candidates = tuple(choice for _item, _selected, choice in choices_by_item)
-    if group_source_usd is None:
+    if any(not search.complete for search in direct_by_id.values()):
+        admission = GroupAdmission(
+            status="manual_review",
+            reason=(
+                "quota_wait"
+                if any(
+                    p.get("reason") in {"quota_wait", "provider_cooldown"}
+                    for search in direct_by_id.values()
+                    for p in search.pending
+                )
+                else "route_search_incomplete"
+            ),
+            source_usd=group_source_usd,
+            loss_usd=None,
+            loss_pct=None,
+            candidates=admission_candidates,
+        )
+    elif group_source_usd is None:
         admission = GroupAdmission(
             status="manual_review",
             reason="missing_source_price",
@@ -373,9 +685,11 @@ def _plan_group(
                 "status": "manual_review",
                 "reason": reason,
                 "group": group_data,
-                "best_candidate": _candidate_data(candidate),
+                (
+                    "best_candidate" if item.base["search"]["complete"] else "provisional_candidate"
+                ): _candidate_data(candidate),
             }
-            if selected is not None:
+            if selected is not None and item.base["search"]["complete"]:
                 entry["target"] = _target_data(selected.target)
                 entry["deposit_address"] = item.deposit_address
                 entry["steps"] = _steps_data(selected.steps)
@@ -416,8 +730,32 @@ def _plan_group(
         }
         if entry["route"] is None:
             del entry["route"]
+        if selected.steps and selected.steps[0][0] == "unwrap_to_native":
+            entry["local_unwrap"] = True
         result.append(entry)
     return result
+
+
+def _selected_choice_freshness(
+    item: _Input, choice: _RouteChoice, candidate: ConsolidationCandidate, now: datetime
+) -> str | None:
+    """Recheck the group's selected evidence after all comparisons have finished."""
+    prices = [item.source_price]
+    prices.extend(fee.price for fee in candidate.gas_estimates)
+    for _kind, route in choice.steps:
+        if route.evidence is None:
+            return "missing_route_evidence"
+        age = (now - _time(route.evidence.quote_timestamp)).total_seconds()
+        if not 0 <= age <= 240:
+            return "route_quote_stale"
+        prices.extend(_route_prices(route).values())
+    for price in prices:
+        if price is None:
+            return "missing_price_evidence"
+        age = now - price.observed_at
+        if age < timedelta(0) or age > _PRICE_MAX_AGE:
+            return "stale_price"
+    return None
 
 
 def _route_choices(
@@ -427,127 +765,267 @@ def _route_choices(
     limit: Decimal,
     now: Callable[[], datetime],
     gas_estimator: GasEstimator | None,
-) -> tuple[list[_RouteChoice], list[ConsolidationCandidate]]:
-    if item.target is not None:
-        candidate = _direct_candidate(item, client, gas_estimator, now)
-        choice = _RouteChoice(candidate, (), item.target)
-        return ([choice] if candidate.is_valid else []), ([] if candidate.is_valid else [candidate])
-
-    if not targets:
-        return [], []
-
-    routes_by_target: list[_RouteChoice] = []
+) -> _SearchResult:
+    quoted: list[_RouteChoice] = []
     failed: list[ConsolidationCandidate] = []
+    errors: list[str] = []
+    pending: list[dict] = []
+    started_at = now()
+    expiries = [started_at + timedelta(seconds=240)]
+    if item.source_price is not None:
+        expiries.append(item.source_price.observed_at + _PRICE_MAX_AGE)
 
-    def direct_target(target):
-        target_asset = AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target))
-        return [
-            _route_choice(
-                route,
-                item,
-                target,
-                client,
-                now,
-                gas_estimator,
-                expected_source=item.asset,
-                expected_destination=target_asset,
-                expected_amount=int(item.base["raw_balance"]),
-                recipient=item.deposit_address,
-                steps=(("bridge", route),),
-            )
-            for route in _request_routes(
-                client,
-                item.asset,
-                target_asset,
-                int(item.base["raw_balance"]),
-                item.base["wallet"],
-                item.deposit_address,
-            )
-        ]
-
-    def collect(function):
-        batches = complete_parallel(function, targets, workers=client.workers)
-        for batch in batches:
-            for choice in batch:
-                if choice.candidate.is_valid:
-                    routes_by_target.append(choice)
-                else:
-                    failed.append(choice.candidate)
-
-    if item.asset.is_native or item.base["symbol"].upper() in _STABLE_SYMBOLS:
-        collect(direct_target)
-        return routes_by_target, failed
-
-    native = native_asset_identity(item.asset.chain_id)
-    swap_routes = _request_routes(
-        client,
-        item.asset,
-        native,
-        int(item.base["raw_balance"]),
-        item.base["wallet"],
-        item.base["wallet"],
-    )
-    if not swap_routes:
-        # Enumerate every enabled target even if the preparatory native swap
-        # cannot be quoted; exact source and target checks still apply.
-        collect(direct_target)
-    for swap in swap_routes:
-        check_deadline()
-        swap_candidate = _route_candidate(
-            swap,
-            item,
-            client,
-            now,
-            gas_estimator,
-            expected_source=item.asset,
-            expected_destination=native,
-            expected_amount=int(item.base["raw_balance"]),
-            recipient=item.base["wallet"],
-            purpose="swap_to_native",
+    def retain_candidate(candidate):
+        if candidate.price_expires_at is not None:
+            expiries.append(candidate.price_expires_at)
+        expiries.extend(
+            fee.price.observed_at + _PRICE_MAX_AGE
+            for fee in candidate.gas_estimates
+            if fee.price is not None
         )
-        if not swap_candidate.is_valid:
-            failed.append(swap_candidate)
-            continue
-        assert swap.evidence is not None
-        bridge_amount = swap.evidence.min_output_amount
 
-        def bridge_target(target):
-            target_asset = AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target))
-            result = []
-            for bridge in _request_routes(
+    def retain_route(route):
+        if route.evidence is not None:
+            expiries.append(_time(route.evidence.quote_timestamp) + timedelta(seconds=240))
+            expiries.extend(
+                price.observed_at + _PRICE_MAX_AGE for price in _route_prices(route).values()
+            )
+
+    if not targets and item.target is None and item.native_target is None:
+        errors.append("no_enabled_deposit_target")
+    if item.target is not None:
+        if int(item.base["raw_balance"]) >= item.target.minimum_raw:
+            candidate = _direct_candidate(item, client, gas_estimator, now)
+            retain_candidate(candidate)
+            if candidate.is_valid:
+                quoted.append(_RouteChoice(candidate, (), item.target))
+            else:
+                failed.append(candidate)
+                errors.append(candidate.reason or "direct_preparation_failed")
+        # The same asset/network target is represented by the direct transfer.
+        targets = tuple(
+            target
+            for target in targets
+            if not (
+                target.chain_id == item.asset.chain_id
+                and target.asset_id == item.asset.contract_address
+            )
+        )
+
+    def request(source, destination, amount, recipient):
+        try:
+            return _request_routes(
                 client,
-                native,
-                target_asset,
-                bridge_amount,
+                source,
+                destination,
+                amount,
                 item.base["wallet"],
-                item.deposit_address,
-            ):
-                bridge_choice = _route_choice(
-                    bridge,
+                recipient,
+                observed=lambda timestamp: expiries.append(timestamp + timedelta(seconds=240)),
+                fallback_observed_at=now(),
+            )
+        except RouteSearchIncomplete as error:
+            errors.append(str(error))
+            pending.append(
+                {
+                    **error.data(),
+                    "source": _asset_data(source),
+                    "destination": _asset_data(destination),
+                }
+            )
+            return ()
+
+    def collect(source, amount):
+        def target_quotes(target):
+            destination = AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target))
+            result = []
+            for route in request(source, destination, amount, item.deposit_address):
+                retain_route(route)
+                choice = _route_choice(
+                    route,
                     item,
                     target,
                     client,
                     now,
                     gas_estimator,
-                    expected_source=native,
-                    expected_destination=target_asset,
-                    expected_amount=bridge_amount,
+                    expected_source=source,
+                    expected_destination=destination,
+                    expected_amount=amount,
                     recipient=item.deposit_address,
-                    steps=(("bridge", bridge),),
-                    purpose="bridge_after_swap",
+                    steps=(("bridge", route),),
+                    prepare=False,
                 )
-                candidate = combine_candidates(swap_candidate, bridge_choice.candidate)
-                result.append(
-                    _RouteChoice(
-                        candidate,
-                        (("swap_to_native", swap), ("bridge", bridge)),
-                        target,
-                    )
-                )
+                retain_candidate(choice.candidate)
+                result.append(choice)
             return result
 
-        collect(bridge_target)
-    return routes_by_target, failed
+        for batch in complete_parallel(target_quotes, targets, workers=client.workers):
+            for choice in batch:
+                if choice.candidate.is_valid:
+                    quoted.append(choice)
+                else:
+                    failed.append(choice.candidate)
+                    if choice.candidate.reason in {
+                        "missing_source_price",
+                        "missing_destination_price",
+                        "missing_gas_price",
+                        "stale_price",
+                        "invalid_price_evidence",
+                    }:
+                        errors.append(choice.candidate.reason)
+
+    # LI.FI aggregates swaps/bridges for each configured destination itself.
+    if item.native_target is not None:
+        local = _local_unwrap_choice(item, client, now, gas_estimator)
+        retain_route(local.steps[0][1])
+        retain_candidate(local.candidate)
+        if local.candidate.is_valid:
+            quoted.append(local)
+        else:
+            failed.append(local.candidate)
+            errors.append(local.candidate.reason or "local_unwrap_quote_failed")
+    collect(item.asset, int(item.base["raw_balance"]))
+
+    if errors:
+        provisional = select_candidate(choice.candidate for choice in quoted)
+        choices = tuple(choice for choice in quoted if choice.candidate is provisional)
+        return _SearchResult(
+            choices,
+            tuple(failed),
+            False,
+            len(quoted),
+            0,
+            0,
+            tuple(sorted(set(errors))),
+            tuple(pending),
+            min(expiries),
+        )
+
+    # Zero gas is a proven lower bound because wallet-paid gas is nonnegative.
+    # Strict inequality preserves deterministic tie-breaking on equal costs.
+    quoted.sort(
+        key=lambda choice: (
+            choice.candidate.loss_pct,
+            choice.candidate.loss_usd,
+            choice.candidate.route_ids,
+        )
+    )
+    prepared: dict[tuple, ConsolidationCandidate] = {}
+    best: _RouteChoice | None = None
+    pruned = 0
+    for choice in quoted:
+        check_deadline()
+        if best is not None and best.candidate.loss_pct < choice.candidate.loss_pct:
+            pruned += 1
+            continue
+        current = choice.candidate if not choice.steps else None
+        for index, (kind, route) in enumerate(choice.steps):
+            source = route.evidence.source
+            destination = route.evidence.destination
+            recipient = (
+                item.base["wallet"]
+                if kind in {"swap_to_native", "unwrap_to_native"}
+                else item.deposit_address
+            )
+            key = (route.evidence.payload_sha256, kind, recipient)
+            if key not in prepared:
+                prepared[key] = _route_candidate(
+                    route,
+                    item,
+                    client,
+                    now,
+                    gas_estimator,
+                    expected_source=source,
+                    expected_destination=destination,
+                    expected_amount=route.evidence.input_amount,
+                    recipient=recipient,
+                    purpose=kind if index == 0 else "bridge_after_swap",
+                    prepare=True,
+                )
+                if kind == "unwrap_to_native" and prepared[key].is_valid:
+                    native_item = replace(
+                        item,
+                        asset=destination,
+                        target=choice.target,
+                        source_price=_token_price(client, destination),
+                    )
+                    prepared[key] = combine_candidates(
+                        prepared[key], _direct_candidate(native_item, client, gas_estimator, now)
+                    )
+            candidate = prepared[key]
+            retain_candidate(candidate)
+            current = candidate if current is None else combine_candidates(current, candidate)
+            if not candidate.is_valid:
+                errors.append(candidate.reason or "candidate_preparation_failed")
+                break
+        if current.is_valid:
+            if current.source_usd != choice.candidate.source_usd:
+                errors.append("valuation_changed_during_search")
+            refined = _RouteChoice(current, choice.steps, choice.target)
+            winner = select_candidate((best.candidate, current) if best else (current,))
+            if winner is current:
+                best = refined
+        else:
+            failed.append(current)
+    return _SearchResult(
+        (best,) if best is not None else (),
+        tuple(failed),
+        not errors,
+        len(quoted),
+        len(prepared),
+        pruned,
+        tuple(sorted(set(errors))),
+        evidence_expires_at=min(expiries),
+    )
+
+
+def _local_unwrap_choice(
+    item: _Input,
+    client: QuoteClient,
+    now: Callable[[], datetime],
+    gas_estimator: GasEstimator | None,
+) -> _RouteChoice:
+    """Quote a canonical withdrawal locally; its dependent deposit is priced on refinement."""
+    target = item.native_target
+    assert target is not None
+    native = native_asset_identity(item.asset.chain_id)
+    native_price = _token_price(client, native)
+    request = LifiRouteRequest(
+        from_chain_id=item.asset.chain_id,
+        to_chain_id=item.asset.chain_id,
+        from_token_address=item.asset.contract_address,
+        to_token_address=_lifi_address(native),
+        from_amount=item.base["raw_balance"],
+        from_address=item.base["wallet"],
+        to_address=item.base["wallet"],
+    )
+    payload = unwrap_route_payload(
+        request,
+        _decimal(item.source_price.usd_per_token) if item.source_price else "0",
+        _decimal(native_price.usd_per_token) if native_price else "0",
+    )
+    action = payload["steps"][0]["action"]
+    for token, price in (("fromToken", item.source_price), ("toToken", native_price)):
+        if price is not None:
+            action[token]["priceTimestamp"] = price.observed_at.isoformat()
+    route = _route_from_dict(
+        payload,
+        quote_timestamp=now().isoformat(),
+    )
+    return _route_choice(
+        route,
+        item,
+        target,
+        client,
+        now,
+        gas_estimator,
+        expected_source=item.asset,
+        expected_destination=native,
+        expected_amount=int(item.base["raw_balance"]),
+        recipient=item.base["wallet"],
+        steps=(("unwrap_to_native", route),),
+        prepare=False,
+    )
 
 
 def _direct_candidate(
@@ -599,7 +1077,34 @@ def _route_choice(
     recipient: str,
     steps: tuple[tuple[str, LifiRoute], ...],
     purpose: str | None = None,
+    prepare: bool = True,
 ) -> _RouteChoice:
+    try:
+        validate_bridge_route(
+            route,
+            expected_source=expected_source,
+            expected_destination=expected_destination,
+            recipient=recipient,
+            input_amount=expected_amount,
+        )
+        early_reason = "below_target_minimum" if route.to_amount_min < target.minimum_raw else None
+    except ValueError:
+        early_reason = "route_identity_mismatch"
+    if early_reason:
+        candidate = candidate_from_values(
+            route_ids=(route.route_id,),
+            source_asset=expected_source,
+            destination_asset=expected_destination,
+            source_amount=expected_amount,
+            destination_amount=route.to_amount_min,
+            source_price=item.source_price,
+            destination_price=None,
+            wallet_paid_gas=(),
+            gas_estimate_complete=False,
+            now=now(),
+            max_price_age=_PRICE_MAX_AGE,
+        )
+        return _RouteChoice(_with_reason(candidate, early_reason), steps, target)
     candidate = _route_candidate(
         route,
         item,
@@ -611,6 +1116,7 @@ def _route_choice(
         expected_amount=expected_amount,
         recipient=recipient,
         purpose=purpose or steps[-1][0],
+        prepare=prepare,
     )
     if candidate.is_valid and candidate.destination_amount is not None:
         if candidate.destination_amount < target.minimum_raw:
@@ -630,18 +1136,23 @@ def _route_candidate(
     expected_amount: int,
     recipient: str,
     purpose: str,
+    prepare: bool = True,
 ) -> ConsolidationCandidate:
-    estimates = _estimate_extra_gas(
-        gas_estimator,
-        purpose=purpose,
-        route=route,
-        wallet=item.base["wallet"],
-        source_asset=item.asset,
-        target=None,
-        amount=expected_amount,
-        recipient=recipient,
+    estimates = (
+        _estimate_extra_gas(
+            gas_estimator,
+            purpose=purpose,
+            route=route,
+            wallet=item.base["wallet"],
+            source_asset=item.asset,
+            target=None,
+            amount=expected_amount,
+            recipient=recipient,
+        )
+        if prepare
+        else (FeeQuote(0, item.source_price),)
     )
-    requires_approval = _requires_approval(route)
+    requires_approval = _requires_approval(route) if prepare else False
     gas_complete = (gas_estimator is None or estimates is not None) and (
         not requires_approval or gas_estimator is not None
     )
@@ -655,24 +1166,37 @@ def _route_candidate(
         priced_estimates = ()
     prices = _route_prices(route)
     for asset in (expected_source, expected_destination):
-        if asset.chain_id == 1 and asset.decimals == 18 and (
-            asset.is_native
-            or asset.contract_address == "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        if (
+            asset.chain_id == 1
+            and asset.decimals == 18
+            and (
+                asset.is_native
+                or asset.contract_address == "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+            )
         ):
             checked = _token_price(client, asset)
             if checked is None:
                 return candidate_from_values(
-                    route_ids=(route.route_id,), source_asset=expected_source,
-                    destination_asset=expected_destination, source_amount=expected_amount,
-                    destination_amount=route.to_amount_min, source_price=None,
-                    destination_price=None, wallet_paid_gas=(), gas_estimate_complete=False,
-                    now=now(), max_price_age=_PRICE_MAX_AGE,
+                    route_ids=(route.route_id,),
+                    source_asset=expected_source,
+                    destination_asset=expected_destination,
+                    source_amount=expected_amount,
+                    destination_amount=route.to_amount_min,
+                    source_price=None,
+                    destination_price=None,
+                    wallet_paid_gas=(),
+                    gas_estimate_complete=False,
+                    now=now(),
+                    max_price_age=_PRICE_MAX_AGE,
                 )
             prices[asset] = checked
     if item.source_price is not None:
         prices[item.asset] = item.source_price
     for estimate in priced_estimates:
-        if estimate.price is not None:
+        if estimate.price is not None and estimate.price.asset not in {
+            expected_source,
+            expected_destination,
+        }:
             prices[estimate.price.asset] = estimate.price
     if route.evidence is not None:
         for cost in route.gas_costs:
@@ -680,7 +1204,7 @@ def _route_candidate(
                 fetched = _token_price(client, cost.token)
                 if fetched is not None:
                     prices[cost.token] = fetched
-    return candidate_from_route(
+    candidate = candidate_from_route(
         route,
         expected_source=expected_source,
         expected_destination=expected_destination,
@@ -692,7 +1216,15 @@ def _route_candidate(
         prices=prices,
         wallet_paid_gas=priced_estimates,
         replace_route_gas=(
-            isinstance(gas_estimator, PlannerGasEstimator) and bool(priced_estimates)
+            (not prepare or isinstance(gas_estimator, PlannerGasEstimator))
+            and bool(priced_estimates)
+        ),
+    )
+    return replace(
+        candidate,
+        price_expires_at=min(
+            (price.observed_at + _PRICE_MAX_AGE for price in prices.values()),
+            default=None,
         ),
     )
 
@@ -704,6 +1236,9 @@ def _request_routes(
     amount: int,
     wallet: str,
     recipient: str,
+    *,
+    observed: Callable[[datetime], None] | None = None,
+    fallback_observed_at: datetime | None = None,
 ) -> tuple[LifiRoute, ...]:
     request = LifiRouteRequest(
         from_chain_id=source.chain_id,
@@ -713,17 +1248,25 @@ def _request_routes(
         from_amount=str(amount),
         from_address=wallet,
         to_address=recipient,
+        from_token_decimals=source.decimals,
+        to_token_decimals=destination.decimals,
     )
     try:
         routes = client.routes(request)
+        if observed is not None:
+            timestamp = getattr(client, "route_observed_at", {}).get(request)
+            observed(_time(timestamp) if timestamp is not None else fallback_observed_at)
     except StageDeadlineExceeded:
         raise
-    except (TimeoutError, httpx.TimeoutException):
+    except (TimeoutError, httpx.TimeoutException) as error:
         check_deadline()
-        return ()
-    except (OSError, ValueError, httpx.HTTPError):
-        return ()
-    return tuple(sorted(routes, key=lambda route: route.route_id))
+        raise RouteSearchIncomplete("quote_timeout", error) from error
+    except (LifiRequestLimit, JobInProgress) as error:
+        raise RouteSearchIncomplete(error.reason, error) from error
+    except (OSError, ValueError, httpx.HTTPError) as error:
+        reason = str(getattr(client, "route_rate_error", None) or "quote_request_failed")
+        raise RouteSearchIncomplete(reason, error) from error
+    return tuple(routes)
 
 
 def _estimate_extra_gas(estimator: GasEstimator | None, **kwargs) -> tuple[FeeQuote, ...] | None:
@@ -733,7 +1276,7 @@ def _estimate_extra_gas(estimator: GasEstimator | None, **kwargs) -> tuple[FeeQu
         check_deadline()
         result = estimator(**kwargs)
         check_deadline()
-    except StageDeadlineExceeded:
+    except (StageDeadlineExceeded, LifiRequestLimit, JobInProgress):
         raise
     except (TimeoutError, httpx.TimeoutException):
         check_deadline()
@@ -801,7 +1344,7 @@ def _token_price(client: QuoteClient, asset: AssetIdentity) -> QuotePrice | None
         if not isinstance(evidence, LifiPriceEvidence) or evidence.asset != asset:
             return None
         return _quote_price(evidence)
-    except StageDeadlineExceeded:
+    except (StageDeadlineExceeded, LifiRequestLimit, JobInProgress):
         raise
     except (TimeoutError, httpx.TimeoutException):
         check_deadline()
@@ -815,8 +1358,11 @@ def _quote_price(evidence: LifiPriceEvidence) -> QuotePrice:
         raise ValueError("price evidence has no value")
     observed_at = _time(evidence.timestamp)
     return QuotePrice(
-        evidence.asset, evidence.price_usd, observed_at,
-        evidence.source, evidence.reported_price_usd,
+        evidence.asset,
+        evidence.price_usd,
+        observed_at,
+        evidence.source,
+        evidence.reported_price_usd,
     )
 
 
@@ -971,6 +1517,7 @@ def _base(row) -> dict:
         "symbol": row.get("symbol", ""),
         "raw_balance": str(row["raw_balance"]),
         "decimals": int(row["decimals"]),
+        **({"balance_aliases": row["balance_aliases"]} if "balance_aliases" in row else {}),
     }
 
 
@@ -1008,7 +1555,7 @@ def _target_decimals(target: BitgetDepositTarget) -> int:
 
 
 def _lifi_address(asset: AssetIdentity) -> str:
-    return _NATIVE_LIFI_ADDRESS if asset.is_native else asset.contract_address
+    return lifi_token_address(asset.chain_id, asset.contract_address)
 
 
 def _target_data(target: BitgetDepositTarget) -> dict:

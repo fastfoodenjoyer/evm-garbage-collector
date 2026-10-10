@@ -178,3 +178,39 @@ def test_rate_limit_pauses_provider_for_following_wallets():
             discovery.page("0x" + "1" * 40, "base-mainnet")
         assert error.value.retry_after is not None
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize('field,value', [('address', '0x' + '9' * 40),
+                                         ('network', 'base-mainnet')])
+def test_scope_mismatch_identifies_field_expected_and_actual(field, value):
+    wallet = '0x' + '1' * 40
+    token = {'address': wallet, 'network': 'eth-mainnet', 'tokenAddress': None,
+             'tokenBalance': '0x1'}
+    token[field] = value
+    transport = Transport(client=httpx.Client(transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, json={'data': {'tokens': [token]}})
+    )), interval=0)
+    with pytest.raises(RequestError) as caught:
+        Discovery(transport, key='test').page(wallet, 'eth-mainnet')
+    assert caught.value.code == 'discovery_wrong_scope'
+    mismatch = caught.value.diagnostic['mismatches'][field]
+    assert mismatch == {'expected': wallet if field == 'address' else 'eth-mainnet',
+                        'actual': value}
+    transport.close()
+
+
+def test_polygon_rpc_name_uses_portfolio_network_name():
+    wallet = '0x' + '1' * 40
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body['addresses'][0]['networks'] == ['matic-mainnet']
+        return httpx.Response(200, json={'data': {'tokens': [
+            {'address': wallet, 'network': 'matic-mainnet', 'tokenAddress': None,
+             'tokenBalance': '0x1'}
+        ]}})
+
+    transport = Transport(client=httpx.Client(transport=httpx.MockTransport(handler)), interval=0)
+    tokens, _ = Discovery(transport, key='test').page(wallet, 'polygon-mainnet')
+    assert tokens[0]['address'] == 'native'
+    transport.close()

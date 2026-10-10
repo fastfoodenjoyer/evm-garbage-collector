@@ -58,9 +58,7 @@ def test_planner_gas_estimator_quotes_direct_erc20_transfer():
     assert request["from"] == WALLET
     assert request["to"] == TOKEN
     assert request["data"] == (
-        "0xa9059cbb"
-        + RECIPIENT[2:].rjust(64, "0")
-        + hex(123456)[2:].rjust(64, "0")
+        "0xa9059cbb" + RECIPIENT[2:].rjust(64, "0") + hex(123456)[2:].rjust(64, "0")
     )
 
 
@@ -68,9 +66,13 @@ def test_planner_gas_estimates_native_transfer_without_spending_full_balance():
     rpc = Rpc()
     estimator = PlannerGasEstimator(rpc, {42161: "https://rpc.example"}, PriceClient())
     estimates = estimator(
-        purpose="direct_deposit", route=None, wallet=WALLET,
-        source_asset=AssetIdentity(42161, "native", 18), target=None,
-        amount=537433696312410, recipient=RECIPIENT,
+        purpose="direct_deposit",
+        route=None,
+        wallet=WALLET,
+        source_asset=AssetIdentity(42161, "native", 18),
+        target=None,
+        amount=537433696312410,
+        recipient=RECIPIENT,
     )
     assert estimates is not None
     assert rpc.calls[0][2][0]["value"] == "0x0"
@@ -135,3 +137,47 @@ def test_planner_gas_estimator_prices_required_approval():
     assert approval["to"] == TOKEN
     assert approval["data"].startswith("0x095ea7b3")
     assert approval["data"][34:74] == SPENDER[2:]
+
+
+def test_native_route_approval_address_does_not_require_erc20_approval():
+    rpc = Rpc()
+    estimator = PlannerGasEstimator(rpc, {10: "https://rpc.example"}, PriceClient())
+    route = _route_from_dict(
+        {
+            "id": "native-approval-metadata",
+            "fromAmount": "1000",
+            "toAmount": "900",
+            "toAmountMin": "850",
+            "gasCosts": [],
+            "steps": [
+                {
+                    "id": "step",
+                    "type": "swap",
+                    "tool": "provider",
+                    "action": {
+                        "fromChainId": 10,
+                        "toChainId": 10,
+                        "fromToken": {"address": "0x" + "0" * 40, "decimals": 18},
+                        "toToken": {"address": TOKEN, "decimals": 6},
+                        "fromAmount": "1000",
+                        "toAddress": WALLET,
+                    },
+                    "estimate": {"toAmount": "900", "approvalAddress": SPENDER},
+                }
+            ],
+        }
+    )
+    estimates = estimator(
+        purpose="bridge",
+        route=route,
+        wallet=WALLET,
+        source_asset=AssetIdentity(10, "native", 18),
+        target=None,
+        amount=1000,
+        recipient=WALLET,
+    )
+    assert estimates is not None and len(estimates) == 1
+    assert not any(
+        method == "eth_call" and params[0].get("to") == "0x" + "0" * 40
+        for _, method, params in rpc.calls
+    )

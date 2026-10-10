@@ -325,32 +325,6 @@
       "alchemy_network": null
     },
     {
-      "chain_id": 183,
-      "name": "Ethernity",
-      "rpc_urls": [
-        "https://mainnet.ethernitychain.io"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
-      "chain_id": 185,
-      "name": "Mint Mainnet",
-      "rpc_urls": [
-        "https://rpc.mintchain.io"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
       "chain_id": 252,
       "name": "Fraxtal",
       "rpc_urls": [
@@ -436,41 +410,6 @@
       "token_review_status": "verified",
       "notes": "Curated sourced contracts only; other variants may exist.",
       "alchemy_network": "worldchain-mainnet"
-    },
-    {
-      "chain_id": 624,
-      "name": "Binary Mainnet",
-      "rpc_urls": [
-        "https://rpc.zero.thebinaryholdings.com"
-      ],
-      "native_symbol": "BNRY",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
-      "chain_id": 690,
-      "name": "Redstone",
-      "rpc_urls": [
-        "https://rpc.redstonechain.com"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [
-        {
-          "address": "0xd5d59fc063e7548b6015a36feb10b875924a19be",
-          "symbol": "USDC.e",
-          "decimals": 6,
-          "source": "https://raw.githubusercontent.com/ethereum-optimism/ethereum-optimism.github.io/d2065d3c28ea4a3006d147bd16508a9bb1e016ad/optimism.tokenlist.json",
-          "checked_at": "2026-09-19",
-          "variant": "Bridged USDC (Lattice)"
-        }
-      ],
-      "token_review_status": "verified",
-      "notes": "Curated stablecoin entries from official OP token list; not exhaustive.",
-      "alchemy_network": null
     },
     {
       "chain_id": 957,
@@ -568,36 +507,10 @@
       "alchemy_network": "settlus-mainnet"
     },
     {
-      "chain_id": 6805,
-      "name": "RACE Mainnet",
-      "rpc_urls": [
-        "https://racemainnet.io"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
       "chain_id": 7560,
       "name": "Cyber Mainnet",
       "rpc_urls": [
         "https://rpc.cyber.co"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
-      "chain_id": 8008,
-      "name": "Polynomial",
-      "rpc_urls": [
-        "https://rpc.polynomial.fi"
       ],
       "native_symbol": "ETH",
       "native_decimals": 18,
@@ -807,19 +720,6 @@
       "alchemy_network": null
     },
     {
-      "chain_id": 65536,
-      "name": "Automata Mainnet",
-      "rpc_urls": [
-        "https://rpc.ata.network"
-      ],
-      "native_symbol": "ATA",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
       "chain_id": 81457,
       "name": "Blast",
       "rpc_urls": [
@@ -831,32 +731,6 @@
       "token_review_status": "pending",
       "notes": "Stablecoin catalog review pending.",
       "alchemy_network": "blast-mainnet"
-    },
-    {
-      "chain_id": 380929,
-      "name": "Silent Data Mainnet",
-      "rpc_urls": [
-        "https://mainnet.silentdata.com/${SILENTDATA_AUTH_TOKEN}"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
-    },
-    {
-      "chain_id": 2702128,
-      "name": "Xterio Chain (ETH)",
-      "rpc_urls": [
-        "https://xterio-eth.alt.technology/"
-      ],
-      "native_symbol": "ETH",
-      "native_decimals": 18,
-      "tokens": [],
-      "token_review_status": "pending",
-      "notes": "Stablecoin catalog review pending.",
-      "alchemy_network": null
     },
     {
       "chain_id": 204,

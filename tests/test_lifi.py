@@ -100,7 +100,7 @@ def test_lifi_routes_use_read_only_quote_endpoint_and_parse_costs():
 
     routes = client.routes(request)
 
-    assert http.calls[0][0] == "https://api.jumper.xyz/pipeline/v1/advanced/routes"
+    assert http.calls[0][0] == "https://li.quest/v1/advanced/routes"
     assert http.calls[0][1]["fromAddress"] == request.from_address
     assert http.calls[0][1]["options"]["order"] == "CHEAPEST"
     assert routes[0].to_amount_min == 990000
@@ -803,7 +803,7 @@ def test_nested_estimate_costs_without_route_aggregate_are_marked_incomplete():
     )
 
     assert route.evidence.costs_complete is False
-    assert "nested fee costs require a route-level aggregate" in (
+    assert "feeCosts aggregate omits nested costs" in (
         route.evidence.costs_incomplete_reason
     )
     assert len(route.fee_costs) == 1
@@ -1183,3 +1183,367 @@ def test_missing_native_gas_price_is_fetched_by_exact_token_identity():
         and price.price_usd == "2500"
         for price in route.evidence.prices
     )
+
+
+class DurableHttp(HttpClient):
+    def __init__(self, path, now, body=None, error=None):
+        super().__init__()
+        self.db_path = path
+        self.scope = "proxy-scope"
+        self.clock = lambda: now[0]
+        self.body = Response().json() if body is None else body
+        self.error = error
+
+    def post(self, url, *, json, headers, timeout):
+        self.calls.append((url, json, headers, timeout))
+        if self.error:
+            raise self.error
+        body = self.body
+        observed = self.clock()
+
+        class DurableResponse:
+            headers = {"x-inventory-observed-at": str(observed)}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return body
+
+        return DurableResponse()
+
+
+def durable_request():
+    return LifiRouteRequest(10, 8453, SOURCE_TOKEN, DESTINATION_TOKEN, "1000000", WALLET, WALLET)
+
+
+def test_route_job_resume_reuses_original_timestamp(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    first_http = DurableHttp(path, now)
+    first = LifiClient(first_http).routes(durable_request())
+    now[0] += 100
+    second_http = DurableHttp(path, now)
+    second_client = LifiClient(second_http)
+    second = second_client.routes(durable_request())
+    assert second_http.calls == []
+    assert second[0].evidence.quote_timestamp == first[0].evidence.quote_timestamp
+    assert second_client.quote_job_metrics["persisted_job_hits"] == 1
+
+
+def test_route_job_resume_reuses_no_route_until_expiration(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    assert LifiClient(DurableHttp(path, now, {"routes": []})).routes(durable_request()) == ()
+    second_http = DurableHttp(path, now, {"routes": []})
+    second = LifiClient(second_http)
+    assert second.routes(durable_request()) == ()
+    assert second_http.calls == []
+    now[0] += 240
+    assert second.routes(durable_request()) == ()
+    assert len(second_http.calls) == 1
+
+
+def test_route_job_key_includes_policy_catalog_decimals_and_amount(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    http = DurableHttp(path, now, {"routes": []})
+    LifiClient(http, policy_digest="p1", catalog_digest="c1").routes(durable_request())
+    LifiClient(http, policy_digest="p2", catalog_digest="c1").routes(durable_request())
+    LifiClient(http, policy_digest="p2", catalog_digest="c2").routes(durable_request())
+    LifiClient(http, policy_digest="p2", catalog_digest="c2").routes(
+        replace(durable_request(), from_token_decimals=6, to_token_decimals=6)
+    )
+    LifiClient(http, policy_digest="p2", catalog_digest="c2").routes(
+        replace(durable_request(), from_amount="999")
+    )
+    assert len(http.calls) == 5
+
+
+def test_route_job_timeout_retries_only_next_invocation(tmp_path):
+    import httpx
+
+    from evm_inventory.quote_jobs import JobInProgress
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    http = DurableHttp(path, now, error=httpx.ReadTimeout("timeout api_key=supersecret"))
+    client = LifiClient(http)
+    with pytest.raises(httpx.ReadTimeout):
+        client.routes(durable_request())
+    with pytest.raises(JobInProgress):
+        client.routes(durable_request())
+    assert len(http.calls) == 1
+    assert "supersecret" not in json.dumps(client.route_diagnostics)
+    assert LifiClient(DurableHttp(path, now)).routes(durable_request())
+
+
+def test_route_job_malformed_response_is_persisted_as_error(tmp_path):
+    import sqlite3
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    with pytest.raises(LifiError):
+        LifiClient(DurableHttp(path, now, {"routes": [{"id": "malformed"}]})).routes(
+            durable_request()
+        )
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT state FROM quote_jobs").fetchone()[0] == "error"
+
+
+def test_route_job_quota_wait_resumes_without_poisoning_client(tmp_path):
+    from evm_inventory.lifi_http import LifiRequestLimit
+    from evm_inventory.quote_jobs import JobInProgress
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    http = DurableHttp(
+        path,
+        now,
+        {"routes": []},
+        LifiRequestLimit("routes", retry_at=1100, diagnostic={"quota": 0}),
+    )
+    client = LifiClient(http)
+    with pytest.raises(LifiRequestLimit):
+        client.routes(durable_request())
+    assert client.route_rate_error is None
+    with pytest.raises(JobInProgress) as exc:
+        client.routes(durable_request())
+    assert exc.value.retry_at == 1100
+    now[0] = 1100
+    http.error = None
+    assert client.routes(durable_request()) == ()
+    assert len(http.calls) == 2
+
+
+def test_route_job_discards_response_if_finish_cas_rejected(tmp_path, monkeypatch):
+    from evm_inventory.quote_jobs import JobInProgress
+
+    now = [1000.0]
+    client = LifiClient(DurableHttp(tmp_path / "operations.sqlite", now))
+    monkeypatch.setattr(client.quote_jobs, "finish", lambda *args, **kwargs: False)
+    with pytest.raises(JobInProgress):
+        client.routes(durable_request())
+
+
+def test_route_job_persists_non429_4xx_across_client_restart(tmp_path):
+    import httpx
+
+    from evm_inventory.quote_jobs import JobInProgress
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    request = httpx.Request("POST", LifiClient.endpoint)
+    error = httpx.HTTPStatusError(
+        "invalid request", request=request, response=httpx.Response(400, request=request)
+    )
+    first_http = DurableHttp(path, now, error=error)
+    with pytest.raises(httpx.HTTPStatusError):
+        LifiClient(first_http).routes(durable_request())
+    other_http = DurableHttp(path, now)
+    with pytest.raises(JobInProgress) as exc:
+        LifiClient(other_http).routes(durable_request())
+    assert exc.value.reason == "bad_request"
+    assert other_http.calls == []
+
+
+def test_route_job_late_response_cannot_overwrite_new_lease_result(tmp_path, monkeypatch):
+    import sqlite3
+
+    from evm_inventory.quote_jobs import JobInProgress, QuoteJobs
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    http = DurableHttp(path, now)
+    client = LifiClient(http)
+    original_post = http.post
+
+    def late_post(*args, **kwargs):
+        response = original_post(*args, **kwargs)
+        now[0] += 60
+        with sqlite3.connect(path) as db:
+            key, request_json = db.execute(
+                "SELECT job_key, request_json FROM quote_jobs"
+            ).fetchone()
+        competing = QuoteJobs(path, http.scope, clock=http.clock)
+        token = competing.claim(key, json.loads(request_json), "")
+        fresh = Response().json()
+        fresh["routes"][0]["id"] = "new-owner-route"
+        assert competing.finish(token, fresh, now[0])
+        return response
+
+    monkeypatch.setattr(http, "post", late_post)
+    with pytest.raises(JobInProgress):
+        client.routes(durable_request())
+    resumed = LifiClient(DurableHttp(path, now)).routes(durable_request())
+    assert resumed[0].route_id == "new-owner-route"
+
+
+def test_route_job_reuses_completion_between_read_and_claim(tmp_path, monkeypatch):
+    from evm_inventory.quote_jobs import QuoteJobs
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    http = DurableHttp(path, now)
+    client = LifiClient(http)
+    original_claim = client.quote_jobs.claim
+
+    def race_claim(key, request, digest, **kwargs):
+        other = QuoteJobs(path, http.scope, clock=http.clock)
+        token = other.claim(key, request, digest)
+        other.finish(token, Response().json(), now[0])
+        return original_claim(key, request, digest, **kwargs)
+
+    monkeypatch.setattr(client.quote_jobs, "claim", race_claim)
+    assert client.routes(durable_request())[0].route_id == "route-1"
+    assert http.calls == []
+
+
+def test_catalog_revision_bypasses_underlying_http_quote_cache(tmp_path):
+    import httpx
+
+    from evm_inventory.lifi_http import LifiHttpClient
+
+    now = [1000.0]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"routes": []})
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    http = LifiHttpClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        db_path=tmp_path / "operations.sqlite",
+        proxy="http://localhost:1234",
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    try:
+        LifiClient(http, catalog_digest="catalog-v1").routes(durable_request())
+        LifiClient(http, catalog_digest="catalog-v2").routes(durable_request())
+        assert len(calls) == 2
+    finally:
+        http.close()
+
+
+def test_route_job_records_position_and_policy_search_association(tmp_path):
+    import sqlite3
+
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    LifiClient(
+        DurableHttp(path, now, {"routes": []}), policy_digest="policy1", catalog_digest="catalog1"
+    ).routes(durable_request())
+    with sqlite3.connect(path) as db:
+        search_key = db.execute("SELECT search_key FROM quote_jobs").fetchone()[0]
+    assert search_key == f"{WALLET}:10:{SOURCE_TOKEN}:policy1:catalog1"
+
+
+def test_route_job_metrics_count_unique_requested_jobs_including_resume(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    LifiClient(DurableHttp(path, now, {"routes": []})).routes(durable_request())
+    client = LifiClient(DurableHttp(path, now, {"routes": []}))
+    client.routes(durable_request())
+    client.routes(durable_request())
+    metrics = client.quote_job_metrics
+    assert metrics["logical_pairs"] == 1
+    assert metrics["pair_completed"] == 1
+    assert metrics["pair_no_route"] == 1
+    assert metrics["pair_pending"] == 0
+    assert metrics["pair_errors"] == 0
+    assert metrics["persisted_job_hits"] == 2
+
+
+def test_route_job_metrics_distinguish_quota_wait_from_errors(tmp_path):
+    from evm_inventory.lifi_http import LifiRequestLimit
+
+    now = [1000.0]
+    http = DurableHttp(
+        tmp_path / "operations.sqlite", now, error=LifiRequestLimit("routes", retry_at=1100)
+    )
+    client = LifiClient(http)
+    with pytest.raises(LifiRequestLimit):
+        client.routes(durable_request())
+    assert client.quote_job_metrics["pair_pending"] == 1
+    assert client.quote_job_metrics["pair_quota_wait"] == 1
+    assert client.quote_job_metrics["pair_errors"] == 0
+    http.error = TimeoutError("timeout")
+    with pytest.raises(TimeoutError):
+        client.routes(replace(durable_request(), from_amount="999"))
+    assert client.quote_job_metrics["logical_pairs"] == 2
+    assert client.quote_job_metrics["pair_errors"] == 1
+
+
+def test_empty_route_response_exposes_original_observation_after_resume(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "operations.sqlite"
+    request = durable_request()
+    first = LifiClient(DurableHttp(path, now, {"routes": []}))
+    assert first.routes(request) == ()
+    observed = first.route_observed_at[request]
+    now[0] += 60
+    resumed = LifiClient(DurableHttp(path, now, {"routes": []}))
+    assert resumed.routes(request) == ()
+    assert resumed.route_observed_at[request] == observed
+    assert observed == datetime.fromtimestamp(1000, UTC).isoformat()
+    assert resumed.quote_job_metrics["pair_expired"] == 0
+
+
+def test_token_price_failure_records_exact_identity_and_provider_body():
+    import httpx
+
+    asset = AssetIdentity(10, SOURCE_TOKEN, 6)
+    request = httpx.Request("GET", LifiClient.token_endpoint)
+    response = httpx.Response(400, json={"message": "token is unavailable"}, request=request)
+    error = httpx.HTTPStatusError("bad token", request=request, response=response)
+
+    class PriceHttp(HttpClient):
+        def get(self, *args, **kwargs):
+            raise error
+
+    client = LifiClient(PriceHttp())
+    with pytest.raises(httpx.HTTPStatusError):
+        client.token_price(asset)
+    diagnostic = client.route_diagnostics[-1]
+    assert diagnostic["operation"] == "token_price"
+    assert diagnostic["chain_id"] == asset.chain_id
+    assert diagnostic["asset"] == asset.contract_address
+    assert diagnostic["decimals"] == asset.decimals
+    provider_error = diagnostic["diagnostic"]["exceptions"][0]
+    assert provider_error["http_status"] == 400
+    assert "token is unavailable" in provider_error["http_response_body"]
+
+
+def test_lifi_http_retry_metric_counts_post_retries(tmp_path, monkeypatch):
+    import httpx
+
+    from evm_inventory.lifi_http import LifiHttpClient
+
+    now = [1000.0]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(500 if len(calls) == 1 else 200, json={"routes": []})
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr("evm_inventory.lifi.budget_sleep", lambda *args, **kwargs: None)
+    http = LifiHttpClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        db_path=tmp_path / "operations.sqlite",
+        proxy="http://localhost:1234",
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    try:
+        assert LifiClient(http).routes(durable_request()) == ()
+        assert len(calls) == 2
+        assert http.metrics["retries"] == 1
+    finally:
+        http.close()

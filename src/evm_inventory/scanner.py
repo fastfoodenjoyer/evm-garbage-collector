@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 from urllib.parse import quote
 
 from .config import format_amount
+from .diagnostics import exception_diagnostic
 from .discovery import Discovery
+from .network_policy import EXCLUDED_NETWORKS
 from .rpc import RpcReader
 from .scan_buffer import ScanBuffer
 from .stages import Deadline, StageDeadlineExceeded, check_deadline, deadline_scope, run_parallel
@@ -29,7 +31,7 @@ def _ready(asset):
 def _failure(store, asset, error, status="error"):
     store.record_asset(
         asset["id"],
-        {"error": error.code, "observed_at": now()},
+        {"error": error.code, "observed_at": now(), "diagnostic": exception_diagnostic(error)},
         status="deferred" if error.retry_after else status,
         retry_after=error.retry_after,
     )
@@ -104,7 +106,10 @@ def _select_endpoint(rpc, network, pinned, blocked, *, rpc_urls=None):
             if exc.code in PERMANENT_RPC_ERRORS:
                 blocked[url] = exc
             elif exc.code in TRANSIENT_RPC_ERRORS:
-                error = RequestError(exc.code, exc.retry_after or time.time() + 300)
+                error = RequestError(
+                    exc.code, exc.retry_after or time.time() + 300,
+                    diagnostic=exception_diagnostic(exc),
+                )
                 blocked[url] = error
     raise error
 
@@ -151,14 +156,20 @@ def _balances(store, assets, wallet, network, rpc, url, block, blocked):
             )
         except RequestError as exc:
             if exc.code in TRANSIENT_RPC_ERRORS:
-                exc = RequestError(exc.code, exc.retry_after or time.time() + 300)
+                exc = RequestError(
+                    exc.code, exc.retry_after or time.time() + 300,
+                    diagnostic=exception_diagnostic(exc),
+                )
                 endpoint_error = exc
                 blocked[url] = exc
             elif exc.code in PERMANENT_RPC_ERRORS:
                 endpoint_error = exc
                 blocked[url] = exc
             elif exc.code not in {"invalid_contract", "decimals_mismatch", "missing_contract_code"}:
-                endpoint_error = RequestError(exc.code, exc.retry_after or time.time() + 300)
+                endpoint_error = RequestError(
+                    exc.code, exc.retry_after or time.time() + 300,
+                    diagnostic=exception_diagnostic(exc),
+                )
                 blocked[url] = endpoint_error
             _failure(store, asset, exc)
 
@@ -259,7 +270,8 @@ def _discover(store, network, wallet, discovery, mandatory_ids):
             status="deferred" if exc.retry_after else "error",
             retry_after=exc.retry_after,
             result=latest["result"],
-            error={"code": exc.code, "observed_at": now()},
+            error={"code": exc.code, "observed_at": now(),
+                   "diagnostic": exception_diagnostic(exc)},
         )
         return discovered_ids
 
@@ -311,12 +323,15 @@ def _scan_network(job, *, rpc, discovery, settings):
 def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=None):
     """Run each wallet's networks concurrently and save read results on the caller thread."""
     settings = scope["settings"]
-    networks = scope["catalog"]["networks"]
+    networks = [n for n in scope["catalog"]["networks"]
+                if n["chain_id"] not in EXCLUDED_NETWORKS]
     started = time.monotonic()
     timed_out = False
     blocked = {}
     mandatory_total = mandatory_failed = discovered_checks = discovered_failed = 0
     positive_balances = 0
+    discovered_provider_only = 0
+    error_details = []
     discovery_statuses = dict.fromkeys(
         ("success", "disabled", "error", "deferred", "pending", "unavailable"), 0
     )
@@ -367,7 +382,9 @@ def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=N
                 if row["id"] in {*mandatory_ids, *discovered_ids} and row["status"] == "pending":
                     store.record_asset(
                         row["id"],
-                        {"error": failure_code, "observed_at": now()},
+                        {"error": failure_code, "observed_at": now(),
+                         "diagnostic": exception_diagnostic(outcome.errors[index])
+                         if worker_failed else {"message": "Scan stage deadline exceeded"}},
                         status=failure_status,
                     )
             state = store.discovery_state(wallet, cid)
@@ -379,7 +396,9 @@ def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=N
                     cursor_history=state["cursor_history"],
                     status=failure_status,
                     result=state["result"],
-                    error={"code": failure_code, "observed_at": now()},
+                    error={"code": failure_code, "observed_at": now(),
+                           "diagnostic": exception_diagnostic(outcome.errors[index])
+                           if worker_failed else {"message": "Scan stage deadline exceeded"}},
                 )
                 state = store.discovery_state(wallet, cid)
             discovery_statuses[state["status"]] = discovery_statuses.get(state["status"], 0) + 1
@@ -393,7 +412,21 @@ def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=N
             )
             discovered = [row for row in current if row["id"] in discovered_ids]
             discovered_checks += len(discovered)
-            discovered_failed += sum(row["status"] != "success" for row in discovered)
+            discovered_failed += sum(
+                row["status"] not in {"success", "provider_only"} for row in discovered
+            )
+            discovered_provider_only += sum(row["status"] == "provider_only" for row in discovered)
+            error_details.extend(
+                {"wallet": wallet, "chain_id": cid, "network": network["name"],
+                 "asset_id": row["asset_id"], "status": row["status"],
+                 "error": (row["result"] or {}).get("error"),
+                 "diagnostic": (row["result"] or {}).get("diagnostic")}
+                for row in current if row["status"] not in {"success", "provider_only"}
+            )
+            if state["status"] not in {"success", "disabled"}:
+                error_details.append({"wallet": wallet, "chain_id": cid,
+                                      "network": network["name"], "phase": "discovery",
+                                      "status": state["status"], "error": state.get("error")})
             positive_balances += sum(
                 int((row["result"] or {}).get("raw_balance") or "0") > 0 for row in current
             )
@@ -409,6 +442,8 @@ def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=N
         "discovery_statuses": discovery_statuses,
         "discovered_checks": discovered_checks,
         "discovered_failed": discovered_failed,
+        "discovered_provider_only": discovered_provider_only,
+        "error_details": error_details,
         "positive_balances": positive_balances,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "timed_out": timed_out,

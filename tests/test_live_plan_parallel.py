@@ -64,7 +64,7 @@ def test_targets_and_groups_run_concurrently_and_prices_are_singleflight(tmp_pat
             )
 
     targets = tuple(
-        BitgetDepositTarget("USDC", chain, DESTINATION, 1) for chain in [8453, 42161, 137, 56]
+        BitgetDepositTarget("USDC", chain, DESTINATION, 1) for chain in [8453, 42161, 137]
     )
     start = time.monotonic()
     plan = create_live_plan(
@@ -88,7 +88,7 @@ def test_targets_and_groups_run_concurrently_and_prices_are_singleflight(tmp_pat
     assert max(prices.values()) == 1
 
 
-def test_deadline_keeps_completed_groups_and_rejects_entire_incomplete_group(tmp_path):
+def test_soft_budget_waits_for_all_groups(tmp_path):
     class Quotes:
         def token_price(self, asset):
             if asset.chain_id == 10:
@@ -109,10 +109,12 @@ def test_deadline_keeps_completed_groups_and_rejects_entire_incomplete_group(tmp
         gas_estimator=lambda **kw: (),
         now_ms=lambda: int(NOW.timestamp() * 1000),
     )
-    assert time.monotonic() - start < 0.3
+    assert time.monotonic() - start >= 0.4
     by_chain = {entry["chain_id"]: entry for entry in plan["entries"]}
     assert by_chain[1]["status"] == "route_ready"
-    assert by_chain[10]["reason"] == "stage_deadline_exceeded"
+    assert by_chain[10]["status"] == "route_ready"
+    assert by_chain[10]["search"]["complete"] is True
+    assert plan["quote_timing"][WALLET]["budget_exceeded"] is True
 
 
 def test_price_cache_keeps_full_asset_identity(tmp_path):
@@ -136,7 +138,7 @@ def test_price_cache_keeps_full_asset_identity(tmp_path):
     assert plan["entries"][0]["reason"] == "missing_source_price"
 
 
-def test_unfinished_target_invalidates_all_positions_in_its_group(tmp_path):
+def test_slow_target_does_not_invalidate_complete_comparison(tmp_path):
     other = "0x" + "e" * 40
     rows = _rows([10, 10])
     rows[1]["asset_id"] = other
@@ -164,11 +166,11 @@ def test_unfinished_target_invalidates_all_positions_in_its_group(tmp_path):
         now_ms=lambda: int(NOW.timestamp() * 1000),
     )
     assert len(plan["entries"]) == 2
-    assert all(entry["reason"] == "stage_deadline_exceeded" for entry in plan["entries"])
-    assert all(entry["status"] == "manual_review" for entry in plan["entries"])
+    assert all(entry["search"]["complete"] for entry in plan["entries"])
+    assert all(entry["status"] == "route_ready" for entry in plan["entries"])
 
 
-def test_blocked_catalog_is_included_in_quote_deadline(tmp_path, monkeypatch):
+def test_slow_catalog_is_not_cancelled_by_soft_budget(tmp_path, monkeypatch):
     def blocked_catalog():
         time.sleep(0.4)
         return ()
@@ -180,9 +182,11 @@ def test_blocked_catalog_is_included_in_quote_deadline(tmp_path, monkeypatch):
         deposit_addresses={WALLET: "0x" + "d" * 40},
         allowlist_path=_allowlist(tmp_path, [(10, SOURCE, "swap")]),
         stage_seconds=0.1,
+        client=object(),
     )
-    assert time.monotonic() - start < 0.3
-    assert plan["entries"][0]["reason"] == "stage_deadline_exceeded"
+    assert time.monotonic() - start >= 0.4
+    assert plan["entries"][0]["reason"] != "stage_deadline_exceeded"
+    assert plan["quote_timing"][WALLET]["budget_exceeded"] is True
 
 
 def test_exact_price_singleflight_deduplicates_parallel_requests():
@@ -225,7 +229,7 @@ def test_direct_positions_share_native_gas_prices_without_mutating_estimator(tmp
             return LifiPriceEvidence(asset, "2000" if asset.is_native else "1", NOW.isoformat())
 
         def routes(self, request):
-            raise AssertionError("direct deposits must not request a route")
+            return ()  # Alternate deposit assets have no available route in this fixture.
 
     class Gas(PlannerGasEstimator):
         def __call__(self, **kwargs):

@@ -10,16 +10,19 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any
 
+from .network_policy import EXCLUDED_NETWORKS
+
 _FILES = ("balances.csv", "checks.csv", "coverage.csv", "inventory.json")
 _MARKER = ".inventory-database"
 _CHECK_FIELDS = [
     "wallet", "chain_id", "asset_id", "name", "symbol", "raw_balance", "decimals",
-    "amount", "status", "error", "block_number", "observed_at", "price_usd",
+    "amount", "status", "error", "diagnostic", "block_number", "observed_at", "price_usd",
     "price_source", "price_timestamp", "source", "verification",
 ]
 _COVERAGE_FIELDS = [
     "wallet", "chain_id", "network", "mandatory_status", "token_review_status",
-    "discovery_status", "discovered_verification_failures",
+    "discovery_status", "discovery_error", "discovered_verification_failures",
+    "discovered_provider_only",
 ]
 
 
@@ -43,6 +46,8 @@ def _row(asset: dict[str, Any]) -> dict[str, Any]:
         "raw_balance": str(raw) if raw is not None else None,
         "decimals": result.get("decimals", meta.get("decimals")), "amount": result.get("amount"),
         "status": asset["status"], "error": result.get("error"),
+        "diagnostic": json.dumps(result["diagnostic"], ensure_ascii=False)
+        if result.get("diagnostic") is not None else None,
         "block_number": result.get("block_number"), "observed_at": result.get("observed_at"),
         "price_usd": result.get("price_usd"), "price_source": result.get("price_source"),
         "price_timestamp": result.get("price_timestamp"), "source": result.get("source"),
@@ -117,7 +122,7 @@ def _coverage(store, mandatory: list[dict[str, Any]], all_assets: list[dict[str,
         metadata = assets[0]["metadata"]
         state = store.discovery_state(wallet, chain_id)
         failures = sum(
-            asset["kind"] == "discovered" and asset["status"] != "success"
+            asset["kind"] == "discovered" and asset["status"] not in {"success", "provider_only"}
             for asset in all_assets
             if asset["wallet"] == wallet and asset["chain_id"] == chain_id
         )
@@ -129,7 +134,14 @@ def _coverage(store, mandatory: list[dict[str, Any]], all_assets: list[dict[str,
             "mandatory_status": "complete" if complete else "incomplete",
             "token_review_status": review,
             "discovery_status": state["status"] if state else "pending",
+            "discovery_error": json.dumps(state.get("error"), ensure_ascii=False)
+            if state and state.get("error") else None,
             "discovered_verification_failures": failures,
+            "discovered_provider_only": sum(
+                asset["kind"] == "discovered" and asset["status"] == "provider_only"
+                for asset in all_assets
+                if asset["wallet"] == wallet and asset["chain_id"] == chain_id
+            ),
         })
     return coverage
 
@@ -139,7 +151,7 @@ def export_current(store, output: Path) -> None:
     output = Path(output)
     database_uuid = store.database_uuid()
     _preflight(output, database_uuid)
-    assets = store.assets()
+    assets = [asset for asset in store.assets() if asset["chain_id"] not in EXCLUDED_NETWORKS]
     checks = [_row(asset) for asset in assets if asset["kind"] == "mandatory"]
     rows = [_row(asset) for asset in assets]
     balances = [

@@ -136,6 +136,7 @@ def test_batch_executor_refuses_without_explicit_execute(tmp_path):
             rpc_urls={},
             journal_path=tmp_path / "journal.sqlite",
             execute=False,
+        trust_deposit_addresses=True,
         )
 
 
@@ -642,7 +643,10 @@ def test_expired_quote_after_approval_defers_route_without_route_signature(monke
     )
     monkeypatch.setattr("evm_inventory.route_execution._bitget_client", lambda: _Bitget())
     jumper = type("Jumper", (), {"step_transaction": lambda self, step: request})()
-    monkeypatch.setattr("evm_inventory.route_execution.LifiClient", lambda *args, **kwargs: jumper)
+    def lifi_client(http, **kwargs):
+        jumper.http_client = http
+        return jumper
+    monkeypatch.setattr("evm_inventory.wallet_lifi.LifiClient", lifi_client)
     entry = {**_route_entry(wallet.public_address), "quoted_at": 100_000, "settlement": "wallet"}
 
     summary = execute_entries(
@@ -654,6 +658,7 @@ def test_expired_quote_after_approval_defers_route_without_route_signature(monke
         delay_min_seconds=0,
         delay_max_seconds=0,
         now_ms=lambda: clock[0],
+        trust_deposit_addresses=True,
     )
 
     assert summary == {"submitted": 0, "skipped": 0, "failed": 0, "deferred": 1}
@@ -689,6 +694,7 @@ def test_batch_records_partial_approval_and_continues_after_deferred_route(monke
         execute=True,
         delay_min_seconds=0,
         delay_max_seconds=0,
+        trust_deposit_addresses=True,
     )
 
     assert summary == {"submitted": 1, "skipped": 0, "failed": 0, "deferred": 1}
@@ -736,6 +742,7 @@ def test_batch_continues_after_real_initial_gas_deferral_without_first_signature
         execute=True,
         delay_min_seconds=0,
         delay_max_seconds=0,
+        trust_deposit_addresses=True,
     )
 
     assert summary == {"submitted": 1, "skipped": 0, "failed": 0, "deferred": 1}
@@ -766,6 +773,7 @@ def test_wallet_settled_route_is_staged_without_calling_bitget(monkeypatch, tmp_
         wallets={wallet.public_address.lower(): wallet}, rpc_urls={1: "https://rpc"},
         journal_path=tmp_path / "journal.sqlite", execute=True,
         delay_min_seconds=0, delay_max_seconds=0,
+        trust_deposit_addresses=True,
     )
 
     assert summary == {"submitted": 1, "skipped": 0, "failed": 0, "deferred": 0}
@@ -790,6 +798,7 @@ def test_final_deposit_passes_exact_target_identity_to_bitget(monkeypatch, tmp_p
         [entry], wallets={wallet.public_address.lower(): wallet}, rpc_urls={1: "https://rpc"},
         journal_path=tmp_path / "journal.sqlite", execute=True,
         delay_min_seconds=0, delay_max_seconds=0,
+        trust_deposit_addresses=True,
     )
 
     assert bitget.calls[0]["chain"] == "BASE"
@@ -810,6 +819,7 @@ def test_bitget_api_failure_is_journaled_as_execution_failed(monkeypatch, tmp_pa
         [_direct_entry(wallet.public_address)], wallets={wallet.public_address.lower(): wallet},
         rpc_urls={1: "https://rpc"}, journal_path=tmp_path / "journal.sqlite", execute=True,
         delay_min_seconds=0, delay_max_seconds=0,
+        trust_deposit_addresses=True,
     )
 
     assert summary["failed"] == 1
@@ -832,6 +842,7 @@ def test_final_deposit_missing_exchange_chain_is_rejected_before_execution(monke
             wallets={wallet.public_address.lower(): wallet}, rpc_urls={1: "https://rpc"},
             journal_path=tmp_path / "journal.sqlite", execute=True,
             delay_min_seconds=0, delay_max_seconds=0,
+        trust_deposit_addresses=True,
         )
 
     assert executed == []
@@ -867,6 +878,7 @@ def test_route_quote_is_rejected_before_execution_or_private_key_use(
             delay_min_seconds=0,
             delay_max_seconds=0,
             now_ms=lambda: 1_000_000,
+        trust_deposit_addresses=True,
         )
 
     assert executed == []
@@ -891,6 +903,7 @@ def test_route_quote_at_exactly_15_minutes_is_accepted(monkeypatch, tmp_path):
         delay_min_seconds=0,
         delay_max_seconds=0,
         now_ms=lambda: 1_000_000,
+        trust_deposit_addresses=True,
     )
 
     assert summary["submitted"] == 1
@@ -905,6 +918,7 @@ def test_route_quote_expiring_during_inter_wallet_delay_is_not_executed(monkeypa
         Account.from_key("0x" + "2" * 64).address.lower(),
         "0x" + "2" * 64,
         "0x" + "3" * 40,
+        "http://localhost:1234",
     )
     executed = []
     clock = [1_000_000]
@@ -930,6 +944,7 @@ def test_route_quote_expiring_during_inter_wallet_delay_is_not_executed(monkeypa
             sleep=lambda _: clock.__setitem__(0, clock[0] + 1),
             wallet_batches=((first.public_address,), (second.public_address,)),
             now_ms=lambda: clock[0],
+        trust_deposit_addresses=True,
         )
 
     assert executed == [first.public_address]
@@ -953,6 +968,7 @@ def test_direct_deposit_does_not_require_a_route_quote(monkeypatch, tmp_path):
         delay_min_seconds=0,
         delay_max_seconds=0,
         now_ms=lambda: 1_000_000,
+        trust_deposit_addresses=True,
     )
 
     assert executed == [True]
@@ -976,6 +992,7 @@ def test_post_bridge_deposit_does_not_require_a_route_quote(monkeypatch, tmp_pat
         delay_min_seconds=0,
         delay_max_seconds=0,
         now_ms=lambda: 1_000_000,
+        trust_deposit_addresses=True,
     )
 
     assert executed == [True]
@@ -983,7 +1000,7 @@ def test_post_bridge_deposit_does_not_require_a_route_quote(monkeypatch, tmp_pat
 
 def _wallet():
     key = "0x" + "1" * 64
-    return WalletWorkbookRow(2, 1, Account.from_key(key).address.lower(), key, "0x" + "2" * 40)
+    return WalletWorkbookRow(2, 1, Account.from_key(key).address.lower(), key, "0x" + "2" * 40, "http://localhost:1234")
 
 
 def _direct_entry(wallet):

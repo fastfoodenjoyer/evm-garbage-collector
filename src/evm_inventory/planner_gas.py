@@ -6,11 +6,13 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from threading import Lock
 
-from .diagnostics import redact_text
+from .diagnostics import exception_diagnostic, redact_text
 from .executor import approve_transaction, token_allowance
 from .fee_planner import FeePlanner, native_asset_identity
 from .lifi import LifiClient, LifiRoute, TransactionRequest
+from .lifi_quota import LifiRequestLimit
 from .models import AssetIdentity
+from .quote_jobs import JobInProgress
 from .rpc import RpcReader, quantity
 from .stages import StageDeadlineExceeded
 from .valuation import FeeQuote, QuotePrice
@@ -36,11 +38,15 @@ class PlannerGasEstimator:
 
     def _failure(self, route, phase: str, error: Exception) -> None:
         with self._diagnostic_lock:
-            self.diagnostics.append({
-                "route_id": route.route_id if route else None,
-                "phase": phase, "error": type(error).__name__,
-                "detail": redact_text(str(error))[:500],
-            })
+            self.diagnostics.append(
+                {
+                    "route_id": route.route_id if route else None,
+                    "phase": phase,
+                    "error": type(error).__name__,
+                    "detail": redact_text(str(error)),
+                    "diagnostic": exception_diagnostic(error),
+                }
+            )
 
     def __call__(
         self,
@@ -56,13 +62,11 @@ class PlannerGasEstimator:
         try:
             if route is None:
                 return (self._estimate_direct(source_asset, wallet, amount, recipient),)
-            prepared = tuple(
-                self.price_client.step_transaction(step) for step in route.raw_steps
-            )
+            prepared = tuple(self.price_client.step_transaction(step) for step in route.raw_steps)
             return self.estimate_prepared_route(
                 route=route, wallet=wallet, prepared_transactions=prepared
             )
-        except StageDeadlineExceeded:
+        except (StageDeadlineExceeded, LifiRequestLimit, JobInProgress):
             raise
         except Exception as error:
             self._failure(route, "prepare_transactions", error)
@@ -88,7 +92,7 @@ class PlannerGasEstimator:
                 self._failure(route, "estimate", ValueError("incomplete route gas metadata"))
                 return None
             return (*transaction_quotes, *approval_quotes)
-        except StageDeadlineExceeded:
+        except (StageDeadlineExceeded, LifiRequestLimit, JobInProgress):
             raise
         except Exception as error:
             self._failure(route, "estimate", error)
@@ -153,9 +157,7 @@ class PlannerGasEstimator:
             }
         return self._priced_estimate(asset.chain_id, url, transaction)
 
-    def _estimate_approvals(
-        self, route: LifiRoute, wallet: str
-    ) -> tuple[FeeQuote, ...] | None:
+    def _estimate_approvals(self, route: LifiRoute, wallet: str) -> tuple[FeeQuote, ...] | None:
         if route.evidence is None:
             return None
         result: list[FeeQuote] = []
@@ -171,7 +173,11 @@ class PlannerGasEstimator:
                 return None
             spender = estimate["approvalAddress"]
             token = evidence.source
-            if token.is_native or not isinstance(spender, str):
+            if token.is_native:
+                # LI.FI also supplies the router as approvalAddress for native inputs.
+                # Native value is sent with the transaction and has no ERC20 allowance.
+                continue
+            if not isinstance(spender, str):
                 return None
             amount = evidence.from_amount
             if amount is None:

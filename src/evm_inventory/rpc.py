@@ -68,8 +68,11 @@ class RpcReader:
 
     def check_chain(self, url, chain_id):
         if (url, chain_id) not in self.identities:
-            if quantity(self.call(url, "eth_chainId", [])) != chain_id:
-                raise RpcError("wrong_chain")
+            actual_chain = quantity(self.call(url, "eth_chainId", []))
+            if actual_chain != chain_id:
+                raise RpcError("wrong_chain", diagnostic={
+                    "method": "eth_chainId", "expected": chain_id, "actual": actual_chain,
+                })
             self.identities.add((url, chain_id))
 
     def block(self, url, chain_id, number=None):
@@ -122,7 +125,9 @@ class RpcReader:
             self.metadata[key] = decimals
         decimals = self.metadata[key]
         if expected_decimals is not None and decimals != expected_decimals:
-            raise RpcError("decimals_mismatch")
+            raise RpcError("decimals_mismatch", diagnostic={
+                "contract": contract, "expected": expected_decimals, "actual": decimals,
+            })
         raw = uint256(
             self.call(
                 url, "eth_call", [{"to": contract, "data": balance_of_data(wallet)}, hex(block)]

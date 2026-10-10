@@ -6,6 +6,7 @@ The caller persists completed results; late readers cannot change that snapshot.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -25,24 +26,50 @@ class StageDeadlineExceeded(TimeoutError):
 
 
 class Deadline:
-    def __init__(self, seconds: float = 30, label: str = "stage"):
-        if isinstance(seconds, bool) or not math.isfinite(seconds) or not 0 < seconds <= 30:
-            raise ValueError("stage budget must be greater than zero and at most 30 seconds")
+    def __init__(self, seconds: float = 30, label: str = "stage", *, hard_limit: bool = True):
+        if isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("stage budget must be finite and greater than zero")
+        if hard_limit and seconds > 30:
+            raise ValueError("hard stage budget must be at most 30 seconds")
         self.started_at = time.monotonic()
         # Include checkpointing and CLI shutdown in the requested stage budget.
         # Remote reads must yield early enough to leave room for local work.
-        self.expires_at = self.started_at + seconds - min(1.0, seconds / 10)
+        self.expires_at = (
+            self.started_at + seconds - min(1.0, seconds / 10) if hard_limit else None
+        )
+        self.target_seconds = seconds
+        self._warning_lock = threading.Lock()
+        self._warned = False
         self.label = label
         self.network_slots = threading.BoundedSemaphore(32)
 
-    def remaining(self) -> float:
+    def remaining(self) -> float | None:
+        if self.expires_at is None:
+            return None
         return max(0.0, self.expires_at - time.monotonic())
 
     @property
     def expired(self) -> bool:
-        return self.remaining() <= 0
+        remaining = self.remaining()
+        return remaining is not None and remaining <= 0
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started_at
+
+    @property
+    def budget_exceeded(self) -> bool:
+        return self.elapsed > self.target_seconds
 
     def check(self) -> None:
+        if self.expires_at is None and self.budget_exceeded:
+            with self._warning_lock:
+                if not self._warned:
+                    self._warned = True
+                    logging.getLogger(__name__).warning(
+                        "%s: превышен ориентир %.2f с; полное сравнение продолжается",
+                        self.label, self.target_seconds,
+                    )
         if self.expired:
             raise StageDeadlineExceeded(f"stage_deadline_exceeded:{self.label}")
 
@@ -75,7 +102,8 @@ def request_timeout(default: float = 30) -> float:
     deadline.check()
     # HTTPX applies timeouts independently to pool/connect/write/read. Reserve
     # room for each phase and favour another endpoint over a long stalled call.
-    return min(default, 3.0, deadline.remaining() / 4)
+    remaining = deadline.remaining()
+    return min(default, 3.0) if remaining is None else min(default, 3.0, remaining / 4)
 
 
 def budget_sleep(seconds: float, *, sleep: Callable[[float], None] = time.sleep) -> None:
@@ -85,8 +113,8 @@ def budget_sleep(seconds: float, *, sleep: Callable[[float], None] = time.sleep)
         return
     deadline.check()
     remaining = deadline.remaining()
-    sleep(min(seconds, remaining))
-    if seconds >= remaining:
+    sleep(seconds if remaining is None else min(seconds, remaining))
+    if remaining is not None and seconds >= remaining:
         raise StageDeadlineExceeded(f"stage_deadline_exceeded:{deadline.label}")
     deadline.check()
 
@@ -129,7 +157,7 @@ def run_parallel[T, R](
     deadline: Deadline,
     workers: int = 16,
 ) -> ParallelResults[R]:
-    """Collect independent reads within one budget, without joining late I/O.
+    """Collect independent reads; only a hard budget discards late results.
 
     Daemon workers are intentional: ThreadPoolExecutor joins outstanding tasks
     on process exit, which would invalidate the stage deadline. Only isolated
@@ -168,7 +196,7 @@ def run_parallel[T, R](
 
     def collect(item):
         index, value, error, finished = item
-        if finished > deadline.expires_at:
+        if deadline.expires_at is not None and finished > deadline.expires_at:
             return
         if error is None:
             completed[index] = value
@@ -177,10 +205,13 @@ def run_parallel[T, R](
 
     try:
         while len(completed) + len(errors) < len(inputs) and not deadline.expired:
+            deadline.check()
+            remaining = deadline.remaining()
             try:
-                collect(output.get(timeout=deadline.remaining()))
+                collect(output.get(timeout=0.1 if remaining is None else remaining))
             except Empty:
-                break
+                if remaining is not None:
+                    break
     finally:
         stopped.set()
     while True:

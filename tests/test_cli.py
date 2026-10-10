@@ -81,16 +81,25 @@ def test_workbook_commands_create_template_and_write_dry_run(tmp_path, capsys):
 def test_route_plan_writes_transaction_free_runbook(tmp_path, capsys):
     balances = tmp_path / "balances.csv"
     balances.write_text(
-        "wallet,chain_id,asset_id,raw_balance,symbol\n"
-        + "0x" + "1" * 40 + ",8453,native,1,ETH\n"
+        "wallet,chain_id,asset_id,raw_balance,symbol\n" + "0x" + "1" * 40 + ",8453,native,1,ETH\n"
     )
     output = tmp_path / "runbook.json"
 
     db = tmp_path / "inventory.sqlite"
-    assert main([
-        "route-plan", "--balances", str(balances), "--output", str(output),
-        "--db", str(db),
-    ]) == 0
+    assert (
+        main(
+            [
+                "route-plan",
+                "--balances",
+                str(balances),
+                "--output",
+                str(output),
+                "--db",
+                str(db),
+            ]
+        )
+        == 0
+    )
 
     assert json.loads(capsys.readouterr().out)["status"] == "planned"
     assert json.loads(output.read_text())["summary"]["dust"] == 1
@@ -263,25 +272,35 @@ def test_resume_routes_prints_key_free_durable_status(tmp_path, capsys):
         pass
     with Journal(db) as journal:
         group = journal.get_or_create_group(
-            group_key="wallet:10:plan", wallet="0x" + "1" * 40,
-            source_chain_id=10, loss_budget_pct="15", source_usd="100",
+            group_key="wallet:10:plan",
+            wallet="0x" + "1" * 40,
+            source_chain_id=10,
+            loss_budget_pct="15",
+            source_usd="100",
         )
         journal.record_group_state(
-            group["id"], "manual_review_group_threshold_exceeded",
+            group["id"],
+            "manual_review_group_threshold_exceeded",
             reason="loss_threshold_exceeded",
         )
         position = journal.get_or_create_position(
-            position_key="wallet:10:native", wallet="0x" + "1" * 40,
+            position_key="wallet:10:native",
+            wallet="0x" + "1" * 40,
             group_id=group["id"],
         )
         journal.record_position_state(
-            position["id"], "manual_review_after_swap",
-            actual_asset_id="native", actual_balance_raw="123",
+            position["id"],
+            "manual_review_after_swap",
+            actual_asset_id="native",
+            actual_balance_raw="123",
             reason="bridge requote is unavailable",
         )
         step = journal.record_step_intent(
-            position_id=position["id"], step_key="bridge", nonce=3,
-            calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+            position_id=position["id"],
+            step_key="bridge",
+            nonce=3,
+            calldata_digest="a" * 64,
+            signed_payload_digest="b" * 64,
         )
         journal.record_broadcast_attempt(step["id"], "0x" + "c" * 64)
         journal.record_receipt(step["id"], status="confirmed", finality_block=123)
@@ -311,9 +330,10 @@ def test_resume_routes_on_inventory_without_transactions_is_read_only(tmp_path, 
     assert main(["resume-routes", "--db", str(db)]) == 0
     assert json.loads(capsys.readouterr().out)["steps"] == {}
     with Store(db, readonly=True) as store:
-        assert store.db.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='route_steps'"
-        ).fetchone() is None
+        assert (
+            store.db.execute("SELECT 1 FROM sqlite_master WHERE name='route_steps'").fetchone()
+            is None
+        )
 
 
 @pytest.mark.parametrize(
@@ -401,6 +421,8 @@ def test_quote_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeypat
     wallet = SimpleNamespace(
         public_address="0x" + "1" * 40,
         bitget_deposit_address="0x" + "2" * 40,
+        rabby_proxy="http://localhost:1234",
+        row_number=2,
     )
     monkeypatch.setattr("evm_inventory.cli.parse_ordinal_ranges", lambda _ranges: None)
     monkeypatch.setattr(
@@ -419,24 +441,28 @@ def test_quote_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeypat
 
     monkeypatch.setattr("evm_inventory.cli.create_live_plan", create_live_plan)
 
-    assert main(
-        [
-            "quote-routes",
-            "--balances",
-            str(tmp_path / "balances.csv"),
-            "--workbook",
-            str(tmp_path / "wallets.xlsx"),
-            "--output",
-            str(tmp_path / "plan.json"),
-            "--db",
-            str(tmp_path / "inventory.sqlite"),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "quote-routes",
+                "--balances",
+                str(tmp_path / "balances.csv"),
+                "--workbook",
+                str(tmp_path / "wallets.xlsx"),
+                "--output",
+                str(tmp_path / "plan.json"),
+                "--db",
+                str(tmp_path / "inventory.sqlite"),
+            ]
+        )
+        == 0
+    )
 
     assert calls["max_route_loss_pct"] == Decimal("7.25")
     assert calls["stage_seconds"] == 30
-    assert calls["workers"] == 4
+    assert calls["workers"] == 16
     assert calls["target_workers"] == 8
+    assert len(calls["target_policy"].targets) == 3
     capsys.readouterr()
 
 
@@ -467,19 +493,23 @@ def test_execute_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeyp
 
     monkeypatch.setattr("evm_inventory.cli.execute_entries", execute_entries)
 
-    assert main(
-        [
-            "execute-routes",
-            "--plan",
-            str(plan),
-            "--workbook",
-            str(tmp_path / "wallets.xlsx"),
-            "--catalog",
-            str(tmp_path / "catalog.json"),
-            "--db",
-            str(tmp_path / "inventory.sqlite"),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "execute-routes",
+                "--trust-deposit-addresses",
+                "--plan",
+                str(plan),
+                "--workbook",
+                str(tmp_path / "wallets.xlsx"),
+                "--catalog",
+                str(tmp_path / "catalog.json"),
+                "--db",
+                str(tmp_path / "inventory.sqlite"),
+            ]
+        )
+        == 0
+    )
 
     assert calls["max_route_loss_pct"] == Decimal("8.5")
     assert calls["journal_path"] == tmp_path / "inventory.sqlite"
@@ -489,8 +519,40 @@ def test_execute_routes_passes_loaded_route_loss_limit(tmp_path, capsys, monkeyp
 
 @pytest.mark.parametrize("budget", ["31", "0", "-1", "nan", "inf"])
 def test_scan_rejects_invalid_stage_budget_before_network_or_database(tmp_path, budget):
-    db = tmp_path / 'inventory.sqlite'
+    db = tmp_path / "inventory.sqlite"
     with pytest.raises(SystemExit) as exc:
-        main(['scan', '--wallets', 'unused', '--db', str(db), '--stage-seconds', budget])
+        main(["scan", "--wallets", "unused", "--db", str(db), "--stage-seconds", budget])
     assert exc.value.code == 2
     assert not db.exists()
+
+
+def test_quote_progress_reports_pairs_and_readable_retry():
+    from evm_inventory.cli import _quote_progress
+
+    plan = {
+        "entries": [
+            {
+                "wallet": "w",
+                "chain_id": 8453,
+                "asset_id": "native",
+                "search": {
+                    "complete": False,
+                    "pending": [
+                        {
+                            "reason": "quota_wait",
+                            "retry_at": 1770000000,
+                            "diagnostic": {
+                                "exceptions": [{"type": "Limit", "message": "remaining=5"}]
+                            },
+                        }
+                    ],
+                },
+            },
+        ],
+        "lifi_requests": {"w": {"http_attempts": 3}},
+    }
+    progress = _quote_progress(plan)
+    assert progress["pending"][0]["retry_at_utc"].endswith("+00:00")
+    assert progress["pending"][0]["retry_at_moscow"].endswith("+03:00")
+    assert progress["pending"][0]["diagnostic"]["exceptions"][0]["message"] == "remaining=5"
+    assert progress["lifi_requests"]["w"]["http_attempts"] == 3

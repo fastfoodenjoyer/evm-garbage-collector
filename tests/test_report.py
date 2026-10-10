@@ -41,7 +41,9 @@ def test_export_current_reads_retained_balance_assets_and_excludes_discovery_sta
             "mandatory_status": "complete",
             "token_review_status": "verified",
             "discovery_status": "success",
-            "discovered_verification_failures": 1,
+            "discovered_verification_failures": 0,
+            "discovered_provider_only": 1,
+            "discovery_error": None,
         }
     ]
     with (tmp_path / "out" / "balances.csv").open(newline="") as stream:

@@ -35,6 +35,7 @@ from .executor import (
 from .fee_planner import FeePlanner
 from .journal import Journal
 from .lifi import TransactionRequest
+from .network_policy import uses_excluded_network
 from .rabby import EncodedAction, RabbyClient, encode_action
 from .rpc import balance_of_data, quantity, uint256
 from .transport import RequestError
@@ -105,6 +106,8 @@ def select_reviewed_action(
     if len(selected) != 1 or selected[0].get("status") != "ready":
         raise ValueError("DeFi action ID does not select one ready position")
     entry = selected[0]
+    if uses_excluded_network(entry):
+        raise ValueError("network excluded from processing")
     if entry.get("wallet") != wallet.lower():
         raise ValueError("selected DeFi action belongs to another wallet")
     return entry

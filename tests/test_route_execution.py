@@ -547,6 +547,7 @@ def test_execute_entries_uses_group_preflight_dependencies_before_submission(tmp
         preflight_entry=lambda planned: planned,
         submit_route_step=lambda fresh, step: submitted.append(step["kind"])
         or {"state": "completed", "realized_loss_usd": "1"},
+        trust_deposit_addresses=True,
     )
 
     assert submitted == ["direct_deposit"]
@@ -1421,3 +1422,290 @@ def _lifi_route(
         },
         quote_timestamp=timestamp,
     )
+
+
+def _local_unwrap_fixture():
+    from evm_inventory.lifi import LifiRouteRequest
+    from evm_inventory.weth import NATIVE, WETH_CONTRACTS, unwrap_route_payload
+
+    amount = 10**18
+    request = LifiRouteRequest(10, 10, WETH_CONTRACTS[10], NATIVE, str(amount), WALLET, WALLET)
+    route = _route_from_dict(
+        unwrap_route_payload(request, "2000", "2000"), quote_timestamp=NOW.isoformat()
+    )
+    entry = _entry(WETH_CONTRACTS[10], status="route_ready")
+    entry.update(
+        local_unwrap=True,
+        decimals=18,
+        raw_balance=str(amount),
+        quoted_at=int(NOW.timestamp() * 1000),
+    )
+    entry["target"] = {
+        "coin": "ETH",
+        "chain_id": 10,
+        "chain": "Optimism",
+        "asset_id": "native",
+        "minimum_raw": "1",
+        "decimals": 18,
+    }
+    entry["steps"] = [{"kind": "unwrap_to_native", "route": _route_data(route)}]
+    return entry, route
+
+
+def test_local_unwrap_preflight_prices_withdraw_and_future_direct_deposit():
+    from evm_inventory.valuation import FeeQuote, QuotePrice
+
+    entry, route = _local_unwrap_fixture()
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    native = AssetIdentity(10, "native", 18)
+    fee = FeeQuote(10**14, QuotePrice(native, Decimal("2000"), NOW))
+
+    class Client:
+        def routes(self, request):
+            assert request.to_address == WALLET
+            return (route,)
+
+        def step_transaction(self, step):
+            from evm_inventory.weth import withdraw_transaction_fields
+
+            chain, contract, data = withdraw_transaction_fields(step)
+            return TransactionRequest(chain, contract, data, 0, 30000, 1)
+
+        def token_price(self, asset):
+            return LifiPriceEvidence(asset, "2000", NOW.isoformat())
+
+    class Rpc:
+        def call(self, url, method, params):
+            assert method == "eth_call"
+            return "0x" + f"{10**18:064x}"
+
+    class Gas:
+        rpc = Rpc()
+        rpc_urls = {10: "rpc"}
+
+        def estimate_prepared_route(self, **kwargs):
+            return (fee,)
+
+        def __call__(self, **kwargs):
+            assert kwargs["route"] is None
+            assert kwargs["recipient"] == DEPOSIT
+            return (fee,)
+
+    bitget = SimpleNamespace(
+        revalidate_deposit_target=lambda *args, **kwargs: BitgetDepositTarget(
+            "ETH", 10, "native", 1, "Optimism", 18
+        )
+    )
+    fresh = _preflight_live_entry(
+        entry,
+        wallet=wallet,
+        rpc=Gas.rpc,
+        rpc_urls=Gas.rpc_urls,
+        jumper=Client(),
+        bitget=bitget,
+        gas_estimator=Gas(),
+        now_ms=lambda: int(NOW.timestamp() * 1000),
+    )
+    assert Decimal(fresh["valuation"]["loss_usd"]) == Decimal("0.4")
+    assert fresh["_step_candidates"][route.route_id].loss_usd == Decimal("0.2")
+
+
+def test_local_unwrap_wrong_target_fails_before_route_callback():
+    entry, _ = _local_unwrap_fixture()
+    entry["target"]["chain_id"] = 8453
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    bitget = SimpleNamespace(
+        revalidate_deposit_target=lambda *args, **kwargs: BitgetDepositTarget(
+            "ETH", 8453, "native", 1, "Base", 18
+        )
+    )
+    with pytest.raises(ValueError, match="local_unwrap_target"):
+        _preflight_live_entry(
+            entry,
+            wallet=wallet,
+            rpc=None,
+            rpc_urls={},
+            jumper=None,
+            bitget=bitget,
+            gas_estimator=None,
+            now_ms=lambda: int(NOW.timestamp() * 1000),
+        )
+
+
+def test_local_unwrap_recovers_confirmed_output_and_deposit_without_second_withdraw(
+    tmp_path, monkeypatch
+):
+    from evm_inventory.stages import StageDeadlineExceeded
+
+    entry, route = _local_unwrap_fixture()
+    wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
+    native_balance = 10**17
+    submitted = []
+    requoted = []
+    projections = []
+    target = BitgetDepositTarget("ETH", 10, "native", 1, "Optimism", 18)
+
+    class Rpc:
+        def call(self, url, method, params):
+            if method == "eth_getBalance":
+                return hex(native_balance)
+            if method == "eth_call":
+                return "0x" + f"{10**18:064x}"
+            if method == "eth_getTransactionReceipt":
+                return {"gasUsed": "0x64", "effectiveGasPrice": "0x1"}
+            raise AssertionError(method)
+
+    class Bitget:
+        def revalidate_deposit_target(self, *args, **kwargs):
+            return target
+
+        def wait_for_deposit_seen(self, **kwargs):
+            return "success"
+
+    def execute(*, entry, journal, position_id, **kwargs):
+        nonlocal native_balance
+        submitted.append(entry["asset_id"])
+        if entry["asset_id"] != "native":
+            native_balance += 10**18 - 100
+        else:
+            saved = journal.record_step_intent(
+                position_id=position_id,
+                step_key="direct_deposit",
+                nonce=2,
+                calldata_digest="a" * 64,
+                signed_payload_digest="b" * 64,
+            )
+            journal.record_broadcast_attempt(saved["id"], "0x" + "2" * 64)
+        return "0x" + "2" * 64
+
+    def requote(original, asset, amount):
+        requoted.append(amount)
+        if len(requoted) == 1:
+            raise StageDeadlineExceeded("fixture_pause_after_withdraw")
+        return {
+            **original,
+            "status": "direct_deposit",
+            "asset_id": "native",
+            "_actual_asset_id": "native",
+            "_actual_balance_raw": str(amount),
+            "steps": [{"kind": "direct_deposit"}],
+            "valuation": {"loss_usd": "0.3"},
+            "_direct_transaction": TransactionRequest(10, DEPOSIT, "0x", amount - 100, 100, 1),
+        }
+
+    monkeypatch.setattr("evm_inventory.route_execution._execute_entry", execute)
+    from evm_inventory.weth import withdraw_transaction_fields
+
+    chain, contract, data = withdraw_transaction_fields(route.raw_steps[0])
+    step = {
+        **entry["steps"][0],
+        "_live_route": route,
+        "_prepared_requests": (TransactionRequest(chain, contract, data, 0, 100, 1),),
+    }
+    entry.update(
+        _step_candidates={route.route_id: SimpleNamespace(loss_usd=Decimal("0.2"))},
+        _requote_after_intermediate=requote,
+        _check_group_loss=projections.append,
+    )
+    with Journal(tmp_path / "journal.sqlite") as journal:
+        position = journal.get_or_create_position(position_key="unwrap", wallet=WALLET)
+        entry["_journal_position_id"] = position["id"]
+        kwargs = dict(
+            wallet=wallet,
+            rpc=Rpc(),
+            rpc_urls={10: "rpc"},
+            jumper=object(),
+            bitget=Bitget(),
+            journal=journal,
+            now_ms=lambda: int(NOW.timestamp() * 1000),
+        )
+        with pytest.raises(StageDeadlineExceeded):
+            _submit_live_step(entry, step, **kwargs)
+        result = _submit_live_step(entry, step, **kwargs)
+        replay = _submit_live_step(entry, step, **kwargs)
+    assert submitted == [entry["asset_id"], "native"]
+    assert requoted == [10**18 - 100, 10**18 - 100]
+    assert projections == [Decimal("0.5")]
+    assert result == replay == {"state": "completed", "realized_loss_usd": "0.5"}
+
+
+def test_local_unwrap_group_counts_combined_loss_once_after_pending_recovery(tmp_path):
+    entry, _ = _local_unwrap_fixture()
+    calls = []
+    with Journal(tmp_path / "journal.sqlite") as journal:
+
+        def submit(prepared, step):
+            calls.append(step["kind"])
+            position_id = prepared["_journal_position_id"]
+            if step["kind"] == "unwrap_to_native":
+                direct = {
+                    **prepared,
+                    "status": "direct_deposit",
+                    "asset_id": "native",
+                    "valuation": {"loss_usd": "0.3"},
+                    "_realized_loss_before_current_usd": "0.2",
+                }
+                journal.save_checkpoint(position_id, "direct_prepared", direct)
+                intent = journal.record_step_intent(
+                    position_id=position_id,
+                    step_key="direct_deposit",
+                    nonce=2,
+                    calldata_digest="a" * 64,
+                    signed_payload_digest="b" * 64,
+                )
+                journal.record_broadcast_attempt(intent["id"], "0x" + "2" * 64)
+                return {"state": "deposit_pending", "realized_loss_usd": "0.5"}
+            return {"state": "completed", "realized_loss_usd": "0.5"}
+
+        first = execute_group_entries(
+            [entry],
+            journal=journal,
+            max_route_loss_pct=Decimal("15"),
+            preflight=lambda e: e,
+            submit_step=submit,
+        )
+        second = execute_group_entries(
+            [entry],
+            journal=journal,
+            max_route_loss_pct=Decimal("15"),
+            preflight=lambda e: pytest.fail("pending deposit must not re-unwrap"),
+            submit_step=submit,
+        )
+        group = journal.group(first["group_id"])
+    assert first["deposit_pending"] == 1
+    assert second["completed"] == 1
+    assert calls == ["unwrap_to_native", "direct_deposit"]
+    assert Decimal(group["realized_loss_usd"]) == Decimal("0.5")
+
+
+def test_local_unwrap_dependent_loss_halts_before_deposit_and_retains_withdraw_cost(tmp_path):
+    entry, route = _local_unwrap_fixture()
+    with Journal(tmp_path / "journal.sqlite") as journal:
+
+        def submit(prepared, step):
+            assert step["kind"] == "unwrap_to_native"
+            journal.save_checkpoint(
+                prepared["_journal_position_id"],
+                f"route:unwrap_to_native:{route.route_id}",
+                {
+                    "unwrap_result": {
+                        "state": "confirmed",
+                        "actual_asset_id": "native",
+                        "actual_balance_raw": "100",
+                        "realized_loss_usd": "0.2",
+                    }
+                },
+            )
+            prepared["_check_group_loss"](Decimal("16"))
+            pytest.fail("deposit must not proceed after its loss exceeds the budget")
+
+        result = execute_group_entries(
+            [entry],
+            journal=journal,
+            max_route_loss_pct=Decimal("15"),
+            preflight=lambda e: e,
+            submit_step=submit,
+        )
+        group = journal.group(result["group_id"])
+    assert result["manual_review_group_threshold_exceeded"] == 1
+    assert Decimal(group["realized_loss_usd"]) == Decimal("0.2")

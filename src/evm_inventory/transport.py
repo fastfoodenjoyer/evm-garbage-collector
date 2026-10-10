@@ -31,7 +31,8 @@ def resolve_url(template: str) -> str:
     def replace(match):
         value = os.environ.get(match[1])
         if not value:
-            raise RequestError("missing_rpc_environment")
+            raise RequestError("missing_rpc_environment",
+                               diagnostic={"missing_environment_variable": match[1]})
         return value
 
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", replace, template)
@@ -59,6 +60,7 @@ class Transport:
             if parsed.scheme not in ("http", "https") or not parsed.hostname:
                 raise ValueError()
             host = parsed.hostname
+            diagnostic["provider_host"] = host
         except ValueError:
             raise RequestError("invalid_rpc_url") from None
         for attempt in range(3):
