@@ -19,6 +19,7 @@ from .network_policy import EXCLUDED_NETWORKS
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SNAPSHOT_SETTINGS = frozenset({
     "delay_min", "delay_max", "interval", "discovery_enabled", "stage_seconds", "workers",
+    "complete_scan",
 })
 
 
@@ -223,11 +224,14 @@ def snapshot(
     if unknown:
         raise ConfigError("snapshot settings contain unsupported fields")
     clean_settings = dict(settings)
+    if "complete_scan" in clean_settings and not isinstance(clean_settings["complete_scan"], bool):
+        raise ConfigError("snapshot setting complete_scan must be boolean")
     if "stage_seconds" in clean_settings:
         value = clean_settings["stage_seconds"]
+        ceiling = 86_400 if clean_settings.get("complete_scan") is True else 30
         if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value) or not 0 < value <= 30):
-            raise ConfigError("snapshot setting stage_seconds must be in (0, 30]")
+                or not math.isfinite(value) or not 0 < value <= ceiling):
+            raise ConfigError(f"snapshot setting stage_seconds must be in (0, {ceiling}]")
     if "workers" in clean_settings:
         value = clean_settings["workers"]
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 32:

@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from .collection import collect_wallets
 from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot, validate_delays
 from .defi_operations import execute_defi, quote_defi
 from .diagnostics import exception_diagnostic, redact_text
@@ -183,6 +184,19 @@ def main(argv=None):
         _load_dotenv()
         parser = argparse.ArgumentParser(prog="evm-inventory")
         sub = parser.add_subparsers(dest="cmd", required=True)
+        collect_parser = sub.add_parser("collect-wallet", help="Scan, plan and settle in one run")
+        collect_parser.add_argument("--workbook", required=True)
+        collect_parser.add_argument("--wallet-ranges", required=True)
+        collect_parser.add_argument("--db", required=True)
+        collect_parser.add_argument("--output", required=True)
+        collect_parser.add_argument("--catalog")
+        collect_parser.add_argument("--allowlist", default="config/swap-allowlist.json")
+        collect_parser.add_argument("--route-targets", default="config/route-targets.json")
+        collect_parser.add_argument("--quote-floor", default="0.01")
+        collect_parser.add_argument("--max-runtime-seconds", type=float, default=10800)
+        collect_parser.add_argument("--execute", action="store_true")
+        collect_parser.add_argument("--trust-deposit-addresses", action="store_true",
+                                    help="Verify recipient once; remember it in the same database")
         scan_parser = sub.add_parser("scan")
         scan_parser.add_argument("--wallets", required=True)
         scan_parser.add_argument("--db", required=True)
@@ -277,6 +291,23 @@ def main(argv=None):
         resume_routes_parser = sub.add_parser("resume-routes")
         resume_routes_parser.add_argument("--db", required=True)
         args = parser.parse_args(argv)
+
+        if args.cmd == "collect-wallet":
+            ranges = parse_ordinal_ranges(args.wallet_ranges)
+            rows = load_wallet_workbook(Path(args.workbook), ordinal_ranges=ranges)
+            wallet_range_batches(rows, ranges)
+            catalog = load_catalog(Path(args.catalog) if args.catalog else None)
+            result = collect_wallets(
+                rows, db_path=Path(args.db), output=Path(args.output), catalog=catalog,
+                rpc_urls=_execution_rpc_urls(catalog), allowlist=Path(args.allowlist),
+                target_policy=load_target_policy(Path(args.route_targets)),
+                loss_limit=load_routing_settings().max_route_loss_pct,
+                execute=args.execute, trust_deposit_addresses=args.trust_deposit_addresses,
+                quote_floor=args.quote_floor, max_runtime_seconds=args.max_runtime_seconds,
+                progress=_progress,
+            )
+            print(json.dumps(result))
+            return 3 if result["status"] == "incomplete" else 0
 
         if args.cmd == "quote-defi":
             print(

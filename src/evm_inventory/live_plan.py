@@ -18,6 +18,7 @@ from typing import Protocol
 
 import httpx
 
+from .asset_policy import denied_entry
 from .bitget_catalog import BitgetDepositTarget, deposit_targets, fetch_public_coins
 from .celo import lifi_token_address, normalize_celo_balances
 from .consolidation import (
@@ -30,6 +31,7 @@ from .consolidation import (
     select_candidate,
 )
 from .diagnostics import exception_diagnostic
+from .executor import GAS_RESERVE_MULTIPLIER
 from .fee_planner import native_asset_identity
 from .lifi import (
     LifiClient,
@@ -142,6 +144,8 @@ def create_live_plan(
     stage_seconds: float = 30,
     workers: int = 16,
     target_workers: int = 8,
+    allow_partial_search: bool = False,
+    runtime_seconds: float | None = None,
 ) -> dict:
     """Quote exact enabled Bitget targets and enforce loss per wallet/network."""
 
@@ -199,12 +203,11 @@ def create_live_plan(
                 and row.get("wallet", "").lower() not in selected_wallets
             ):
                 continue
-            if row.get("status") != "success" or (
+            if row.get("status") not in {"success", "provider_only"} or (
                 int(row["raw_balance"]) <= 0 and not row.get("balance_conflict")
             ):
                 continue
             base = _base(row)
-            asset = AssetIdentity(base["chain_id"], base["asset_id"], base["decimals"])
             if row.get("balance_conflict"):
                 excluded_entries.append(
                     {
@@ -213,13 +216,20 @@ def create_live_plan(
                     }
                 )
                 continue
-            action = actions.get((asset.chain_id, asset.contract_address), "deny")
+            action = actions.get((base["chain_id"], base["asset_id"]), "deny")
             if action == "deny":
-                excluded_entries.append({**base, "status": "denied"})
+                excluded_entries.append(denied_entry(base, policy=actions, path=allowlist_path))
+                continue
+            if row.get("status") != "success":
+                excluded_entries.append(_manual(base, "balance_not_rpc_verified"))
                 continue
             if action == "review":
                 excluded_entries.append(_manual(base, "policy_review"))
                 continue
+            if base["decimals"] is None:
+                excluded_entries.append(_manual(base, "asset_decimals_unavailable"))
+                continue
+            asset = AssetIdentity(base["chain_id"], base["asset_id"], base["decimals"])
             address = addresses.get(base["wallet"])
             executable.append(_Input(base, asset, action, None, address, None, None))
 
@@ -231,15 +241,24 @@ def create_live_plan(
     wallets = sorted({wallet for wallet, _chain in groups})
     quote_timing = {}
     for wallet in wallets:
-        deadline = Deadline(seconds=stage_seconds, label=f"quote:{wallet}", hard_limit=False)
-        timing = {"target_seconds": stage_seconds, "elapsed_seconds": 0, "budget_exceeded": False}
+        deadline = (Deadline(seconds=stage_seconds, label=f"quote:{wallet}", hard_limit=False)
+                    if runtime_seconds is None else
+                    Deadline(seconds=runtime_seconds, label=f"quote:{wallet}",
+                             max_seconds=max(30, runtime_seconds)))
+        timing = {"target_seconds": stage_seconds if runtime_seconds is None else runtime_seconds,
+                  "elapsed_seconds": 0, "budget_exceeded": False}
         quote_timing[wallet] = timing
         select_client = getattr(quote_client, "for_wallet", None)
         scoped_client = select_client(wallet) if select_client is not None else quote_client
         wallet_client = CachedQuoteClient(scoped_client, workers=target_workers)
+        wallet_client.allow_partial_search = allow_partial_search
+        wallet_client.reserve_native_gas = allow_partial_search or isinstance(
+            gas_estimator, PlannerGasEstimator
+        )
         wallet_gas_estimator = gas_estimator
         if isinstance(gas_estimator, PlannerGasEstimator):
             wallet_gas_estimator = copy(gas_estimator)
+            wallet_gas_estimator.retry_transient_errors = allow_partial_search
             wallet_gas_estimator.price_client = (
                 wallet_client
                 if gas_estimator.price_client is quote_client
@@ -312,12 +331,17 @@ def create_live_plan(
                     timing.update(
                         elapsed_seconds=deadline.elapsed, budget_exceeded=deadline.budget_exceeded
                     )
+                    if allow_partial_search:
+                        _apply_relay_fallback(entries, wallet, quote_client, resolution.enabled,
+                                              limit, floor, addresses.get(wallet))
                     continue
                 supported_groups = []
                 for key, items in wallet_groups:
                     if key[1] not in supported:
                         relay_factory = getattr(quote_client, "relay_for_wallet", None)
-                        if key[1] in RELAY_SOURCE_CHAINS and relay_factory is not None:
+                        if relay_factory is not None and (
+                            key[1] in RELAY_SOURCE_CHAINS or allow_partial_search
+                        ):
                             relay_client = relay_factory(wallet)
                             entries.extend(
                                 quote_relay_entry(
@@ -410,7 +434,10 @@ def create_live_plan(
                         for item in group_items
                     )
 
-        deadline.check()
+        if allow_partial_search:
+            with deadline_scope(deadline):
+                _apply_relay_fallback(entries, wallet, quote_client, resolution.enabled,
+                                      limit, floor, addresses.get(wallet))
         timing.update(elapsed_seconds=deadline.elapsed, budget_exceeded=deadline.budget_exceeded)
 
     for entry in entries:
@@ -423,7 +450,7 @@ def create_live_plan(
             tuple(step.get("route", {}).get("id", "") for step in item.get("steps", ())),
         )
     )
-    _invalidate_expired_comparisons(entries, valuation_now())
+    _invalidate_expired_comparisons(entries, valuation_now(), allow_requote=allow_partial_search)
     counts = Counter(entry["status"] for entry in entries)
     return {
         "version": 4,
@@ -451,11 +478,35 @@ def create_live_plan(
         },
         "quote_timing": quote_timing,
         "search_scope": search_scope,
+        "selection_policy": "best_available" if allow_partial_search else "complete_comparison",
         "entries": entries,
     }
 
 
-def _invalidate_expired_comparisons(entries: list[dict], now: datetime) -> None:
+def _apply_relay_fallback(entries, wallet, clients, targets, limit, floor, recipient):
+    factory = getattr(clients, "relay_for_wallet", None)
+    if factory is None:
+        return
+    for index, entry in enumerate(entries):
+        if (entry.get("wallet") != wallet or entry.get("asset_id") != "native"
+                or entry.get("decimals") != 18 or entry.get("status") != "manual_review"
+                or entry.get("routing_provider") == "relay"
+                or entry.get("reason") in {"policy_review", "conflicting_native_balance"}):
+            continue
+        alternative = quote_relay_entry(_base(entry), factory(wallet), targets, loss_limit=limit,
+                                         quote_floor=floor,
+                                         deposit_address=recipient)
+        if alternative.get("status") == "route_ready" or alternative.get("reason") == (
+            "insufficient_source_gas"
+        ):
+            alternative["provider_fallback"] = {
+                "from": "lifi", "reason": entry.get("reason"), "search": entry.get("search")
+            }
+            entries[index] = alternative
+
+
+def _invalidate_expired_comparisons(entries: list[dict], now: datetime, *,
+                                    allow_requote: bool = False) -> None:
     expired_groups = {
         entry["group"]["key"]
         for entry in entries
@@ -476,6 +527,9 @@ def _invalidate_expired_comparisons(entries: list[dict], now: datetime) -> None:
             complete=False, errors=sorted(set((*search.get("errors", []), "stale_quote")))
         )
         entry["search"] = search
+        if allow_requote:
+            entry["execution_requote_required"] = True
+            continue
         entry["status"] = "manual_review"
         entry["reason"] = "stale_quote"
         entry["group"] = {**group, "status": "manual_review", "reason": "stale_quote"}
@@ -525,10 +579,11 @@ def _prepare_group(
         }
         item = replace(item, base={**item.base, **price_data})
         if source_usd is not None and source_usd < floor:
-            excluded.append({**item.base, "status": "dust"})
+            excluded.append({**item.base, "status": "dust", "reason": "below_quote_floor"})
             continue
         if item.deposit_address is None:
-            excluded.append({**item.base, "status": "missing_deposit_address"})
+            excluded.append({**item.base, "status": "missing_deposit_address",
+                             "reason": "missing_deposit_address"})
             continue
         target = _target(item.asset, targets)
         native_target = None
@@ -642,7 +697,13 @@ def _plan_group(
         else None
     )
     admission_candidates = tuple(choice for _item, _selected, choice in choices_by_item)
-    if any(not search.complete for search in direct_by_id.values()):
+    partial_allowed = getattr(client, "allow_partial_search", False)
+    if partial_allowed:
+        eligible = [(item, candidate) for item, selected, candidate in choices_by_item
+                    if selected is not None and candidate.is_valid]
+        admission_candidates = tuple(candidate for _item, candidate in eligible)
+        group_source_usd = _exact_sum(item.source_usd for item, _candidate in eligible)
+    if any(not search.complete for search in direct_by_id.values()) and not partial_allowed:
         admission = GroupAdmission(
             status="manual_review",
             reason=(
@@ -678,8 +739,15 @@ def _plan_group(
     group_data = _group_data(group_key, admission, limit, quoted_at)
     result: list[dict] = []
     for item, selected, candidate in choices_by_item:
-        if admission.status != "accepted":
-            reason = admission.reason or "no_eligible_candidate"
+        item.base["search"]["selection_policy"] = (
+            "best_available" if partial_allowed else "complete_comparison"
+        )
+        if admission.status != "accepted" or selected is None or not candidate.is_valid:
+            reason = (candidate.reason if partial_allowed and
+                      (selected is None or not candidate.is_valid)
+                      else admission.reason) or "no_eligible_candidate"
+            if selected is None and item.base.get("insufficient_source_gas"):
+                reason = "insufficient_source_gas"
             entry = {
                 **item.base,
                 "status": "manual_review",
@@ -835,11 +903,87 @@ def _route_choices(
             )
             return ()
 
+    prepared: dict[tuple, ConsolidationCandidate] = {}
+    native_prepared: dict[tuple, tuple[_RouteChoice, ConsolidationCandidate]] = {}
+
+    def prepare_native(choice):
+        """Refine spendable input against RPC fee caps using the executor's reserve rule."""
+        balance = int(item.base["raw_balance"])
+        initial_key = (choice.steps[0][1].evidence.payload_sha256, item.deposit_address)
+        if initial_key in native_prepared:
+            return native_prepared[initial_key]
+        for attempt in range(3):
+            kind, route = choice.steps[0]
+            key = (route.evidence.payload_sha256, kind, item.deposit_address)
+            if key not in prepared:
+                prepared[key] = _route_candidate(
+                    route, item, client, now, gas_estimator, expected_source=item.asset,
+                    expected_destination=route.evidence.destination,
+                    expected_amount=route.evidence.input_amount, recipient=item.deposit_address,
+                    purpose=kind, prepare=True,
+                )
+            candidate = prepared[key]
+            if not candidate.is_valid:
+                return choice, candidate
+            source_fee = sum(fee.raw_amount for fee in candidate.gas_estimates
+                             if fee.price is not None and fee.price.asset == item.asset)
+            reserve = source_fee * GAS_RESERVE_MULTIPLIER
+            remaining = balance - route.evidence.input_amount
+            if remaining == reserve or (attempt == 2 and remaining >= reserve):
+                if candidate.destination_amount < choice.target.minimum_raw:
+                    return choice, _with_reason(candidate, "below_target_minimum")
+                result = choice, candidate
+                native_prepared[initial_key] = result
+                native_prepared[(route.evidence.payload_sha256, item.deposit_address)] = result
+                return choice, candidate
+            amount = balance - reserve
+            if amount <= 0:
+                return choice, _with_reason(candidate, "insufficient_source_gas")
+            alternatives = [
+                _route_choice(
+                    replacement, item, choice.target, client, now, gas_estimator,
+                    expected_source=item.asset, expected_destination=route.evidence.destination,
+                    expected_amount=amount, recipient=item.deposit_address,
+                    steps=((kind, replacement),), prepare=False,
+                    check_target_minimum=False,
+                )
+                for replacement in request(item.asset, route.evidence.destination, amount,
+                                           item.deposit_address)
+            ]
+            valid = [c for c in alternatives if c.candidate.is_valid]
+            if not valid:
+                return choice, _with_reason(candidate, "native_reserve_requote_unavailable")
+            winner = select_candidate(c.candidate for c in valid)
+            choice = next(c for c in valid if c.candidate is winner)
+            retain_route(choice.steps[0][1])
+        return choice, _with_reason(candidate, "native_gas_reserve_unstable")
+
     def collect(source, amount):
+        def defer(alternatives):
+            if alternatives:
+                errors.append("alternative_destination_not_requested")
+                pending.extend({**_target_data(t),
+                                "reason": "alternative_destination_not_requested"}
+                               for t in alternatives)
+
         def target_quotes(target):
             destination = AssetIdentity(target.chain_id, target.asset_id, _target_decimals(target))
             result = []
-            for route in request(source, destination, amount, item.deposit_address):
+            quote_amount = amount
+            routes = request(source, destination, quote_amount, item.deposit_address)
+            if source.is_native and getattr(client, "reserve_native_gas", False) and routes:
+                reserves = [sum(cost.amount for cost in route.gas_costs if cost.token == source)
+                            for route in routes]
+                reserves = [value for value in reserves if value > 0]
+                if reserves:
+                    reserve = min(reserves) * GAS_RESERVE_MULTIPLIER * 2
+                    quote_amount = amount - reserve
+                    if quote_amount <= 0:
+                        # A provider hint cannot prove an RPC gas shortfall. Prepare
+                        # a smaller input, then refine to balance minus the exact cap.
+                        quote_amount = max(1, amount // 2)
+                    routes = request(source, destination, quote_amount, item.deposit_address)
+            for route in routes:
                 retain_route(route)
                 choice = _route_choice(
                     route,
@@ -850,14 +994,57 @@ def _route_choices(
                     gas_estimator,
                     expected_source=source,
                     expected_destination=destination,
-                    expected_amount=amount,
+                    expected_amount=quote_amount,
                     recipient=item.deposit_address,
                     steps=(("bridge", route),),
                     prepare=False,
+                    check_target_minimum=not (
+                        source.is_native and getattr(client, "reserve_native_gas", False)
+                    ),
                 )
                 retain_candidate(choice.candidate)
                 result.append(choice)
             return result
+
+        if getattr(client, "allow_partial_search", False):
+            # A prepared direct transfer already meets the collection policy.
+            if any(not c.steps and c.candidate.loss_pct <= limit for c in quoted):
+                defer(targets)
+                return
+            for index, target in enumerate(targets):
+                batch = sorted(target_quotes(target), key=lambda c: (
+                    c.candidate.loss_pct, c.candidate.loss_usd, c.candidate.route_ids
+                ))
+                for route_index, choice in enumerate(batch):
+                    if not choice.candidate.is_valid:
+                        failed.append(choice.candidate)
+                        continue
+                    kind, route = choice.steps[0]
+                    if source.is_native and getattr(client, "reserve_native_gas", False):
+                        choice, candidate = prepare_native(choice)
+                    else:
+                        key = (route.evidence.payload_sha256, kind, item.deposit_address)
+                        if key not in prepared:
+                            prepared[key] = _route_candidate(
+                                route, item, client, now, gas_estimator,
+                                expected_source=source,
+                                expected_destination=route.evidence.destination,
+                                expected_amount=route.evidence.input_amount,
+                                recipient=item.deposit_address, purpose=kind, prepare=True,
+                            )
+                        candidate = prepared[key]
+                    retain_candidate(candidate)
+                    if not candidate.is_valid:
+                        failed.append(candidate)
+                        errors.append(candidate.reason or "candidate_preparation_failed")
+                        continue
+                    quoted.append(_RouteChoice(candidate, choice.steps, choice.target))
+                    if candidate.loss_pct <= limit:
+                        defer(targets[index + 1:])
+                        if route_index < len(batch) - 1:
+                            errors.append("alternative_routes_not_prepared")
+                        return
+            return
 
         for batch in complete_parallel(target_quotes, targets, workers=client.workers):
             for choice in batch:
@@ -886,7 +1073,7 @@ def _route_choices(
             errors.append(local.candidate.reason or "local_unwrap_quote_failed")
     collect(item.asset, int(item.base["raw_balance"]))
 
-    if errors:
+    if errors and not getattr(client, "allow_partial_search", False):
         provisional = select_candidate(choice.candidate for choice in quoted)
         choices = tuple(choice for choice in quoted if choice.candidate is provisional)
         return _SearchResult(
@@ -910,7 +1097,6 @@ def _route_choices(
             choice.candidate.route_ids,
         )
     )
-    prepared: dict[tuple, ConsolidationCandidate] = {}
     best: _RouteChoice | None = None
     pruned = 0
     for choice in quoted:
@@ -919,6 +1105,19 @@ def _route_choices(
             pruned += 1
             continue
         current = choice.candidate if not choice.steps else None
+        if (item.asset.is_native and getattr(client, "reserve_native_gas", False)
+                and len(choice.steps) == 1 and choice.steps[0][0] == "bridge"):
+            choice, current = prepare_native(choice)
+            retain_candidate(current)
+            if not current.is_valid:
+                failed.append(current)
+                errors.append(current.reason)
+                continue
+            refined = _RouteChoice(current, choice.steps, choice.target)
+            winner = select_candidate((best.candidate, current) if best else (current,))
+            if winner is current:
+                best = refined
+            continue
         for index, (kind, route) in enumerate(choice.steps):
             source = route.evidence.source
             destination = route.evidence.destination
@@ -975,6 +1174,7 @@ def _route_choices(
         len(prepared),
         pruned,
         tuple(sorted(set(errors))),
+        tuple(pending),
         evidence_expires_at=min(expiries),
     )
 
@@ -1078,6 +1278,7 @@ def _route_choice(
     steps: tuple[tuple[str, LifiRoute], ...],
     purpose: str | None = None,
     prepare: bool = True,
+    check_target_minimum: bool = True,
 ) -> _RouteChoice:
     try:
         validate_bridge_route(
@@ -1087,7 +1288,10 @@ def _route_choice(
             recipient=recipient,
             input_amount=expected_amount,
         )
-        early_reason = "below_target_minimum" if route.to_amount_min < target.minimum_raw else None
+        early_reason = (
+            "below_target_minimum"
+            if check_target_minimum and route.to_amount_min < target.minimum_raw else None
+        )
     except ValueError:
         early_reason = "route_identity_mismatch"
     if early_reason:
@@ -1118,7 +1322,7 @@ def _route_choice(
         purpose=purpose or steps[-1][0],
         prepare=prepare,
     )
-    if candidate.is_valid and candidate.destination_amount is not None:
+    if check_target_minimum and candidate.is_valid and candidate.destination_amount is not None:
         if candidate.destination_amount < target.minimum_raw:
             candidate = _with_reason(candidate, "below_target_minimum")
     return _RouteChoice(candidate, steps, target)
@@ -1516,7 +1720,7 @@ def _base(row) -> dict:
         "asset_id": row["asset_id"].lower(),
         "symbol": row.get("symbol", ""),
         "raw_balance": str(row["raw_balance"]),
-        "decimals": int(row["decimals"]),
+        "decimals": int(row["decimals"]) if row.get("decimals") not in {None, ""} else None,
         **({"balance_aliases": row["balance_aliases"]} if "balance_aliases" in row else {}),
     }
 

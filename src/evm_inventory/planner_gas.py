@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Lock
 
@@ -15,6 +16,7 @@ from .models import AssetIdentity
 from .quote_jobs import JobInProgress
 from .rpc import RpcReader, quantity
 from .stages import StageDeadlineExceeded
+from .transport import is_transient_error
 from .valuation import FeeQuote, QuotePrice
 
 _TRANSFER_SELECTOR = "a9059cbb"
@@ -29,12 +31,17 @@ class PlannerGasEstimator:
         rpc: RpcReader,
         rpc_urls: Mapping[int, str],
         price_client: LifiClient,
+        *,
+        retry_transient_errors: bool = False,
     ):
         self.rpc = rpc
         self.rpc_urls = rpc_urls
         self.price_client = price_client
+        self.retry_transient_errors = retry_transient_errors
         self.diagnostics: list[dict] = []
         self._diagnostic_lock = Lock()
+        self.prepared_fee_caps: dict[str, tuple[TransactionRequest, ...]] = {}
+        self.approval_fee_caps: dict[str, int] = {}
 
     def _failure(self, route, phase: str, error: Exception) -> None:
         with self._diagnostic_lock:
@@ -70,6 +77,8 @@ class PlannerGasEstimator:
             raise
         except Exception as error:
             self._failure(route, "prepare_transactions", error)
+            if self.retry_transient_errors and is_transient_error(error):
+                raise
             # Gas evidence is an admission requirement; an RPC/API failure
             # rejects this candidate instead of stopping the whole plan.
             return None
@@ -96,6 +105,8 @@ class PlannerGasEstimator:
             raise
         except Exception as error:
             self._failure(route, "estimate", error)
+            if self.retry_transient_errors and is_transient_error(error):
+                raise
             return None
 
     def _estimate_route_transactions(
@@ -111,6 +122,7 @@ class PlannerGasEstimator:
         ):
             return None
         result = []
+        fee_caps = []
         for step, request in zip(route.raw_steps, prepared_transactions, strict=True):
             action = step.get("action")
             if not isinstance(action, dict):
@@ -121,18 +133,29 @@ class PlannerGasEstimator:
             if request.chain_id != chain_id:
                 return None
             url = self._url(chain_id)
-            result.append(
-                self._priced_estimate(
-                    chain_id,
-                    url,
-                    {
-                        "from": wallet,
-                        "to": request.to,
-                        "value": hex(request.value),
-                        "data": request.data,
-                    },
+            try:
+                planned = FeePlanner(self.rpc).plan(url, request, sender=wallet)
+            except ValueError as error:
+                text = str(error).lower()
+                spender = step.get("estimate", {}).get("approvalAddress")
+                token = action.get("fromToken", {}).get("address", "").lower()
+                if (not any(marker in text for marker in ("allowance", "transfer_from_failed"))
+                        or token in {"", "0x" + "0" * 40} or not isinstance(spender, str)
+                        or token_allowance(self.rpc, url=url, token=token, owner=wallet,
+                                           spender=spender) >= int(action["fromAmount"])
+                        or not 0 < request.gas_limit <= 1_000_000):
+                    raise
+                # This is a cap for staged preparation, not a successful RPC simulation.
+                # Execution confirms approval, then must simulate under this fee cap before signing.
+                planned = FeePlanner(_PendingApprovalRpc(self.rpc, request.gas_limit * 2)).plan(
+                    url, request, sender=wallet
                 )
-            )
+                planned = replace(planned, fee_quote_fallback_reason="pending_approval")
+            planned = replace(planned, max_total_fee_cap_wei=planned.max_total_fee_wei)
+            fee_caps.append(planned)
+            result.append(self._price_planned(planned))
+        with self._diagnostic_lock:
+            self.prepared_fee_caps[route.route_id] = tuple(fee_caps)
         return tuple(result)
 
     def _estimate_direct(
@@ -199,8 +222,7 @@ class PlannerGasEstimator:
                 amount=_UINT256_MAX,
                 gas_price_wei=0,
             )
-            result.append(
-                self._priced_estimate(
+            fee = self._priced_estimate(
                     token.chain_id,
                     url,
                     {
@@ -210,7 +232,12 @@ class PlannerGasEstimator:
                         "data": transaction.data,
                     },
                 )
-            )
+            result.append(fee)
+            with self._diagnostic_lock:
+                key = f"{token.chain_id}:{token.contract_address}:{spender.lower()}"
+                self.approval_fee_caps[key] = (
+                    fee.raw_amount
+                )
         return tuple(result)
 
     def _priced_estimate(self, chain_id: int, url: str, transaction: dict) -> FeeQuote:
@@ -233,7 +260,10 @@ class PlannerGasEstimator:
             TransactionRequest(chain_id, recipient, data, value, 0, 0),
             sender=sender,
         )
-        native = native_asset_identity(chain_id)
+        return self._price_planned(planned)
+
+    def _price_planned(self, planned):
+        native = native_asset_identity(planned.chain_id)
         evidence = self.price_client.token_price(native)
         if evidence.asset != native or evidence.price_usd is None:
             raise ValueError("native gas-token price is unavailable")
@@ -283,3 +313,13 @@ def _timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("gas-token price timestamp must be timezone-aware")
     return parsed.astimezone(UTC)
+
+
+class _PendingApprovalRpc:
+    def __init__(self, rpc, gas_cap):
+        self.rpc, self.gas_cap = rpc, gas_cap
+
+    def call(self, url, method, params):
+        if method == "eth_estimateGas":
+            return hex(self.gas_cap)
+        return self.rpc.call(url, method, params)

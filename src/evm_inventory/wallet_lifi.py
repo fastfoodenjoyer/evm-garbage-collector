@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from threading import Lock
@@ -24,10 +25,12 @@ class WalletLifiClients:
         db_path: Path,
         purpose: str = "planning",
         policy_digest: str = "",
+        quota_wait_seconds: float = 0,
     ):
         self.purpose = purpose
         self.policy_digest = policy_digest
         self.db_path = db_path
+        self.quota_wait_seconds = quota_wait_seconds
         self._proxies: dict[str, str] = {}
         for row in rows:
             if not row.rabby_proxy:
@@ -51,6 +54,8 @@ class WalletLifiClients:
                         db_path=self.db_path,
                         proxy=self._proxies[wallet],
                         purpose=self.purpose,
+                        api_key=os.environ.get("LIFI_API_KEY", ""),
+                        quota_wait_seconds=self.quota_wait_seconds,
                     ),
                     policy_digest=self.policy_digest,
                 )
@@ -71,6 +76,8 @@ class WalletLifiClients:
                         base_url=RELAY_BASE_URL,
                         provider="relay",
                         quota_store=RelayQuotaStore,
+                        api_key=os.environ.get("RELAY_API_KEY", ""),
+                        quota_wait_seconds=self.quota_wait_seconds,
                     ),
                     policy_digest=self.policy_digest,
                 )

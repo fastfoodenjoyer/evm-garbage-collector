@@ -340,7 +340,8 @@ def scan(store, scope, *, rpc=None, discovery=None, sleep=time.sleep, progress=N
         if wi:
             sleep(random.uniform(settings.get("delay_min", 1), settings.get("delay_max", 3)))
         seconds = settings.get("stage_seconds", 30)
-        deadline = Deadline(seconds=seconds, label="scan")
+        deadline = Deadline(seconds=seconds, label="scan",
+                            max_seconds=max(30, seconds) if settings.get("complete_scan") else 30)
         prior = store.assets(wallet)
         useful = {
             row["chain_id"]

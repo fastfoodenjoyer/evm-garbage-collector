@@ -12,6 +12,7 @@ from eth_utils import keccak
 
 from .diagnostics import exception_diagnostic
 from .executor import (
+    GAS_RESERVE_MULTIPLIER,
     ExecutionRpc,
     broadcast_durable_transaction,
     pending_nonce,
@@ -20,10 +21,15 @@ from .executor import (
 )
 from .fee_planner import FeePlanner
 from .journal import Journal
-from .relay import SOURCE_CHAINS
 from .relay_protocol import verified_transaction
 from .rpc import quantity
-from .stages import Deadline, StageDeadlineExceeded, check_deadline, deadline_scope
+from .stages import (
+    Deadline,
+    StageDeadlineExceeded,
+    check_deadline,
+    current_deadline,
+    deadline_scope,
+)
 from .transport import Transport
 from .wallet_lifi import WalletLifiClients
 
@@ -42,11 +48,10 @@ def _confirmed(rpc, url, receipt):
 
 def _prepare(entry, wallet, client, rpc, url, target, limit):
     if (
-        entry["chain_id"] not in SOURCE_CHAINS
-        or entry["asset_id"] != "native"
+        entry["asset_id"] != "native"
         or entry["decimals"] != 18
     ):
-        raise ValueError("Relay execution supports native ETH on Zora, Shape and Superseed only")
+        raise ValueError("Relay execution requires a native EVM asset with 18 decimals")
     if target.coin != "USDC" or target.asset_id == "native":
         raise ValueError("Relay execution requires an approved USDC Bitget target")
     if quantity(rpc.call(url, "eth_chainId", [])) != entry["chain_id"]:
@@ -55,14 +60,31 @@ def _prepare(entry, wallet, client, rpc, url, target, limit):
         raise ValueError("Relay recipient differs from the trusted workbook address")
     balance = quantity(rpc.call(url, "eth_getBalance", [wallet.public_address, "latest"]))
     amount = int(entry["relay_selected"]["request"]["amount"])
+    automatic = bool(entry.get("automatic_requote"))
+    if automatic:
+        hint = int(entry["relay_selected"].get("source_gas_raw", 0))
+        available = balance - hint * GAS_RESERVE_MULTIPLIER
+        amount = min(amount, available if 0 < available < balance else max(1, balance // 2))
     if not 0 < amount < balance:
         raise ValueError("Relay planned amount exceeds live native balance or leaves no gas")
     client.supported_chain_ids()
-    quote = client.quote(entry, target, amount, recipient=wallet.bitget_deposit_address, fresh=True)
-    tx = FeePlanner(rpc).plan(
-        url, verified_transaction(quote, client.chain_catalog), sender=wallet.public_address
-    )
-    fee = tx.max_total_fee_wei
+    for attempt in range(4):
+        quote = client.quote(entry, target, amount,
+                             recipient=wallet.bitget_deposit_address, fresh=True)
+        tx = FeePlanner(rpc).plan(
+            url, verified_transaction(quote, client.chain_catalog), sender=wallet.public_address
+        )
+        fee = tx.max_total_fee_wei
+        if not automatic:
+            break
+        available = balance - fee * GAS_RESERVE_MULTIPLIER
+        if available <= 0:
+            raise ValueError("insufficient_source_gas")
+        if available == amount or (attempt == 3 and amount < available):
+            break
+        amount = available
+    else:
+        raise ValueError("Relay native gas reserve did not stabilize")
     if balance < amount + fee:
         raise ValueError("Relay live balance cannot cover input and maximum RPC gas fee")
     if int(quote["to_amount_min"]) < target.minimum_raw:
@@ -231,7 +253,14 @@ def execute_relay_entries(
                         summary["skipped"] += 1
                         continue
                     try:
-                        with deadline_scope(Deadline(stage_seconds, "relay_execution")):
+                        seconds = stage_seconds
+                        if entry.get("automatic_requote") and current_deadline() is not None:
+                            check_deadline()
+                            remaining = current_deadline().remaining()
+                            if remaining is not None:
+                                seconds = min(seconds, remaining)
+                        with deadline_scope(Deadline(seconds, "relay_execution",
+                                max_seconds=86_400 if entry.get("automatic_requote") else 30)):
                             client = clients.relay_for_wallet(entry["wallet"])
                             checkpoint = journal.checkpoint(position["id"], "relay_execution")
                             if journal.has_broadcast(position["id"]):

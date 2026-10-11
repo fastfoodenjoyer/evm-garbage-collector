@@ -31,6 +31,7 @@ class LifiRequestLimit(ValueError):
 
 class LifiQuotaStore:
     limits = {"routes": (65, 7200, 5), "steps": (40, 7200, 3), "public": (80, 60, 0)}
+    provider_limit_matches_window = True
 
     def __init__(self, db_path: Path, scope: str, *, clock=None):
         self.db_path, self.scope = db_path, scope
@@ -93,7 +94,7 @@ class LifiQuotaStore:
             (self.scope, bucket),
         ).fetchone()
         fresh = row and row[1] > now
-        if fresh and row[2] is not None:
+        if fresh and row[2] is not None and self.provider_limit_matches_window:
             limit = min(limit, row[2])
         times = [
             r[0]
@@ -240,7 +241,8 @@ class LifiQuotaStore:
                     "SELECT COUNT(*) FROM lifi_attempts WHERE scope=? AND bucket=? AND id>?",
                     (self.scope, bucket, attempt),
                 ).fetchone()[0]
-                adjusted = max(0, int(remaining) - later) if remaining is not None else None
+                adjusted = (max(0, int(remaining) - later) if remaining is not None else
+                            max(0, int(limit) - 1 - later) if limit is not None else None)
                 prior = db.execute(
                     "SELECT remaining,reset_at,provider_limit FROM lifi_quota_state WHERE "
                     "scope=? AND bucket=?",
@@ -292,3 +294,13 @@ class LifiQuotaStore:
     def snapshot(self):
         with self.db() as db:
             return {bucket: self._state(db, bucket, self.clock())[0] for bucket in self.limits}
+
+
+class AuthenticatedLifiQuotaStore(LifiQuotaStore):
+    # Default key allocation: 100 RPM, enforced over a 2h rolling window for quotes.
+    # Provider headers/cooldowns may only lower this ceiling; actual starts remain paced.
+    limits = {"routes": (12_000, 7200, 5), "steps": (12_000, 7200, 3),
+              "public": (100, 60, 0)}
+    # Header remaining/reset controls its own window; never mix a minute capacity
+    # with the independent two-hour local ledger.
+    provider_limit_matches_window = False

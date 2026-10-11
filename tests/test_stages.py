@@ -94,11 +94,11 @@ def test_soft_budget_warns_once_and_keeps_request_timeout(caplog):
 
     deadline = Deadline(0.01, "quote", hard_limit=False)
     with deadline_scope(deadline):
-        assert request_timeout(20) == 3
+        assert request_timeout(20) == 20
         time.sleep(0.02)
         with network_slot():
             deadline.check()
-            assert request_timeout(20) == 3
+            assert request_timeout(20) == 20
             assert not deadline.expired
             assert deadline.remaining() is None
     assert deadline.budget_exceeded

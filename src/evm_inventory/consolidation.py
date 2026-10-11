@@ -53,6 +53,9 @@ REASON_CODES = frozenset(
         "tampered_route_evidence",
         "conflicting_price_evidence",
         "zero_source_value",
+        "insufficient_source_gas",
+        "native_reserve_requote_unavailable",
+        "native_gas_reserve_unstable",
     }
 )
 

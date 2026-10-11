@@ -7,6 +7,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from .asset_policy import denied_entry
 from .execution_policy import SequentialSchedule
 from .network_policy import EXCLUDED_NETWORKS
 from .route_plan import DepositTarget, Position, classify_position
@@ -39,11 +40,13 @@ def create_route_plan(
             asset_policy = policy.get((position.chain_id, position.asset_id.lower()), "deny")
             if asset_policy == "deny":
                 counts["denied"] += 1
-                entries.append(_entry(row, position, "denied"))
+                entries.append(denied_entry(_entry(row, position, "denied"),
+                                            policy=policy, path=allowlist_path))
                 continue
             if asset_policy == "review":
                 counts["manual_review"] += 1
-                entries.append(_entry(row, position, "manual_review"))
+                entries.append({**_entry(row, position, "manual_review"),
+                                "reason": "policy_review"})
                 continue
             decision = classify_position(
                 position, targets=_TARGETS, quote_floor_raw=quote_floor_raw

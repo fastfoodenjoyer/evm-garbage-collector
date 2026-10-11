@@ -27,6 +27,25 @@ class RequestError(Exception):
         self.diagnostic = diagnostic
 
 
+def is_transient_error(error):
+    """Recognize retryable provider causes even when an RPC helper wrapped them."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, (httpx.TransportError, TimeoutError)):
+            return True
+        if isinstance(error, RequestError) and error.code in {
+            "network_error", "provider_unavailable", "rate_limited"
+        }:
+            return True
+        if isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {
+            429, 500, 502, 503, 504
+        }:
+            return True
+        error = error.__cause__
+    return False
+
+
 def resolve_url(template: str) -> str:
     def replace(match):
         value = os.environ.get(match[1])

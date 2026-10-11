@@ -26,11 +26,13 @@ class StageDeadlineExceeded(TimeoutError):
 
 
 class Deadline:
-    def __init__(self, seconds: float = 30, label: str = "stage", *, hard_limit: bool = True):
+    def __init__(self, seconds: float = 30, label: str = "stage", *, hard_limit: bool = True,
+                 max_seconds: float = 30):
         if isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0:
             raise ValueError("stage budget must be finite and greater than zero")
-        if hard_limit and seconds > 30:
-            raise ValueError("hard stage budget must be at most 30 seconds")
+        if hard_limit and seconds > max_seconds:
+            raise ValueError(f"hard stage budget must be at most {max_seconds} seconds")
+        self.request_limit = 3.0 if hard_limit and max_seconds <= 30 else 30.0
         self.started_at = time.monotonic()
         # Include checkpointing and CLI shutdown in the requested stage budget.
         # Remote reads must yield early enough to leave room for local work.
@@ -103,7 +105,7 @@ def request_timeout(default: float = 30) -> float:
     # HTTPX applies timeouts independently to pool/connect/write/read. Reserve
     # room for each phase and favour another endpoint over a long stalled call.
     remaining = deadline.remaining()
-    return min(default, 3.0) if remaining is None else min(default, 3.0, remaining / 4)
+    return default if remaining is None else min(default, deadline.request_limit, remaining / 4)
 
 
 def budget_sleep(seconds: float, *, sleep: Callable[[float], None] = time.sleep) -> None:

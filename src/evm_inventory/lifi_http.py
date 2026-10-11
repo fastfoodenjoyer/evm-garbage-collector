@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from contextlib import contextmanager
 from hashlib import sha256
@@ -11,7 +12,12 @@ from threading import BoundedSemaphore, Lock
 
 import httpx
 
-from .lifi_quota import DispatchWait, LifiQuotaStore, LifiRequestLimit
+from .lifi_quota import (
+    AuthenticatedLifiQuotaStore,
+    DispatchWait,
+    LifiQuotaStore,
+    LifiRequestLimit,
+)
 from .stages import StageDeadlineExceeded, check_deadline, current_deadline, request_timeout
 
 _REGISTRY_LOCK = Lock()
@@ -34,12 +40,27 @@ class LifiHttpClient:
         base_url="https://li.quest/",
         provider="lifi",
         quota_store=LifiQuotaStore,
+        api_key: str = "",
+        max_attempts: int = 3,
+        quota_wait_seconds: float = 0,
     ):
         if purpose not in ("planning", "execution"):
             raise ValueError("invalid LI.FI request purpose")
+        if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
+                or not 1 <= max_attempts <= 10):
+            raise ValueError("max_attempts must be an integer between 1 and 10")
+        if not math.isfinite(quota_wait_seconds) or quota_wait_seconds < 0:
+            raise ValueError("quota_wait_seconds must be finite and nonnegative")
         self.client = client
         self.base_url = base_url
-        scope_input = proxy if provider == "lifi" else provider + ":" + proxy
+        self.api_key = api_key
+        self.max_attempts = max_attempts
+        self.quota_wait_seconds = quota_wait_seconds
+        scope_input = ("lifi-key:" + api_key) if api_key and provider == "lifi" else (
+            proxy if provider == "lifi" else provider + ":" + proxy
+        )
+        if api_key and provider == "lifi":
+            quota_store = AuthenticatedLifiQuotaStore
         self.scope = sha256(scope_input.encode()).hexdigest()
         self.db_path = db_path
         self.purpose = purpose
@@ -140,6 +161,40 @@ class LifiHttpClient:
         return self._request("POST", url, kwargs)
 
     def _request(self, method, url, kwargs):
+        if not url.startswith(self.base_url):
+            return self.client.request(method, url, **kwargs)
+        if self.api_key:
+            header = "x-lifi-api-key" if self.base_url == "https://li.quest/" else "x-api-key"
+            kwargs["headers"] = {**kwargs.get("headers", {}), header: self.api_key}
+        wait_until = self.clock() + self.quota_wait_seconds
+        for number in range(self.max_attempts):
+            try:
+                response = self._request_once(method, url, dict(kwargs))
+            except LifiRequestLimit as error:
+                if (error.retry_at is None or error.retry_at > wait_until
+                        or number + 1 == self.max_attempts):
+                    raise
+                delay = max(0, error.retry_at - self.clock())
+            except httpx.TransportError:
+                if number + 1 == self.max_attempts:
+                    raise
+                delay = 2 ** number
+            else:
+                if response.status_code not in {500, 502, 503, 504}:
+                    return response
+                if number + 1 == self.max_attempts:
+                    return response
+                delay = 2 ** number
+            self.record_retry()
+            while delay > 0:
+                check_deadline()
+                step = min(1, delay)
+                self.sleep(step)
+                delay -= step
+            check_deadline()
+        raise RuntimeError("HTTP retry loop exhausted")
+
+    def _request_once(self, method, url, kwargs):
         cache_namespace = kwargs.pop("cache_namespace", None)
         if not url.startswith(self.base_url):
             return self.client.request(method, url, **kwargs)

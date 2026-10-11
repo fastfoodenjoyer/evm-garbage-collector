@@ -829,6 +829,13 @@ class Journal:
             is not None
         )
 
+    def has_asset_broadcast(self, position_id: int) -> bool:
+        """Approvals do not spend the source asset or freeze its route identity."""
+        return self.connection.execute(
+            "SELECT 1 FROM route_steps WHERE position_id=? AND tx_hash IS NOT NULL "
+            "AND step_key NOT LIKE 'approval:%' LIMIT 1", (position_id,)
+        ).fetchone() is not None
+
     def record_step_state(self, step_id: int, state: str) -> None:
         self._transition_step(step_id, state)
         self.connection.commit()

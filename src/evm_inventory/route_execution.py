@@ -54,10 +54,12 @@ from .lifi import (
     _route_from_dict,
     validate_bridge_route,
 )
+from .lifi_quota import LifiRequestLimit
 from .live_plan import _route_data, _valuation_data
 from .models import AssetIdentity
 from .network_policy import uses_excluded_network
 from .planner_gas import PlannerGasEstimator
+from .quote_jobs import JobInProgress
 from .rpc import quantity
 from .stages import (
     Deadline,
@@ -67,7 +69,7 @@ from .stages import (
     current_deadline,
     deadline_scope,
 )
-from .transport import Transport
+from .transport import Transport, is_transient_error
 from .valuation import FeeQuote, QuotePrice, raw_to_decimal
 from .wallet_lifi import WalletLifiClients
 from .weth import WETH_WITHDRAW_TOOL, withdraw_transaction_fields
@@ -620,7 +622,9 @@ def execute_group_entries(
                     return counts
         try:
             saved_preflight = journal.checkpoint(position_id, "prepared")
-            if saved_preflight is not None and journal.has_broadcast(position_id):
+            frozen = (journal.has_asset_broadcast(position_id) if entry.get("automatic_requote")
+                      else journal.has_broadcast(position_id))
+            if saved_preflight is not None and frozen:
                 fresh = saved_preflight
             else:
                 fresh = preflight(entry)
@@ -636,6 +640,11 @@ def execute_group_entries(
         except StageDeadlineExceeded as exc:
             return yield_stage(position_id, exc)
         except Exception as exc:
+            if entry.get("automatic_requote") and _retryable_provider_error(exc):
+                journal.save_checkpoint(position_id, "automatic_retry", {
+                    "reason": _execution_reason(exc), "retry_at": getattr(exc, "retry_at", None)
+                })
+                return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
             if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
                 return yield_stage(
                     position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
@@ -719,6 +728,8 @@ def execute_group_entries(
             except StageDeadlineExceeded as exc:
                 return yield_stage(position_id, exc)
             except Exception as exc:
+                if entry.get("automatic_requote") and _retryable_provider_error(exc):
+                    return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
                 if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
                     return yield_stage(
                         position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
@@ -820,6 +831,8 @@ def execute_group_entries(
             except StageDeadlineExceeded as exc:
                 return yield_stage(position_id, exc)
             except Exception as exc:
+                if entry.get("automatic_requote") and _retryable_provider_error(exc):
+                    return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
                 if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
                     return yield_stage(
                         position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
@@ -918,6 +931,10 @@ def execute_group_entries(
                 except StageDeadlineExceeded as exc:
                     return yield_stage(position_id, exc)
                 except Exception as exc:
+                    if entry.get("automatic_requote") and _retryable_provider_error(exc):
+                        return yield_stage(
+                            position_id, StageDeadlineExceeded(_execution_reason(exc))
+                        )
                     if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
                         return yield_stage(
                             position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
@@ -1044,6 +1061,16 @@ def resume_routes_read_only(*, journal_path: Path) -> dict[str, object]:
     }
 
 
+def _execution_deadline(seconds, entries):
+    continuous = bool(entries) and all(e.get("automatic_requote") for e in entries)
+    if continuous and current_deadline() is not None:
+        check_deadline()
+        remaining = current_deadline().remaining()
+        if remaining is not None:
+            seconds = min(seconds, remaining)
+    return Deadline(seconds, "execution", max_seconds=86_400 if continuous else 30)
+
+
 def execute_entries(
     entries: list[dict],
     *,
@@ -1081,7 +1108,8 @@ def execute_entries(
     require_trusted_deposit_addresses(trust_deposit_addresses)
     if not execute:
         raise ValueError("refusing to broadcast without --execute")
-    print(DEPOSIT_ADDRESS_WARNING, file=sys.stderr, flush=True)
+    if not entries or not all(e.get("automatic_requote") for e in entries):
+        print(DEPOSIT_ADDRESS_WARNING, file=sys.stderr, flush=True)
     if allow_duplicate_deposit_addresses:
         print(
             "Проверка уникальности депозитных адресов отключена явным флагом.",
@@ -1094,7 +1122,7 @@ def execute_entries(
     if delay_min_seconds < 0 or delay_max_seconds < delay_min_seconds:
         raise ValueError("invalid execution delay range")
     now_ms = now_ms or _utc_now_ms
-    Deadline(stage_seconds, "execution")  # validate before allocating clients
+    _execution_deadline(stage_seconds, entries)  # validate before allocating clients
     relay_entries = [e for e in entries if e.get("routing_provider") == "relay"]
     if relay_entries:
         if preflight_entry is not None or submit_route_step is not None:
@@ -1182,7 +1210,7 @@ def execute_entries(
                         summary["skipped"] += len(wallet_entries)
                         continue
                     jumper = lifi_clients.for_wallet(wallet)
-                    with deadline_scope(Deadline(stage_seconds, "execution")):
+                    with deadline_scope(_execution_deadline(stage_seconds, wallet_entries)):
                         for entry in wallet_entries:
                             operation_id = journal.create_operation(
                                 wallet=wallet, action=str(entry["status"])
@@ -1301,7 +1329,7 @@ def _execute_injected_groups(
     with Journal(journal_path) as journal:
         for key in sorted(groups):
             wallet_deadline = deadlines.setdefault(
-                str(groups[key][0]["wallet"]).lower(), Deadline(stage_seconds, "execution")
+                str(groups[key][0]["wallet"]).lower(), _execution_deadline(stage_seconds, entries)
             )
             with deadline_scope(wallet_deadline):
                 result = execute_group_entries(
@@ -1369,10 +1397,28 @@ def _execute_live_groups(
                     sleep(randomizer.randint(delay_min_seconds, delay_max_seconds))
                 previous_wallet = wallet_address
                 jumper = lifi_clients.for_wallet(wallet_address)
-                gas_estimator = PlannerGasEstimator(rpc, rpc_urls, jumper)
+                gas_estimator = PlannerGasEstimator(
+                    rpc, rpc_urls, jumper,
+                    retry_transient_errors=all(e.get("automatic_requote") for e in group_entries),
+                )
 
                 def preflight(entry: dict) -> dict:
-                    return _preflight_live_entry(
+                    position = journal.get_or_create_position(
+                        position_key=_position_key(entry), wallet=entry["wallet"]
+                    )
+                    approval_hashes = []
+                    if entry.get("automatic_requote") and not journal.has_asset_broadcast(
+                        position["id"]
+                    ):
+                        for approval in journal.connection.execute(
+                            "SELECT tx_hash FROM route_steps WHERE position_id=? "
+                            "AND step_key LIKE 'approval:%' AND tx_hash IS NOT NULL",
+                            (position["id"],),
+                        ).fetchall():
+                            wait_for_receipt(rpc, url=_rpc_url(rpc_urls, entry["chain_id"]),
+                                             tx_hash=approval[0])
+                            approval_hashes.append((entry["chain_id"], approval[0]))
+                    fresh = _preflight_live_entry(
                         entry,
                         wallet=wallet,
                         rpc=rpc,
@@ -1382,6 +1428,15 @@ def _execute_live_groups(
                         gas_estimator=gas_estimator,
                         now_ms=now_ms,
                     )
+                    if approval_hashes:
+                        expense = _actual_gas_paid_usd(
+                            approval_hashes, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper,
+                        )
+                        fresh["_realized_loss_before_current_usd"] = _decimal_string(expense)
+                        fresh["valuation"]["loss_usd"] = _decimal_string(
+                            _exact_sum((_entry_loss(fresh), expense))
+                        )
+                    return fresh
 
                 def submit(entry: dict, step: dict) -> dict:
                     background.raise_if_failed()
@@ -1439,7 +1494,7 @@ def _execute_live_groups(
                     )
 
                 wallet_deadline = deadlines.setdefault(
-                    wallet_address, Deadline(stage_seconds, "execution")
+                        wallet_address, _execution_deadline(stage_seconds, entries)
                 )
                 with deadline_scope(wallet_deadline):
                     result = execute_group_entries(
@@ -1624,6 +1679,10 @@ def _preflight_live_entry(
             raise ValueError("requote_required:below_target_minimum")
     _require_valid_candidate(candidate)
     fresh = {**entry, "steps": fresh_steps}
+    if entry.get("automatic_requote"):
+        fresh["quoted_at"] = now_ms()
+        if len(fresh_steps) == 1:
+            fresh["route"] = fresh_steps[0]["route"]
     fresh["_candidate"] = candidate
     fresh["_step_candidates"] = step_candidates
     fresh["valuation"] = _candidate_valuation(candidate)
@@ -1641,6 +1700,8 @@ def _refresh_route_step(
     bitget: BitgetClient,
     source_amount: int | None = None,
     actual_asset_id: str | None = None,
+    _spend_amount: int | None = None,
+    _reserve_attempt: int = 0,
 ) -> tuple[object, dict]:
     route_data = step.get("route")
     if not isinstance(route_data, dict) or not isinstance(route_data.get("evidence"), dict):
@@ -1679,6 +1740,29 @@ def _refresh_route_step(
         ):
             raise ValueError("requote_required:local_unwrap_identity_invalid")
     live = step.get("_live_route")
+    allow_replacement = bool(entry.get("automatic_requote")) and (
+        source_amount is None and not entry.get("_journal_position_id")
+        and step.get("kind") != "unwrap_to_native"
+    )
+    native_available = None
+    if allow_replacement and source.is_native:
+        native_available = _asset_balance(
+            gas_estimator.rpc, url=_rpc_url(gas_estimator.rpc_urls, source.chain_id),
+            asset=source, wallet=wallet.public_address,
+        )
+        hint = sum(cost.amount for cost in planned.gas_costs if cost.token == source)
+        if _spend_amount is not None:
+            amount = _spend_amount
+        else:
+            hinted_available = native_available - hint * GAS_RESERVE_MULTIPLIER * 2
+            amount = min(amount, hinted_available if hinted_available > 0
+                         else max(1, native_available // 2))
+        if native_available <= 0:
+            raise ValueError("insufficient_source_gas")
+        if amount <= 0:
+            raise ValueError("insufficient_source_gas")
+        if amount != planned.evidence.input_amount:
+            live = None
     if not isinstance(live, LifiRoute):
         request = LifiRouteRequest(
             from_chain_id=source.chain_id,
@@ -1694,17 +1778,33 @@ def _refresh_route_step(
             (route for route in routes if route.route_id == route_data.get("id")),
             None,
         )
+        if live is None and allow_replacement:
+            for option in routes:
+                try:
+                    validate_bridge_route(option, expected_source=source,
+                                          expected_destination=destination,
+                                          input_amount=amount, recipient=recipient)
+                except ValueError:
+                    continue
+                live = option
+                break
         if live is None:
             raise ValueError("requote_required:route_id_changed")
-    revalidate_route_evidence(
-        planned,
-        live,
-        expected_source=source,
-        expected_destination=destination,
-        expected_input_amount=amount,
-        recipient=recipient,
-    )
-    if source_amount is not None:
+    if allow_replacement:
+        validate_bridge_route(live, expected_source=source, expected_destination=destination,
+                              input_amount=amount, recipient=recipient)
+    else:
+        revalidate_route_evidence(
+            planned,
+            live,
+            expected_source=source,
+            expected_destination=destination,
+            expected_input_amount=amount,
+            recipient=recipient,
+        )
+    if native_available is not None:
+        available = native_available
+    elif source_amount is not None:
         available = source_amount
     elif not (
         step.get("kind") == "bridge" and entry.get("steps", [])[0].get("kind") == "swap_to_native"
@@ -1725,6 +1825,22 @@ def _refresh_route_step(
         wallet=wallet.public_address,
         prepared_transactions=prepared_requests,
     )
+    if native_available is not None and extra_gas:
+        fee_cap = sum(f.raw_amount for f in extra_gas if f.price and f.price.asset == source)
+        spendable = native_available - GAS_RESERVE_MULTIPLIER * fee_cap
+        if amount != spendable and not (_reserve_attempt >= 2 and amount < spendable):
+            if spendable <= 0:
+                raise ValueError("insufficient_source_gas")
+            if _reserve_attempt >= 2:
+                raise ValueError("native_gas_reserve_unstable")
+            return _refresh_route_step(
+                entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
+                jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
+                _spend_amount=spendable, _reserve_attempt=_reserve_attempt + 1,
+            )
+    prepared_requests = getattr(gas_estimator, "prepared_fee_caps", {}).get(
+        live.route_id, prepared_requests
+    )
     candidate = candidate_from_route(
         live,
         expected_source=source,
@@ -1742,8 +1858,10 @@ def _refresh_route_step(
         _require_target_minimum(entry, bitget, wallet, candidate)
     fresh_step = {
         **step,
+        "route": _route_data(live),
         "_live_route": live,
         "_prepared_requests": prepared_requests,
+        "_approval_fee_caps": dict(getattr(gas_estimator, "approval_fee_caps", {})),
     }
     if len(prepared_requests) == 1:
         fresh_step["_prepared_request"] = prepared_requests[0]
@@ -2459,6 +2577,7 @@ def _submit_live_step(
             "raw_balance": str(step_amount),
             "route": {**route_data, "step": raw_step},
             "_journal_step_key": step_key,
+            "_approval_fee_caps": step.get("_approval_fee_caps", {}),
         }
         if carried_asset_id == step_source.contract_address and carried_amount is not None:
             route_entry["_actual_asset_id"] = carried_asset_id
@@ -2498,7 +2617,10 @@ def _submit_live_step(
                 step,
                 wallet=wallet,
                 jumper=jumper,
-                gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper),
+                gas_estimator=PlannerGasEstimator(
+                    rpc, rpc_urls, jumper,
+                    retry_transient_errors=bool(entry.get("automatic_requote")),
+                ),
                 now=datetime.fromtimestamp(now_ms() / 1000, tz=UTC),
                 bitget=bitget,
                 source_amount=int(route_data["evidence"]["input_amount"]),
@@ -2772,7 +2894,11 @@ def _execute_entry(
         if recovered is not None:
             wait_for_receipt(rpc, url=url, tx_hash=recovered)
             return ExecutedTransactionHash(recovered, None)
-    if not (
+    pending_approval = request.fee_quote_fallback_reason == "pending_approval"
+    if pending_approval and (entry["asset_id"] == "native" or entry["status"] != "route_ready"
+                             or request.max_total_fee_cap_wei is None):
+        raise ValueError("pending approval estimate requires a capped ERC20 route")
+    if not pending_approval and not (
         prepared_request is not None
         and entry["status"] == "direct_deposit"
         and entry["asset_id"] == "native"
@@ -2810,6 +2936,13 @@ def _execute_entry(
             position_id=(position_id if "_journal_step_key" in entry else None),
             route_step_key=step_key,
         )
+        if pending_approval:
+            request = FeePlanner(rpc).plan(url, request, sender=wallet.public_address)
+            require_ethereum_planned_gas_price_valid(request)
+            require_native_reserve(
+                balance=_native_balance(rpc, url=url, wallet=wallet.public_address) - request.value,
+                gas_cost=request.max_total_fee_wei,
+            )
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
     try:
         if callable(before_sign):
@@ -2935,6 +3068,12 @@ def _execution_reason(exc: Exception) -> str:
     return f"execution_error:{type(exc).__name__}"
 
 
+def _retryable_provider_error(error):
+    if isinstance(error, (LifiRequestLimit, JobInProgress)):
+        return True
+    return is_transient_error(error)
+
+
 def _direct_request(
     entry: dict, *, wallet: WalletWorkbookRow, rpc: ExecutionRpc, url: str
 ) -> TransactionRequest:
@@ -3035,7 +3174,11 @@ def _approve_if_needed(
         amount=amount,
         gas_price_wei=0,
     )
-    approval = FeePlanner(rpc).plan(url, approval, sender=wallet.public_address)
+    approval_cap = entry.get("_approval_fee_caps", {}).get(
+        f"{request.chain_id}:{asset_id}:{spender.lower()}"
+    )
+    approval = FeePlanner(rpc).plan(url, approval, sender=wallet.public_address,
+                                    max_total_fee_wei=approval_cap)
     require_ethereum_planned_gas_price_valid(approval)
     balance = _native_balance(rpc, url=url, wallet=wallet.public_address)
     require_native_reserve(balance=balance, gas_cost=approval.max_total_fee_wei)
