@@ -194,6 +194,82 @@ def test_planning_waits_for_quota_and_only_retries_unresolved_network(tmp_path):
     assert all(e["status"] == "direct_deposit" for e in result["entries"])
 
 
+@pytest.mark.parametrize("reason", ["quota_wait", "quote_timeout", "quote_request_failed"])
+def test_rejected_one_target_does_not_hide_pending_alternative_routes(reason):
+    from evm_inventory.collection import _unresolved
+
+    waiting = {"status": "manual_review", "reason": "below_target_minimum",
+               "search": {"complete": False, "pending": [{"reason": reason}]}}
+    assert _unresolved(waiting)
+    assert not _unresolved({**waiting, "search": {"complete": True, "pending": []}})
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_final_execution_holds_native_for_unresolved_token_but_observes_known_hash(
+    tmp_path, broadcast,
+):
+    from evm_inventory.collection import drive_execution
+
+    native = entry(10)
+    token = {**native, "asset_id": "0xabc", "status": "manual_review",
+             "reason": "below_target_minimum", "search": {
+                 "complete": False, "pending": [{"reason": "quota_wait"}]}}
+    path, calls, clock = tmp_path / "inventory.sqlite", [], [1000.0]
+    if broadcast:
+        with Journal(path) as journal:
+            p = journal.get_or_create_position(position_key=_position_key(native),
+                                              wallet=native["wallet"])
+            step = journal.record_step_intent(position_id=p["id"], step_key="direct_deposit",
+                nonce=9, calldata_digest="a"*64, signed_payload_digest="b"*64, tx_hash="0x"+"c"*64)
+            assert step["tx_hash"]
+    def execute(entries):
+        calls.extend(entries)
+        with Journal(path) as journal:
+            journal.record_position_state(p["id"], "completed")
+    result = drive_execution({"entries": [native, token]}, path, execute_round=execute,
+        until=1010, clock=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0]+s))
+    assert len(calls) == int(broadcast)
+    assert result["status"] == ("completed" if broadcast else "incomplete")
+
+
+def test_pending_relay_diagnostics_remain_retryable_without_unhashable_dict_error():
+    from evm_inventory.collection import _search_error_reasons, _unresolved
+
+    search = {"complete": False, "errors": [{"destination_chain_id": 10, "retry_at": 1002}],
+              "pending": [{"retry_at": 1002}]}
+    assert _unresolved({"status": "manual_review", "reason": "below_target_minimum",
+                        "search": search})
+    assert _search_error_reasons(search) == {"quota_wait"}
+
+
+def test_recovery_on_partially_sent_network_preserves_sent_entries_and_requotes_unsent_assets(
+    tmp_path,
+):
+    import csv
+
+    from evm_inventory.collection import recover_planning
+
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+                      "wallet,10,native,100,18,success\n"
+                      "wallet,10,0xabc,200,18,success\n")
+    sent = {**entry(10), "wallet": "wallet"}
+    waiting = {**sent, "asset_id": "0xabc", "status": "manual_review", "reason": "quota_wait",
+               "search": {"pending": [{"reason": "quota_wait", "retry_at": 1002}]}}
+    clock = [1000.0]
+    calls = []
+    def quote(path):
+        calls.extend(csv.DictReader(path.open()))
+        return {"entries": [{**waiting, "status": "route_ready", "reason": None}]}
+    result = recover_planning({"entries": [sent, waiting]}, source, quote,
+        until=1010, clock=lambda: clock[0], wall_clock=lambda: clock[0],
+        sleep=lambda s: clock.__setitem__(0, clock[0]+s), locked_chains={10},
+        frozen_keys={("wallet", 10, "native")})
+    assert [r["asset_id"] for r in calls] == ["0xabc"]
+    assert result["entries"][0] == sent
+    assert result["entries"][1]["status"] == "route_ready"
+
+
 def test_planning_progress_hook_runs_before_quota_wait_and_after_refresh(tmp_path):
     from evm_inventory.collection import recover_planning
 
@@ -462,6 +538,16 @@ def test_new_relay_collection_has_new_identity_but_resume_keeps_same_identity():
     assert _position_key(first["entries"][0]) == key
 
 
+def test_unsent_relay_on_partially_sent_chain_gets_collection_identity():
+    from evm_inventory.collection import _assign_collection_identities
+
+    native = {**entry(), "routing_provider": "relay"}
+    native.pop("group")
+    _assign_collection_identities({"entries": [native]}, "run-one", locked_chains={10},
+        frozen_keys={(native["wallet"], 10, "0xabc")})
+    assert native["group"]["key"].startswith("run-one:")
+
+
 def test_relay_native_drain_waits_for_sibling_token_execution(tmp_path):
     from evm_inventory.collection import drive_execution
 
@@ -492,6 +578,35 @@ def test_relay_native_drain_waits_for_sibling_token_execution(tmp_path):
     )
     assert rounds == [[token["asset_id"]], ["native"]]
     assert result["status"] == "completed"
+
+
+@pytest.mark.parametrize("token_state", ["planned", "manual_review"])
+def test_already_sent_relay_is_observed_even_when_sibling_token_is_unfinished(
+    tmp_path, token_state,
+):
+    from evm_inventory.collection import drive_execution
+
+    relay = {**entry(), "routing_provider": "relay"}
+    token = {**entry(), "asset_id": "0xabc",
+             "group": {**entry()["group"], "key": "token-group"}}
+    path, clock, calls = tmp_path / "inventory.sqlite", [1000.0], []
+    with Journal(path) as journal:
+        rp = journal.get_or_create_position(
+            position_key=_position_key(relay), wallet=relay["wallet"])
+        journal.record_step_intent(position_id=rp["id"], step_key="relay", nonce=9,
+            calldata_digest="a"*64, signed_payload_digest="b"*64, tx_hash="0x"+"c"*64)
+        tp = journal.get_or_create_position(
+            position_key=_position_key(token), wallet=token["wallet"])
+        journal.record_position_state(tp["id"], token_state)
+    def execute(entries):
+        calls.extend(e["asset_id"] for e in entries)
+        with Journal(path) as journal:
+            for e in entries:
+                pid = rp["id"] if e["asset_id"] == "native" else tp["id"]
+                journal.record_position_state(pid, "completed")
+    drive_execution({"entries": [relay, token]}, path, execute_round=execute,
+        until=1010, clock=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0]+s))
+    assert "native" in calls
 
 
 def test_provider_retry_can_continue_after_more_than_two_failures(tmp_path):

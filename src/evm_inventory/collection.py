@@ -87,19 +87,36 @@ def verify_prior_defi_exit(journal, position_id, rpc_urls, *, rpc=None):
 
 
 def _unresolved(entry):
+    search = entry.get("search", {})
+    operational = {"quota_wait", "provider_cooldown", "route_search_incomplete", "stale_quote",
+                   "quote_timeout", "quote_request_failed"}
+    pending_alternatives = (bool(operational.intersection(_search_error_reasons(search))) or (
+        not search.get("complete") and bool(search.get("pending"))
+    ))
     return (
         entry.get("status") not in _READY
         and entry.get("status") not in {"denied", "dust", "below_quote_floor"}
-        and entry.get("reason") not in _SKIP_REASONS
+        and (entry.get("reason") not in _SKIP_REASONS or pending_alternatives)
     )
 
 
-def _assign_collection_identities(plan, run_id, *, locked_chains=()):
+def _asset_key(entry):
+    return (str(entry["wallet"]).lower(), int(entry["chain_id"]), str(entry["asset_id"]).lower())
+
+
+def _search_error_reasons(search):
+    return {e if isinstance(e, str) else e.get("reason", (
+        "quota_wait" if isinstance(e.get("retry_at"), (int, float)) else "quote_request_failed"
+    )) for e in search.get("errors", [])}
+
+
+def _assign_collection_identities(plan, run_id, *, locked_chains=(), frozen_keys=None):
     for entry in plan["entries"]:
         if (
             entry.get("routing_provider") == "relay"
             and not entry.get("group")
-            and entry["chain_id"] not in locked_chains
+            and (_asset_key(entry) not in frozen_keys if frozen_keys is not None
+                 else entry["chain_id"] not in locked_chains)
         ):
             entry["group"] = {"key": f"{run_id}:{entry['wallet']}:{entry['chain_id']}:relay"}
 
@@ -115,6 +132,7 @@ def recover_planning(
     sleep=time.sleep,
     progress=None,
     locked_chains=(),
+    frozen_keys=None,
     on_plan=None,
 ):
     """Retry unfinished source groups in this invocation without requerying completed groups."""
@@ -126,7 +144,8 @@ def recover_planning(
             e
             for e in plan["entries"]
             if _unresolved(e)
-            and e["chain_id"] not in locked_chains
+            and (_asset_key(e) not in frozen_keys if frozen_keys is not None
+                 else e["chain_id"] not in locked_chains)
             and e.get("reason") not in _PERMANENT_REASONS
         ]
         if not unresolved or clock() >= until:
@@ -135,7 +154,7 @@ def recover_planning(
         due = {}
         for entry in unresolved:
             search = entry.get("search", {})
-            errors = set(search.get("errors", []))
+            errors = _search_error_reasons(search)
             times = [p["retry_at"] for p in search.get("pending", [])
                      if isinstance(p.get("retry_at"), (int, float))]
             # A provider cooldown gates only provider work. Local RPC/fee failures
@@ -160,13 +179,16 @@ def recover_planning(
                 tick_at = clock() + 60
             if progress and end - clock() > 60 and int(end - clock()) % 60 == 0:
                 progress(f"Provider cooldown: {end - clock():.0f} seconds remaining")
-        chains = {chain for chain, when in due.items()
-                  if when <= clock() and chain not in locked_chains}
+        chains = {chain for chain, when in due.items() if when <= clock() and (
+            frozen_keys is not None or chain not in locked_chains
+        )}
         if not chains:
             continue
         with Path(balances_path).open(newline="") as stream:
             reader = csv.DictReader(stream)
-            rows = [r for r in reader if int(r["chain_id"]) in chains]
+            rows = [r for r in reader if int(r["chain_id"]) in chains and (
+                frozen_keys is None or _asset_key(r) not in frozen_keys
+            )]
             fields = reader.fieldnames
         retry_path = Path(balances_path).parent.parent / "retry-balances.csv"
         with retry_path.open("w", newline="") as stream:
@@ -176,8 +198,11 @@ def recover_planning(
         refreshed = quote(retry_path)
         plan = {
             **plan,
-            "entries": [e for e in plan["entries"] if e["chain_id"] not in chains]
-            + refreshed["entries"],
+            "entries": [e for e in plan["entries"] if e["chain_id"] not in chains or (
+                frozen_keys is not None and _asset_key(e) in frozen_keys
+            )] + [e for e in refreshed["entries"] if frozen_keys is None or (
+                _asset_key(e) not in frozen_keys
+            )],
         }
         plan["summary"] = dict(Counter(e["status"] for e in plan["entries"]))
         plan.setdefault("recovery_attempts", []).append(
@@ -227,7 +252,7 @@ def execution_positions(entries, db_path):
                 continue
             key = _position_key(entry)
             row = journal.connection.execute(
-                "SELECT p.state,p.reason,g.state AS group_state,g.reason AS group_reason "
+                "SELECT p.id,p.state,p.reason,g.state AS group_state,g.reason AS group_reason "
                 "FROM route_positions p "
                 "LEFT JOIN route_groups g ON p.group_id=g.id WHERE p.position_key=?",
                 (key,),
@@ -244,6 +269,7 @@ def execution_positions(entries, db_path):
                     "asset_id": entry["asset_id"],
                     "state": state,
                     "reason": reason,
+                    "has_broadcast": bool(row and journal.has_broadcast(row["id"])),
                 }
             )
     return result
@@ -281,6 +307,11 @@ def drive_execution(
         active = [
             e for e in plan["entries"] if e.get("status") in _READY and _position_key(e) in pending
         ]
+        unresolved_chains = {e["chain_id"] for e in plan["entries"] if _unresolved(e)}
+        observed_keys = {p["position_key"] for p in positions if p["has_broadcast"]}
+        def eligible(e):
+            return e["chain_id"] not in unresolved_chains or _position_key(e) in observed_keys
+        active = [e for e in active if eligible(e)]
         blocked_chains = {
             p["chain_id"]
             for p in positions
@@ -289,12 +320,13 @@ def drive_execution(
         active = [
             e
             for e in active
-            if not (e.get("routing_provider") == "relay" and e["chain_id"] in blocked_chains)
+            if not (e.get("routing_provider") == "relay" and e["chain_id"] in blocked_chains
+                    and _position_key(e) not in observed_keys)
         ]
-        if not active and failure:
+        if not active and (failure or unresolved_chains):
             return {
                 "status": "incomplete",
-                "reason": "execution_failed",
+                "reason": "execution_failed" if failure else "planning_incomplete",
                 "completed": completed,
                 "rounds": rounds,
                 "positions": positions,
@@ -308,6 +340,7 @@ def drive_execution(
             for e in plan["entries"]
             if e.get("status") in _READY
             and (_position_key(e) in active_keys or e.get("group", {}).get("key") in groups)
+            and eligible(e)
         ]
         state = tuple((p["position_key"], p["state"], p["reason"]) for p in positions)
         if progress and state != last_progress:
@@ -555,6 +588,7 @@ def collect_wallets(
                     seconds=max(0.1, planning_until - clock()),
                 )
             locked_chains = set()
+            frozen_keys = set()
             if not previous:
                 _assign_collection_identities(plan, run_id)
             with Journal(db_path) as journal:
@@ -565,6 +599,7 @@ def collect_wallets(
                     ).fetchone()
                     if position and journal.has_broadcast(position[0]):
                         locked_chains.add(entry["chain_id"])
+                        frozen_keys.add(_asset_key(entry))
             balances_path = wallet_output / "inventory" / "balances.csv"
 
             def execute_round(entries):
@@ -581,11 +616,13 @@ def collect_wallets(
 
             def advance_ready_groups(current):
                 blocked = {e["chain_id"] for e in current["entries"] if _unresolved(e)}
-                ready = [e for e in current["entries"]
-                         if e.get("status") in _READY and e["chain_id"] not in blocked]
+                ready = [e for e in current["entries"] if e.get("status") in _READY and (
+                    e["chain_id"] not in blocked or _asset_key(e) in frozen_keys
+                )]
                 if not ready or clock() >= until:
                     return
-                _assign_collection_identities(current, run_id, locked_chains=locked_chains)
+                _assign_collection_identities(current, run_id, locked_chains=locked_chains,
+                                              frozen_keys=frozen_keys)
                 for e in current["entries"]:
                     e["automatic_requote"] = True
                 # A crash after the first broadcast must resume this exact plan.
@@ -603,6 +640,7 @@ def collect_wallets(
                         ).fetchone()
                         if position and journal.has_broadcast(position[0]):
                             locked_chains.add(e["chain_id"])
+                            frozen_keys.add(_asset_key(e))
 
             if balances_path.exists():
                 plan = recover_planning(
@@ -625,9 +663,11 @@ def collect_wallets(
                     sleep=sleep,
                     progress=progress,
                     locked_chains=locked_chains,
+                    frozen_keys=frozen_keys,
                     on_plan=advance_ready_groups if execute else None,
                 )
-            _assign_collection_identities(plan, run_id, locked_chains=locked_chains)
+            _assign_collection_identities(plan, run_id, locked_chains=locked_chains,
+                                          frozen_keys=frozen_keys)
             for entry in plan["entries"]:
                 entry["automatic_requote"] = True
             preserved_status = previous["status"] if previous and not execute else None
