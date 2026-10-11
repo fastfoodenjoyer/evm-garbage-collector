@@ -275,6 +275,23 @@ def execution_positions(entries, db_path):
     return result
 
 
+def _resume_stale_price_groups(entries, db_path):
+    groups = {}
+    for entry in entries:
+        if entry.get("status") in _READY and entry.get("group"):
+            groups.setdefault(entry["group"]["key"], []).append(entry)
+    with Journal(db_path) as journal:
+        for key, members in groups.items():
+            if not all(e.get("automatic_requote") for e in members):
+                continue
+            group = journal.connection.execute(
+                "SELECT id FROM route_groups WHERE group_key=?", (key,),
+            ).fetchone()
+            if group:
+                journal.reactivate_stale_price_group(group["id"],
+                                                     {_position_key(e) for e in members})
+
+
 def drive_execution(
     plan, db_path, *, execute_round, until, clock=time.monotonic, sleep=time.sleep, progress=None
 ):
@@ -587,6 +604,8 @@ def collect_wallets(
                     quote_floor=quote_floor,
                     seconds=max(0.1, planning_until - clock()),
                 )
+            if execute:
+                _resume_stale_price_groups(plan["entries"], db_path)
             locked_chains = set()
             frozen_keys = set()
             if not previous:

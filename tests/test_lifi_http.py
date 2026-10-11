@@ -150,10 +150,10 @@ def test_more_than_24_requests_and_execution_reserve(tmp_path):
         clock=lambda: clock[0],
         sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )
-    for n in range(60):
+    for n in range(70):
         c.post(URL, json={"n": n})
     with pytest.raises(LifiRequestLimit):
-        c.post(URL, json={"n": 61})
+        c.post(URL, json={"n": 71})
     execution = LifiHttpClient(
         httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={}))),
         db_path=c.db_path,
@@ -162,8 +162,8 @@ def test_more_than_24_requests_and_execution_reserve(tmp_path):
         clock=lambda: clock[0],
         sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )
-    execution.post(URL, json={"n": 62})
-    assert c.metrics["requests"] == 60
+    execution.post(URL, json={"n": 72})
+    assert c.metrics["requests"] == 70
     assert execution.metrics["requests"] == 1
 
 

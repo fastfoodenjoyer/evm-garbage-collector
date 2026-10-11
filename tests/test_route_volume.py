@@ -81,7 +81,7 @@ def test_thirty_positions_stop_at_real_quota_without_429(tmp_path):
     client = LifiClient(http)
     try:
         plan = volume_plan(tmp_path, 30, client)
-        assert len(routes) == 60
+        assert len(routes) == 70
         assert http.metrics["provider_429"] == 0
         assert any(
             e.get("reason") == "quota_wait" or e.get("group", {}).get("reason") == "quota_wait"

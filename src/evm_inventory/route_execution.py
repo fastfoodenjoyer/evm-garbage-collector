@@ -1622,6 +1622,7 @@ def _preflight_live_entry(
             jumper=jumper,
             gas_estimator=gas_estimator,
             now=now,
+            now_fn=lambda: datetime.fromtimestamp(now_ms() / 1000, UTC),
             bitget=bitget,
             source_amount=int(actual_balance_raw),
             actual_asset_id=str(actual_asset_id),
@@ -1643,6 +1644,7 @@ def _preflight_live_entry(
             jumper=jumper,
             gas_estimator=gas_estimator,
             now=now,
+            now_fn=lambda: datetime.fromtimestamp(now_ms() / 1000, UTC),
             bitget=bitget,
         )
         candidates.append(candidate)
@@ -1673,7 +1675,7 @@ def _preflight_live_entry(
             destination_price=price,
             wallet_paid_gas=direct_gas or (),
             gas_estimate_complete=direct_gas is not None,
-            now=now,
+            now=datetime.fromtimestamp(now_ms() / 1000, UTC),
             max_price_age=_MAX_PRICE_AGE,
         )
         _require_valid_candidate(direct_candidate)
@@ -1706,6 +1708,7 @@ def _refresh_route_step(
     gas_estimator: PlannerGasEstimator,
     now: datetime,
     bitget: BitgetClient,
+    now_fn: Callable[[], datetime] | None = None,
     source_amount: int | None = None,
     actual_asset_id: str | None = None,
     _spend_amount: int | None = None,
@@ -1844,6 +1847,7 @@ def _refresh_route_step(
             return _refresh_route_step(
                 entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
                 jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
+                now_fn=now_fn,
                 _spend_amount=spendable, _reserve_attempt=_reserve_attempt + 1,
             )
     prepared_requests = getattr(gas_estimator, "prepared_fee_caps", {}).get(
@@ -1856,7 +1860,7 @@ def _refresh_route_step(
         expected_input_amount=amount,
         recipient=recipient,
         gas_estimate_complete=extra_gas is not None,
-        now=now,
+        now=now_fn() if now_fn is not None else now,
         max_price_age=_MAX_PRICE_AGE,
         wallet_paid_gas=extra_gas or (),
         replace_route_gas=bool(extra_gas),
@@ -1931,9 +1935,9 @@ def _requote_from_intermediate(
         from_address=wallet.public_address,
         to_address=wallet.bitget_deposit_address,
     )
-    now = datetime.fromtimestamp(now_ms() / 1000, UTC)
     routes = jumper.routes(request)
     candidates = []
+    stale_price = False
     for route in routes:
         try:
             validate_bridge_route(
@@ -1960,17 +1964,20 @@ def _requote_from_intermediate(
                 expected_input_amount=amount,
                 recipient=wallet.bitget_deposit_address,
                 gas_estimate_complete=extra_gas is not None,
-                now=now,
+                now=datetime.fromtimestamp(now_ms() / 1000, UTC),
                 max_price_age=_MAX_PRICE_AGE,
                 wallet_paid_gas=extra_gas or (),
                 replace_route_gas=bool(extra_gas),
             )
             _require_valid_candidate(candidate)
             _require_target_minimum(dynamic, bitget, wallet, candidate)
-        except (ValueError, LifiError):
+        except (ValueError, LifiError) as exc:
+            stale_price |= str(exc) == "requote_required:stale_price"
             continue
         candidates.append((route, candidate, prepared))
     if not candidates:
+        if stale_price:
+            raise ValueError("requote_required:stale_price")
         raise ValueError("requote_required:no_eligible_route_after_intermediate_bridge")
     route, candidate, prepared = min(
         candidates,
@@ -2017,8 +2024,8 @@ def _requote_bridge_after_swap(
     if amount <= 0:
         raise ValueError("requote_required:empty_swap_output")
     live_target = _require_live_target(entry, wallet=wallet, bitget=bitget)
-    now = datetime.fromtimestamp(now_ms() / 1000, UTC)
     candidates = []
+    stale_price = False
     initial_request = LifiRouteRequest(
         from_chain_id=source.chain_id,
         to_chain_id=target_identity.chain_id,
@@ -2082,11 +2089,12 @@ def _requote_bridge_after_swap(
                 expected_input_amount=spendable,
                 recipient=wallet.bitget_deposit_address,
                 gas_estimate_complete=True,
-                now=now,
+                now=datetime.fromtimestamp(now_ms() / 1000, UTC),
                 max_price_age=_MAX_PRICE_AGE,
                 wallet_paid_gas=extra_gas,
                 replace_route_gas=True,
             )
+            stale_price |= candidate.reason == "stale_price"
             if (
                 candidate.is_valid
                 and candidate.destination_amount is not None
@@ -2094,6 +2102,8 @@ def _requote_bridge_after_swap(
             ):
                 candidates.append((route, candidate, prepared_requests))
     if not candidates:
+        if stale_price:
+            raise ValueError("requote_required:stale_price")
         raise ValueError("no eligible bridge route")
     route, candidate, prepared_requests = min(
         candidates,
@@ -2692,6 +2702,7 @@ def _submit_live_step(
                     retry_transient_errors=bool(entry.get("automatic_requote")),
                 ),
                 now=datetime.fromtimestamp(now_ms() / 1000, tz=UTC),
+                now_fn=lambda: datetime.fromtimestamp(now_ms() / 1000, UTC),
                 bitget=bitget,
                 source_amount=int(route_data["evidence"]["input_amount"]),
             )
@@ -3153,6 +3164,8 @@ def _execution_reason(exc: Exception) -> str:
 
 def _retryable_provider_error(error):
     if isinstance(error, (LifiRequestLimit, JobInProgress)):
+        return True
+    if isinstance(error, ValueError) and str(error) == "requote_required:stale_price":
         return True
     return is_transient_error(error)
 

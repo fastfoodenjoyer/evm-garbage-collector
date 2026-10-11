@@ -30,7 +30,7 @@ class LifiRequestLimit(ValueError):
 
 
 class LifiQuotaStore:
-    limits = {"routes": (65, 7200, 5), "steps": (40, 7200, 3), "public": (80, 60, 0)}
+    limits = {"routes": (75, 7200, 5), "steps": (50, 7200, 3), "public": (100, 60, 0)}
     provider_limit_matches_window = True
 
     def __init__(self, db_path: Path, scope: str, *, clock=None):

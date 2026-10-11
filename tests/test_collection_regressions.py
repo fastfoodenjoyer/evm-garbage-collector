@@ -10,6 +10,173 @@ from evm_inventory.runbook import create_route_plan
 from evm_inventory.stages import Deadline, deadline_scope, request_timeout
 
 
+def test_unauthenticated_quota_uses_published_limits_with_execution_reserves():
+    from evm_inventory.lifi_quota import LifiQuotaStore
+
+    assert LifiQuotaStore.limits == {
+        "routes": (75, 7200, 5), "steps": (50, 7200, 3), "public": (100, 60, 0)
+    }
+
+
+def test_live_route_valuation_reads_clock_after_fetching_fresh_gas_prices():
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from test_route_execution import ASSET_A, DEPOSIT, NOW, WALLET, _entry, _lifi_route
+
+    from evm_inventory.bitget_catalog import BitgetDepositTarget
+    from evm_inventory.lifi import TransactionRequest
+    from evm_inventory.live_plan import _route_data
+    from evm_inventory.models import AssetIdentity
+    from evm_inventory.route_execution import _refresh_route_step
+    from evm_inventory.valuation import FeeQuote, QuotePrice
+
+    route = _lifi_route(route_id="fresh", output_amount=910_000)
+    step = {"kind": "bridge", "route": _route_data(route)}
+    clock = [NOW]
+
+    def estimate(**_):
+        clock[0] += timedelta(seconds=3)
+        return (FeeQuote(1, QuotePrice(AssetIdentity(10, "native", 18), "2000", clock[0])),)
+
+    gas = SimpleNamespace(
+        rpc=SimpleNamespace(call=lambda *_: "0x" + f"{1_000_000:064x}"),
+        rpc_urls={10: "rpc"}, estimate_prepared_route=estimate,
+    )
+    candidate, _ = _refresh_route_step(
+        _entry(ASSET_A, status="route_ready", steps=[step]), step,
+        wallet=SimpleNamespace(public_address=WALLET, bitget_deposit_address=DEPOSIT),
+        jumper=SimpleNamespace(routes=lambda _: (route,), step_transaction=lambda _:
+                              TransactionRequest(10, DEPOSIT, "0x", 0, 21_000, 1)),
+        gas_estimator=gas, now=NOW, now_fn=lambda: clock[0],
+        bitget=SimpleNamespace(revalidate_deposit_target=lambda *_a, **_kw:
+            BitgetDepositTarget("USDC", 8453, "0x" + "e" * 40, 1, "Base", 6)),
+    )
+    assert candidate.is_valid
+
+
+@pytest.mark.parametrize("broadcast", [None, "approval:router", "bridge:0"])
+def test_stale_price_group_recovery_preserves_approvals_and_never_unlocks_spent_assets(
+    tmp_path, broadcast,
+):
+    from evm_inventory.journal import Journal
+
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        g = journal.get_or_create_group(group_key="g", wallet="wallet", source_chain_id=10,
+                                       source_usd="100", loss_budget_pct="15")
+        p = journal.get_or_create_position(position_key="p", wallet="wallet", group_id=g["id"])
+        if broadcast:
+            journal.record_step_intent(position_id=p["id"], step_key=broadcast, nonce=1,
+                calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+                tx_hash="0x" + "c" * 64)
+        reason = "requote_required:stale_price"
+        journal.record_position_state(p["id"], "manual_review", reason=reason)
+        journal.record_group_state(g["id"], "manual_review_group_halted", reason=reason)
+        assert not journal.reactivate_stale_price_group(g["id"], {"another-position"})
+        assert journal.reactivate_stale_price_group(g["id"], {"p"}) is (broadcast != "bridge:0")
+        if broadcast != "bridge:0":
+            assert journal.position(p["id"])["state"] == "planned"
+            assert journal.group(g["id"])["state"] == "active"
+            assert journal.checkpoint(p["id"], "automatic_retry")["reason"] == reason
+            if broadcast:
+                assert journal.latest_step(position_id=p["id"], step_key=broadcast)["tx_hash"]
+
+
+def test_automatic_stale_price_failure_yields_and_retries_instead_of_halting(tmp_path):
+    from decimal import Decimal
+
+    from test_route_execution import ASSET_A, _entry
+
+    from evm_inventory.journal import Journal
+    from evm_inventory.route_execution import execute_group_entries
+
+    e = {**_entry(ASSET_A), "automatic_requote": True}
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        def stale(_):
+            raise ValueError("requote_required:stale_price")
+
+        result = execute_group_entries([e], journal=journal, max_route_loss_pct=Decimal("15"),
+                                      preflight=stale, submit_step=lambda *_: pytest.fail("send"))
+        assert result["deferred"] == 1
+        assert journal.group(result["group_id"])["state"] == "active"
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("skipped_sibling", [False, True])
+def test_collection_resumes_only_explicit_automatic_stale_price_groups(
+    tmp_path, automatic, skipped_sibling,
+):
+    from test_route_execution import ASSET_A, ASSET_B, _entry
+
+    from evm_inventory.collection import _resume_stale_price_groups
+    from evm_inventory.journal import Journal
+    from evm_inventory.route_execution import _position_key
+
+    path = tmp_path / "inventory.sqlite"
+    e = {**_entry(ASSET_A), "automatic_requote": automatic}
+    with Journal(path) as journal:
+        g = journal.get_or_create_group(group_key=e["group"]["key"], wallet=e["wallet"],
+            source_chain_id=10, source_usd="100", loss_budget_pct="15")
+        p = journal.get_or_create_position(position_key=_position_key(e), wallet=e["wallet"],
+                                          group_id=g["id"])
+        reason = "requote_required:stale_price"
+        journal.record_position_state(p["id"], "manual_review", reason=reason)
+        journal.record_group_state(g["id"], "manual_review_group_halted", reason=reason)
+    entries = [e]
+    if skipped_sibling:
+        entries.append({**_entry(ASSET_B), "status": "manual_review",
+                        "reason": "below_target_minimum", "automatic_requote": automatic})
+    _resume_stale_price_groups(entries, path)
+    with Journal(path) as journal:
+        assert journal.group(g["id"])["state"] == (
+            "active" if automatic else "manual_review_group_halted")
+        assert journal.position(p["id"])["state"] == ("planned" if automatic else "manual_review")
+        assert journal.group(g["id"])["source_usd"] == "100"
+        assert journal.group(g["id"])["loss_budget_pct"] == "15"
+
+
+@pytest.mark.parametrize("phase", ["intermediate", "after_swap"])
+@pytest.mark.parametrize("reason", ["stale_price", "missing_destination_price"])
+def test_dependent_requote_preserves_stale_price_failure(monkeypatch, phase, reason):
+    from types import SimpleNamespace
+
+    from test_live_plan import _quoted_route
+    from test_route_execution import ASSET_A, DEPOSIT, NOW, WALLET, _entry, _lifi_route
+
+    import evm_inventory.route_execution as execution
+    from evm_inventory.bitget_catalog import BitgetDepositTarget
+    from evm_inventory.lifi import TransactionRequest
+    from evm_inventory.live_plan import _route_data
+    from evm_inventory.models import AssetIdentity
+    from evm_inventory.valuation import FeeQuote, QuotePrice
+
+    planned = _lifi_route(route_id="planned", output_amount=910_000)
+    step = {"kind": "bridge", "route": _route_data(planned)}
+    e = {**_entry(ASSET_A, status="route_ready", steps=[step]), "automatic_requote": True}
+    monkeypatch.setattr(execution, "candidate_from_route", lambda *_a, **_kw:
+                        SimpleNamespace(is_valid=False, reason=reason))
+    client = SimpleNamespace(
+        routes=lambda request: (_quoted_route(request, route_id="live", output_amount=910_000,
+                                              gas_amount=10),),
+        step_transaction=lambda _: TransactionRequest(10, DEPOSIT, "0x", 0, 21_000, 1),
+    )
+    kwargs = dict(
+        wallet=SimpleNamespace(public_address=WALLET, bitget_deposit_address=DEPOSIT),
+        jumper=client, gas_estimator=SimpleNamespace(estimate_prepared_route=lambda **_:
+            (FeeQuote(10, QuotePrice(AssetIdentity(10, "native", 18), "2000", NOW)),)),
+        now_ms=lambda: int(NOW.timestamp() * 1000),
+        bitget=SimpleNamespace(revalidate_deposit_target=lambda *_a, **_kw:
+            BitgetDepositTarget("USDC", 8453, "0x" + "e" * 40, 1, "Base", 6)),
+    )
+    match = "requote_required:stale_price" if reason == "stale_price" else "eligible.*route"
+    with pytest.raises(ValueError, match=match):
+        if phase == "intermediate":
+            execution._requote_from_intermediate(e, AssetIdentity(10, ASSET_A, 6), 1_000_000,
+                                                rpc=object(), rpc_urls={}, **kwargs)
+        else:
+            execution._requote_bridge_after_swap(e, 1_000_000, **kwargs)
+
+
 def test_celo_erc20_direct_transfer_reserves_its_shared_native_balance(monkeypatch):
     from types import SimpleNamespace
 

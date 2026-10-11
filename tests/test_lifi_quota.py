@@ -10,7 +10,7 @@ def quota(tmp_path):
 
 def test_durable_window_reserve_and_execution(tmp_path):
     q, clock = quota(tmp_path)
-    for n in range(60):
+    for n in range(70):
         q.reserve_request("routes", str(n))
     with pytest.raises(LifiRequestLimit) as caught:
         q.reserve_request("routes", "blocked")
@@ -143,7 +143,7 @@ def test_provider_limit_smaller_than_planning_reserve_returns_wait(tmp_path):
 
 def test_local_retry_expires_enough_rows_and_step_reserve(tmp_path):
     q, clock = quota(tmp_path)
-    for n in range(38):
+    for n in range(48):
         q.reserve_request("steps", str(n), purpose="execution")
         clock[0] += 1
     with pytest.raises(LifiRequestLimit) as caught:
@@ -188,7 +188,7 @@ def test_429_diagnostics_use_shared_sanitizer(tmp_path, monkeypatch):
     assert "gateway" in evidence
 
 
-def test_provider_header_cannot_raise_conservative_local_ceiling(tmp_path):
+def test_provider_header_cannot_raise_published_local_ceiling(tmp_path):
     from evm_inventory.lifi_quota import LifiQuotaStore
 
     quota = LifiQuotaStore(tmp_path / "db.sqlite", "scope", clock=lambda: 1000.0)
@@ -198,7 +198,7 @@ def test_provider_header_cannot_raise_conservative_local_ceiling(tmp_path):
             "VALUES (?,?,?,?,?)",
             ("scope", "routes", 100, 2000, 100),
         )
-    for _ in range(60):
+    for _ in range(70):
         quota.reserve_request("routes", "key", purpose="planning")
     with pytest.raises(LifiRequestLimit):
         quota.reserve_request("routes", "key", purpose="planning")

@@ -435,6 +435,39 @@ class Journal:
         self.connection.commit()
         return True
 
+    def reactivate_stale_price_group(self, group_id: int, position_keys: set[str]) -> bool:
+        """Retry exact unsigned members after a legacy price-timestamp failure."""
+        reason = "requote_required:stale_price"
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            group = self.group(group_id)
+            rows = self.connection.execute(
+                "SELECT id,position_key,state,reason FROM route_positions WHERE group_id=?",
+                (group_id,),
+            ).fetchall()
+            if (group["state"] != "manual_review_group_halted" or group["reason"] != reason
+                    or not rows or {r["position_key"] for r in rows} != position_keys
+                    or any(r["state"] not in {"manual_review", "manual_review_group_halted"}
+                           or r["reason"] != reason or self.has_asset_broadcast(r["id"])
+                           for r in rows)):
+                return False
+            for row in rows:
+                self.connection.execute(
+                    "INSERT INTO route_checkpoints VALUES (?, 'automatic_retry', ?) "
+                    "ON CONFLICT(position_id,checkpoint_key) DO UPDATE SET "
+                    "payload_json=excluded.payload_json",
+                    (row["id"], json.dumps({"reason": reason, "recovered_from": group["state"]})),
+                )
+            self.connection.execute(
+                "UPDATE route_positions SET state='planned',reason=NULL,"
+                "updated_at=CURRENT_TIMESTAMP WHERE group_id=?", (group_id,),
+            )
+            self.connection.execute(
+                "UPDATE route_groups SET state='active',reason=NULL,"
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?", (group_id,),
+            )
+        return True
+
     def record_group_projection(
         self, group_id: int, *, projected_loss_usd: str, projected_loss_pct: str
     ) -> None:
