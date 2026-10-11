@@ -836,6 +836,30 @@ class Journal:
             "AND step_key NOT LIKE 'approval:%' LIMIT 1", (position_id,)
         ).fetchone() is not None
 
+    def has_confirmed_defi_exit(self, position_id: int) -> bool:
+        """Identify a mined local DeFi exit eligible for live finality checks.
+
+        Older DeFi execution records receipts without advancing the parent
+        position from planned. Its output review remains separate from a fresh
+        RPC scan; pending exits and every bridge still block a new collection.
+        """
+        position = self.position(position_id)
+        if not position["position_key"].startswith("defi:"):
+            return False
+        steps = self.connection.execute(
+            "SELECT step_key,tx_hash,state,receipt_status,finality_block FROM route_steps "
+            "WHERE position_id=?", (position_id,)
+        ).fetchall()
+        return any(step["step_key"] == "defi_withdraw" for step in steps) and all(
+            (step["step_key"] == "defi_withdraw" or step["step_key"].startswith("approval:"))
+            and step["tx_hash"] is not None
+            and step["state"] == "confirmed"
+            and step["receipt_status"] == "confirmed"
+            and step["finality_block"] is not None
+            and step["finality_block"] > 0
+            for step in steps
+        )
+
     def record_step_state(self, step_id: int, state: str) -> None:
         self._transition_step(step_id, state)
         self.connection.commit()

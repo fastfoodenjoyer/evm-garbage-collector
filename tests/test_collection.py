@@ -7,6 +7,50 @@ from evm_inventory.journal import Journal
 from evm_inventory.route_execution import _position_key
 
 
+@pytest.mark.parametrize("finalized", [99, 100])
+def test_confirmed_defi_exit_requires_live_finalized_receipt(tmp_path, finalized):
+    from types import SimpleNamespace
+
+    from evm_inventory.collection import verify_prior_defi_exit
+    from evm_inventory.store import Store
+
+    path = tmp_path / "inventory.sqlite"
+    wallet, action = entry()["wallet"], "old-action"
+    with Store(path) as store:
+        with store.db:
+            store.db.execute("INSERT INTO defi_plans VALUES ('old-plan',1,'{}',1)")
+            store.db.execute(
+                "INSERT INTO defi_positions VALUES ('old-plan',1,?,10,'p','pool',"
+                "'ready',NULL,?,'{}')",
+                (wallet, action),
+            )
+    with Journal(path) as journal:
+        p = journal.get_or_create_position(position_key=f"defi:{wallet}:{action}", wallet=wallet)
+        step = journal.record_step_intent(
+            position_id=p["id"],
+            step_key="defi_withdraw",
+            nonce=48,
+            calldata_digest="a" * 64,
+            signed_payload_digest="b" * 64,
+        )
+        tx_hash = "0x" + "c" * 64
+        journal.record_broadcast_attempt(step["id"], tx_hash)
+        journal.record_receipt(step["id"], status="confirmed", finality_block=100)
+
+        def call(_, method, params):
+            if method == "eth_chainId":
+                return "0xa"
+            if method == "eth_getBlockByNumber":
+                assert params == ["finalized", False]
+                return {"number": hex(finalized)}
+            assert method == "eth_getTransactionReceipt" and params == [tx_hash]
+            return {"status": "0x1", "blockNumber": "0x64", "transactionHash": tx_hash}
+
+        assert verify_prior_defi_exit(
+            journal, p["id"], {10: "rpc"}, rpc=SimpleNamespace(call=call)
+        ) is (finalized >= 100)
+
+
 def entry(chain=10):
     return dict(
         wallet="0x" + "a" * 40,
@@ -152,8 +196,9 @@ def test_planning_waits_for_quota_and_only_retries_unresolved_network(tmp_path):
 
 @pytest.mark.parametrize("resume_after_crash", [False, True])
 @pytest.mark.parametrize("include_skip", [False, True])
+@pytest.mark.parametrize("prior_defi", [None, "confirmed", "pending", "confirmed_route"])
 def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_send(
-    tmp_path, monkeypatch, capsys, resume_after_crash, include_skip
+    tmp_path, monkeypatch, capsys, resume_after_crash, include_skip, prior_defi
 ):
     from openpyxl import load_workbook
 
@@ -168,6 +213,45 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
     book["Wallets"].append([3, entry()["wallet"], "0x" + "1" * 64, "0x" + "d" * 40])
     book.save(workbook)
     path, output = tmp_path / "inventory.sqlite", tmp_path / "result"
+    if prior_defi:
+        with Store(path) as store:
+            with store.db:
+                store.db.execute("INSERT INTO defi_plans VALUES ('old-plan',1,'{}',1)")
+                store.db.execute(
+                    "INSERT INTO defi_positions VALUES ('old-plan',1,?,10,'p','pool',"
+                    "'ready',NULL,'old-action','{}')",
+                    (entry()["wallet"],),
+                )
+        with Journal(path) as journal:
+            p = journal.get_or_create_position(
+                position_key=f"{'external' if prior_defi == 'confirmed_route' else 'defi'}:"
+                f"{entry()['wallet']}:old-action",
+                wallet=entry()["wallet"],
+            )
+            step = journal.record_step_intent(
+                position_id=p["id"],
+                step_key="bridge" if prior_defi == "confirmed_route" else "defi_withdraw",
+                nonce=48,
+                calldata_digest="a" * 64,
+                signed_payload_digest="b" * 64,
+            )
+            journal.record_broadcast_attempt(step["id"], "0x" + "c" * 64)
+            if prior_defi.startswith("confirmed"):
+                journal.record_receipt(step["id"], status="confirmed", finality_block=100)
+        from types import SimpleNamespace
+
+        def prior_rpc(_, method, params):
+            if method == "eth_chainId":
+                return "0xa"
+            if method == "eth_getBlockByNumber":
+                assert params == ["finalized", False]
+                return {"number": "0x100"}
+            assert method == "eth_getTransactionReceipt"
+            return {"status": "0x1", "blockNumber": "0x64", "transactionHash": params[0]}
+
+        monkeypatch.setattr(
+            "evm_inventory.collection.ExecutionRpc", lambda _: SimpleNamespace(call=prior_rpc)
+        )
     clock = [1000.0]
     calls = dict(scan=0, quote=0, execute=0, send=0)
 
@@ -251,6 +335,11 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
         "--execute",
     ]
     first = main([*args, "--trust-deposit-addresses"])
+    if prior_defi in {"pending", "confirmed_route"}:
+        assert first == 2
+        assert calls == dict(scan=0, quote=0, execute=0, send=0)
+        assert "unresolved_wallet_execution" in capsys.readouterr().err
+        return
     if resume_after_crash:
         assert first == 4
         capsys.readouterr()

@@ -13,12 +13,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from .config import add_allowlisted_tokens, snapshot
+from .executor import ExecutionRpc
 from .journal import Journal
 from .live_plan import create_live_plan
 from .planner_gas import PlannerGasEstimator
 from .report import export_current
 from .route_execution import _position_key, execute_entries
-from .rpc import RpcReader
+from .rpc import RpcReader, quantity
 from .scanner import scan
 from .stages import Deadline, StageDeadlineExceeded, deadline_scope
 from .store import Store
@@ -43,6 +44,46 @@ _PERMANENT_REASONS = {
     "conflicting_native_balance",
     "missing_deposit_address",
 }
+
+
+def verify_prior_defi_exit(journal, position_id, rpc_urls, *, rpc=None):
+    """Exclude only local exits whose exact receipts are finalized on their source chain."""
+    if not journal.has_confirmed_defi_exit(position_id):
+        return False
+    position = journal.position(position_id)
+    action_id = position["position_key"].rsplit(":", 1)[1]
+    chains = journal.connection.execute(
+        "SELECT DISTINCT chain_id FROM defi_positions WHERE wallet=? AND action_id=?",
+        (position["wallet"], action_id),
+    ).fetchall()
+    if len(chains) != 1 or chains[0][0] not in rpc_urls:
+        return False
+    chain_id = chains[0][0]
+    url = rpc_urls[chain_id]
+    transport = Transport(interval=0) if rpc is None else None
+    rpc = rpc or ExecutionRpc(transport)
+    try:
+        if quantity(rpc.call(url, "eth_chainId", [])) != chain_id:
+            return False
+        finalized = rpc.call(url, "eth_getBlockByNumber", ["finalized", False])
+        if not isinstance(finalized, dict):
+            return False
+        height = quantity(finalized["number"])
+        for step in journal.connection.execute(
+            "SELECT tx_hash FROM route_steps WHERE position_id=?", (position_id,)
+        ):
+            receipt = rpc.call(url, "eth_getTransactionReceipt", [step["tx_hash"]])
+            if (
+                not isinstance(receipt, dict)
+                or str(receipt.get("transactionHash", "")).lower() != step["tx_hash"].lower()
+                or quantity(receipt.get("status")) != 1
+                or quantity(receipt.get("blockNumber")) > height
+            ):
+                return False
+        return True
+    finally:
+        if transport is not None:
+            transport.close()
 
 
 def _unresolved(entry):
@@ -412,12 +453,16 @@ def collect_wallets(
             )
             with Journal(db_path) as journal:
                 outstanding = journal.connection.execute(
-                    "SELECT DISTINCT p.position_key FROM route_positions p JOIN route_steps s "
+                    "SELECT DISTINCT p.id,p.position_key FROM route_positions p JOIN route_steps s "
                     "ON s.position_id=p.id WHERE p.wallet=? AND p.state<>'completed' "
                     "AND s.tx_hash IS NOT NULL",
                     (row.public_address.lower(),),
                 ).fetchall()
-            foreign = [p[0] for p in outstanding if p[0] not in known_keys]
+                foreign = [
+                    p["position_key"] for p in outstanding
+                    if p["position_key"] not in known_keys
+                    and not verify_prior_defi_exit(journal, p["id"], rpc_urls)
+                ]
             if foreign:
                 raise ValueError(
                     "unresolved_wallet_execution: resume the existing saved plan "
