@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import httpx
@@ -7,6 +8,152 @@ import pytest
 from evm_inventory.lifi_http import LifiHttpClient
 from evm_inventory.runbook import create_route_plan
 from evm_inventory.stages import Deadline, deadline_scope, request_timeout
+
+
+def test_celo_erc20_direct_transfer_reserves_its_shared_native_balance(monkeypatch):
+    from types import SimpleNamespace
+
+    import evm_inventory.route_execution as execution
+    from evm_inventory.celo import CELO_TOKEN_ADDRESS
+    from evm_inventory.lifi import TransactionRequest
+
+    wallet = SimpleNamespace(public_address="0x" + "1" * 40,
+                             bitget_deposit_address="0x" + "2" * 40)
+    entry = {"chain_id": 42220, "asset_id": CELO_TOKEN_ADDRESS, "decimals": 18,
+             "raw_balance": "1000", "status": "direct_deposit",
+             "target": {"minimum_raw": "1"}}
+    monkeypatch.setattr(execution, "_native_balance", lambda *_, **__: 1000)
+    monkeypatch.setattr(execution, "FeePlanner", lambda _: SimpleNamespace(
+        plan=lambda _, request, **__: TransactionRequest(
+            request.chain_id, request.to, request.data, 0, 10, 1)))
+    tx = execution._direct_request(entry, wallet=wallet, rpc=object(), url="rpc")
+    assert tx.to == CELO_TOKEN_ADDRESS and tx.value == 0
+    assert int(tx.data[-64:], 16) == 970
+    assert tx.max_total_fee_wei == 10
+
+
+def test_reverted_celo_recovery_uses_separate_step_and_observes_retry_on_resume(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import evm_inventory.route_execution as execution
+    from evm_inventory.celo import CELO_TOKEN_ADDRESS
+    from evm_inventory.journal import Journal
+    from evm_inventory.lifi import TransactionRequest
+
+    wallet = SimpleNamespace(public_address="0x" + "1" * 40,
+                             bitget_deposit_address="0x" + "2" * 40)
+    old_hash, new_hash = "0x" + "a"*64, "0x" + "b"*64
+    sends = []
+    rpc = SimpleNamespace(call=lambda _, method, params: {
+        "status": "0x0" if params[0] == old_hash else "0x1"})
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        p = journal.get_or_create_position(position_key="celo", wallet=wallet.public_address)
+        old = journal.record_step_intent(position_id=p["id"], step_key="direct_deposit", nonce=15,
+            calldata_digest="c"*64, signed_payload_digest="d"*64)
+        journal.record_broadcast_attempt(old["id"], old_hash)
+        entry = {"chain_id": 42220, "asset_id": CELO_TOKEN_ADDRESS, "status": "direct_deposit",
+                 "automatic_requote": True, "decimals": 18,
+                 "_journal_position_id": p["id"], "valuation": {"loss_usd": "1"},
+                 "target": {"coin": "CELO", "chain": "CELO", "minimum_raw": "1"}}
+        def recover(**kw):
+            assert kw["saved"]["tx_hash"] == old_hash
+            journal.record_receipt(old["id"], status="reverted", finality_block=10)
+            fresh = {**entry, "_journal_step_key": "direct_deposit:recovery1",
+                     "_direct_transaction": TransactionRequest(42220, CELO_TOKEN_ADDRESS,
+                                                               "0x", 0, 10, 1)}
+            journal.save_checkpoint(p["id"], "direct_recovery", {
+                "step_key": "direct_deposit:recovery1", "failed_tx_hash": old_hash})
+            return fresh
+        def send(**kw):
+            sends.append(kw["entry"]["_journal_step_key"])
+            step = journal.record_step_intent(position_id=p["id"], step_key=sends[-1], nonce=16,
+                calldata_digest="e"*64, signed_payload_digest="f"*64)
+            journal.record_broadcast_attempt(step["id"], new_hash)
+            return new_hash
+        monkeypatch.setattr(execution, "_recover_reverted_celo_direct", recover)
+        monkeypatch.setattr(execution, "_execute_entry", send)
+        bitget = SimpleNamespace(wait_for_deposit_seen=lambda **kw: "success"
+                                 if kw["tx_hash"] == new_hash else None)
+        kwargs = dict(wallet=wallet, rpc=rpc, rpc_urls={42220: "rpc"}, jumper=object(),
+                      bitget=bitget, journal=journal, now_ms=lambda: 1000)
+        with deadline_scope(Deadline(30)):
+            assert execution._submit_live_step(entry, {"kind": "direct_deposit"}, **kwargs)[
+                "state"] == "completed"
+            assert execution._submit_live_step(entry, {"kind": "direct_deposit"}, **kwargs)[
+                "state"] == "completed"
+        assert sends == ["direct_deposit:recovery1"]
+        assert journal.step(old["id"])["state"] == "reverted"
+
+
+@pytest.mark.parametrize("finalized,loss,allowed", [(9, "1", False), (10, "1", True),
+                                                    (10, "16", False)])
+def test_failed_celo_full_balance_transfer_retry_requires_finality_and_original_loss_budget(
+    tmp_path, monkeypatch, finalized, loss, allowed
+):
+    from types import SimpleNamespace
+
+    from test_route_execution import NOW
+
+    import evm_inventory.route_execution as execution
+    from evm_inventory.celo import CELO_TOKEN_ADDRESS
+    from evm_inventory.journal import Journal
+    from evm_inventory.lifi import LifiPriceEvidence, TransactionRequest
+    from evm_inventory.stages import StageDeadlineExceeded
+
+    wallet = SimpleNamespace(public_address="0x" + "1" * 40,
+                             bitget_deposit_address="0x" + "2" * 40)
+    data = "0xa9059cbb" + wallet.bitget_deposit_address[2:].rjust(64, "0") + f"{1000:064x}"
+    original = TransactionRequest(42220, CELO_TOKEN_ADDRESS, data, 0, 10, 1)
+    entry = {"wallet": wallet.public_address, "chain_id": 42220,
+             "asset_id": CELO_TOKEN_ADDRESS, "decimals": 18, "raw_balance": "1000",
+             "automatic_requote": True, "_direct_transaction": original}
+    tx_hash = "0x" + "a" * 64
+    receipt = {"transactionHash": tx_hash, "from": wallet.public_address,
+               "to": CELO_TOKEN_ADDRESS, "status": "0x0", "blockNumber": "0xa",
+               "gasUsed": "0xa", "effectiveGasPrice": "0x1"}
+    def call(_, method, params):
+        if method == "eth_chainId":
+            return hex(42220)
+        if method == "eth_getBlockByNumber":
+            assert params == ["finalized", False]
+            return {"number": hex(finalized)}
+        assert method == "eth_getBalance" and params == [wallet.public_address, "0x9"]
+        return hex(1000)
+    rpc = SimpleNamespace(call=call)
+    jumper = SimpleNamespace(
+        token_price=lambda asset: LifiPriceEvidence(asset, "1", NOW.isoformat()))
+    monkeypatch.setattr(execution, "_preflight_live_entry", lambda e, **_: {
+        **e, "valuation": {"loss_usd": loss},
+        "_direct_transaction": TransactionRequest(42220, CELO_TOKEN_ADDRESS,
+            data[:-64] + f"{970:064x}", 0, 10, 1),
+    })
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        group = journal.get_or_create_group(group_key="celo", wallet=wallet.public_address,
+            source_chain_id=42220, loss_budget_pct="15", source_usd="100")
+        position = journal.get_or_create_position(position_key="celo", wallet=wallet.public_address,
+            group_id=group["id"], source_asset_id=CELO_TOKEN_ADDRESS, source_amount_raw="1000")
+        step = journal.record_step_intent(position_id=position["id"], step_key="direct_deposit",
+            nonce=15, calldata_digest=sha256(data.encode()).hexdigest(),
+            signed_payload_digest="b"*64)
+        journal.record_broadcast_attempt(step["id"], tx_hash)
+        step = journal.step(step["id"])
+        kwargs = dict(entry=entry, saved=step, receipt=receipt, position_id=position["id"],
+                      wallet=wallet, rpc=rpc, rpc_urls={42220: "rpc"}, jumper=jumper,
+                      bitget=object(), journal=journal, now_ms=lambda: int(NOW.timestamp()*1000))
+        if allowed:
+            fresh = execution._recover_reverted_celo_direct(**kwargs)
+            assert fresh["_journal_step_key"] == "direct_deposit:recovery1"
+            assert journal.step(step["id"])["state"] == "reverted"
+            proof = journal.checkpoint(position["id"], "direct_recovery")
+            assert proof["failed_tx_hash"] == tx_hash
+            assert int(fresh["_direct_transaction"].data[-64:], 16) == 970
+        else:
+            with pytest.raises((StageDeadlineExceeded, execution.GroupLossLimitExceeded)):
+                execution._recover_reverted_celo_direct(**kwargs)
+            assert journal.step(step["id"])["state"] == "submitted"
+            assert journal.checkpoint(position["id"], "direct_recovery") is None
 
 
 @pytest.mark.parametrize(

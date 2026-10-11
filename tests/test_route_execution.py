@@ -1275,6 +1275,8 @@ def test_direct_preflight_refreshes_balance_target_and_gas_without_route_quote()
                 return "0x3b9aca00"
             if method == "eth_estimateGas":
                 return "0x5208"
+            if method == "eth_getBlockByNumber":
+                return {"number": "0xa"}
             raise AssertionError(method)
 
     class Prices:
@@ -1329,6 +1331,10 @@ def test_direct_preflight_refreshes_balance_target_and_gas_without_route_quote()
     assert fresh["steps"][0]["kind"] == "direct_deposit"
     assert fresh["_direct_transaction"].data.startswith("0xa9059cbb")
     assert fresh["_candidate"].is_valid
+    assert fresh["_direct_transaction"].gas_limit == 25201
+    assert fresh["_direct_transaction"].max_total_fee_cap_wei == (
+        fresh["_direct_transaction"].max_total_fee_wei)
+    assert Decimal(fresh["valuation"]["loss_usd"]) > 0
     assert prices.route_requests == 0
 
 

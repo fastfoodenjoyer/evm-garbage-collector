@@ -1,6 +1,9 @@
 from dataclasses import replace
 
 import pytest
+import rlp
+from eth_abi import decode
+from eth_utils import function_signature_to_4byte_selector
 
 from evm_inventory.fee_planner import FeePlanner, FeePolicy
 from evm_inventory.lifi import TransactionRequest
@@ -93,6 +96,21 @@ def test_plans_legacy_price_when_block_has_no_base_fee():
     assert planned.gas_price_wei == 20
     assert planned.max_fee_per_gas_wei is None
     assert planned.max_total_fee_wei == 25_201 * 20 + 1
+
+
+@pytest.mark.parametrize("chain_id", [56, 1116])
+def test_zero_base_fee_network_uses_live_legacy_gas_price(chain_id):
+    rpc = StubRpc({"eth_estimateGas": "0x5208",
+                   "eth_getBlockByNumber": {"number": "0xa", "baseFeePerGas": "0x0"},
+                   "eth_gasPrice": "0x2faf080"})
+    request = TransactionRequest(chain_id, "0x" + "1" * 40, "0x", 0, 0, 0)
+    planned = FeePlanner(rpc).plan("https://rpc", request, sender="0x" + "2" * 40)
+    assert planned.gas_price_wei == 50_000_000
+    assert planned.max_fee_per_gas_wei is None
+    assert planned.max_total_fee_wei == 25_201 * 50_000_000
+    assert planned.fee_quote_fallback_reason == "zero_base_fee"
+    assert [call[1] for call in rpc.calls] == [
+        "eth_estimateGas", "eth_getBlockByNumber", "eth_gasPrice"]
 
 
 def test_eip1559_rpc_gap_falls_back_to_legacy_fee_quote():
@@ -199,3 +217,62 @@ def test_fee_cap_checks_execution_and_op_l1_fee_components_together():
         )
 
     assert f"estimated_total_fee_wei={execution_fee + 1000}" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("base_fee", [None, "0x64"])
+def test_scroll_l1_fee_uses_complete_signed_size_bound_even_for_zero_value_probe(base_fee):
+    header = {"number": "0xa"}
+    if base_fee is not None:
+        header["baseFeePerGas"] = base_fee
+    rpc = StubRpc({"eth_estimateGas": "0x5208", "eth_getBlockByNumber": header,
+                   "eth_gasPrice": "0x2", "eth_feeHistory": {"reward": [["0x5"]]},
+                   "eth_call": "0x" + f"{1000:064x}"})
+    request = TransactionRequest(534352, "0x" + "1" * 40, "0x", 0, 0, 0)
+    planned = FeePlanner(rpc).plan("rpc", request, sender="0x" + "2" * 40)
+    assert planned.additional_fee_wei == 1200
+    assert planned.fee_quote_method.endswith("+scroll_l1_fee_size_bound")
+    call = rpc.calls[-1][2][0]
+    assert call["to"] == "0x5300000000000000000000000000000000000002"
+    encoded = bytes.fromhex(call["data"][2:])
+    assert encoded[:4] == function_signature_to_4byte_selector("getL1Fee(bytes)")
+    payload = decode(["bytes"], encoded[4:])[0]
+    fields = rlp.decode(payload[1:] if base_fee else payload)
+    assert len(fields) == (12 if base_fee else 9)
+    assert len(fields[6 if base_fee else 4]) == 32
+    assert len(fields[-1]) == len(fields[-2]) == 32
+    assert planned.max_total_fee_wei == planned.gas_limit * (
+        planned.max_fee_per_gas_wei or planned.gas_price_wei) + 1200
+
+
+def test_scroll_l1_fee_oracle_failure_prevents_signing_incomplete_fee_quote():
+    rpc = StubRpc({"eth_estimateGas": "0x5208",
+                   "eth_getBlockByNumber": {"number": "0xa"}, "eth_gasPrice": "0x2",
+                   "eth_call": RuntimeError("offline")})
+    with pytest.raises(ValueError, match="scroll_l1_fee_estimation_failed"):
+        FeePlanner(rpc).plan("rpc", replace(_request(), chain_id=534352),
+                             sender="0x" + "2" * 40)
+
+
+def test_replacement_quote_bumps_both_fee_fields_before_calculating_l1_fee():
+    rpc = StubRpc({"eth_estimateGas": "0x5208",
+                   "eth_getBlockByNumber": {"number": "0xa", "baseFeePerGas": "0x64"},
+                   "eth_feeHistory": {"reward": [["0x5"]]}, "eth_call": f"0x{1000:064x}"})
+    old = TransactionRequest(534352, "0x" + "1" * 40, "0x", 0, 25201, None,
+                             max_fee_per_gas_wei=500, max_priority_fee_per_gas_wei=100)
+    planned = FeePlanner(rpc).plan("rpc", old, sender="0x" + "2" * 40, replacement_for=old)
+    assert planned.max_fee_per_gas_wei == 563
+    assert planned.max_priority_fee_per_gas_wei == 113
+    payload = decode(["bytes"], bytes.fromhex(rpc.calls[-1][2][0]["data"][10:]))[0]
+    fields = rlp.decode(payload[1:])
+    assert int.from_bytes(fields[3], "big") == 563
+    assert int.from_bytes(fields[2], "big") == 113
+
+
+def test_legacy_to_eip1559_replacement_raises_tip_above_old_gas_price():
+    rpc = StubRpc({"eth_estimateGas": "0x5208",
+                   "eth_getBlockByNumber": {"number": "0xa", "baseFeePerGas": "0x64"},
+                   "eth_feeHistory": {"reward": [["0x5"]]}, "eth_call": f"0x{1000:064x}"})
+    old = TransactionRequest(534352, "0x" + "1" * 40, "0x", 0, 25201, 500)
+    planned = FeePlanner(rpc).plan("rpc", old, sender="0x" + "2" * 40, replacement_for=old)
+    assert planned.max_fee_per_gas_wei == 563
+    assert planned.max_priority_fee_per_gas_wei == 563

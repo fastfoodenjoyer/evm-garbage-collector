@@ -107,6 +107,7 @@ class FeePlanner:
         *,
         sender: str,
         max_total_fee_wei: int | None = None,
+        replacement_for: TransactionRequest | None = None,
     ) -> TransactionRequest:
         if not sender.startswith("0x") or len(sender) != 42:
             raise ValueError("invalid_fee_sender")
@@ -148,8 +149,19 @@ class FeePlanner:
         except Exception as exc:
             raise ValueError("invalid_latest_block_number_for_fee_quote") from exc
         base_fee_value = header.get("baseFeePerGas")
-        if base_fee_value is None:
+        base_fee = None
+        if base_fee_value is not None:
+            try:
+                base_fee = quantity(base_fee_value)
+            except StageDeadlineExceeded:
+                raise
+            except Exception as exc:
+                raise ValueError("invalid_latest_base_fee") from exc
+        if base_fee is None or base_fee == 0:
             gas_price = self._legacy_price(url)
+            if replacement_for is not None:
+                gas_price = max(gas_price, _replacement_fee_floor(
+                    replacement_for.maximum_fee_per_gas_wei))
             additional_fee = self._op_stack_l1_fee(
                 url,
                 request,
@@ -168,20 +180,14 @@ class FeePlanner:
                 gas_estimate=estimate,
                 fee_quote_block_number=quote_block_number,
                 fee_quote_method=(
-                    "eth_gasPrice+op_l1_fee_upper_bound" if additional_fee else "eth_gasPrice"
+                    "eth_gasPrice" + self._l1_fee_suffix(request.chain_id)
+                    if additional_fee else "eth_gasPrice"
                 ),
+                base_fee_per_gas_wei=base_fee,
+                fee_quote_fallback_reason="zero_base_fee" if base_fee == 0 else None,
                 max_total_fee_cap_wei=fee_cap,
             )
             return self._check_fee_cap(planned)
-        try:
-            base_fee = quantity(base_fee_value)
-        except StageDeadlineExceeded:
-            raise
-        except Exception as exc:
-            raise ValueError("invalid_latest_base_fee") from exc
-        if base_fee <= 0:
-            raise ValueError("invalid_latest_base_fee")
-
         priority_fee, source, fallback_reason = self._priority_fee(url)
         if request.chain_id == 1:
             max_fee = (base_fee * 13 + 9) // 10
@@ -197,6 +203,16 @@ class FeePlanner:
                 projected_base_fee = (projected_base_fee * 9 + 7) // 8
             max_fee = projected_base_fee + priority_fee
             eip1559 = True
+        if replacement_for is not None:
+            max_fee = max(max_fee, _replacement_fee_floor(
+                replacement_for.maximum_fee_per_gas_wei))
+            if eip1559:
+                old_tip = (replacement_for.max_priority_fee_per_gas_wei
+                           if replacement_for.max_priority_fee_per_gas_wei is not None
+                           else replacement_for.gas_price_wei or 0)
+                priority_fee = max(priority_fee, _replacement_fee_floor(
+                    old_tip))
+                max_fee = max(max_fee, priority_fee)
         additional_fee = self._op_stack_l1_fee(
             url,
             request,
@@ -206,7 +222,7 @@ class FeePlanner:
             eip1559=eip1559,
         )
         if additional_fee:
-            source = f"{source}+op_l1_fee_upper_bound"
+            source += self._l1_fee_suffix(request.chain_id)
         planned = replace(
             request,
             gas_limit=gas_limit,
@@ -233,6 +249,24 @@ class FeePlanner:
         priority_fee_per_gas: int,
         eip1559: bool,
     ) -> int:
+        if request.chain_id == 534352:
+            payload = _scroll_transaction_size_bound(
+                request, gas_limit=gas_limit, eip1559=eip1559,
+                max_fee_per_gas=max_fee_per_gas, priority_fee_per_gas=priority_fee_per_gas,
+            )
+            selector = function_signature_to_4byte_selector("getL1Fee(bytes)")
+            try:
+                fee = uint256(self.rpc.call(url, "eth_call", [{
+                    "to": "0x5300000000000000000000000000000000000002",
+                    "data": "0x" + (selector + encode(["bytes"], [payload])).hex(),
+                }, "latest"]))
+                if fee <= 0:
+                    raise ValueError("empty_result")
+                return (fee * 12 + 9) // 10
+            except StageDeadlineExceeded:
+                raise
+            except Exception as exc:
+                raise ValueError(f"scroll_l1_fee_estimation_failed:{type(exc).__name__}") from exc
         if request.chain_id not in _OP_STACK_CHAIN_IDS:
             return 0
         unsigned = _unsigned_transaction_payload(
@@ -288,6 +322,10 @@ class FeePlanner:
         except Exception as exc:
             raise ValueError(f"op_stack_l1_fee_estimation_failed:{type(exc).__name__}") from exc
         raise ValueError("op_stack_l1_fee_estimation_failed:empty_result")
+
+    @staticmethod
+    def _l1_fee_suffix(chain_id: int) -> str:
+        return "+scroll_l1_fee_size_bound" if chain_id == 534352 else "+op_l1_fee_upper_bound"
 
     @staticmethod
     def _check_fee_cap(request: TransactionRequest) -> TransactionRequest:
@@ -373,6 +411,10 @@ def _rpc_failure_detail(exc: Exception) -> str:
     return json.dumps(detail, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _replacement_fee_floor(previous: int) -> int:
+    return max(1, (previous * 9 + 7) // 8)
+
+
 def _unsigned_transaction_payload(
     request: TransactionRequest,
     *,
@@ -415,4 +457,24 @@ def _unsigned_transaction_payload(
         b"",
         b"",
     ]
+    return rlp.encode(fields)
+
+
+def _scroll_transaction_size_bound(request: TransactionRequest, **kwargs) -> bytes:
+    """Quote the signed RLP envelope, including a full-width sweep value/signature.
+
+    This payload is only input to the fee oracle; it is never signed or broadcast.
+    Scroll's oracle uses complete signed size, unlike the OP unsigned helper.
+    """
+    unsigned = _unsigned_transaction_payload(request, **kwargs)
+    signature_word = b"\xff" * 32
+    if kwargs["eip1559"]:
+        fields = rlp.decode(unsigned[1:])
+        fields[6] = signature_word
+        return b"\x02" + rlp.encode(fields + [b"\x01", signature_word, signature_word])
+    fields = rlp.decode(unsigned)
+    fields[4] = signature_word
+    v = request.chain_id * 2 + 36
+    fields[-3:] = [v.to_bytes((v.bit_length() + 7) // 8, "big"),
+                   signature_word, signature_word]
     return rlp.encode(fields)

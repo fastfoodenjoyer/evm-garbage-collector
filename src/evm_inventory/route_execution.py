@@ -20,6 +20,7 @@ import httpx
 
 from .bitget import BitgetClient
 from .bitget_catalog import BitgetDepositTarget
+from .celo import CELO_CHAIN_ID, CELO_TOKEN_ADDRESS
 from .consolidation import (
     candidate_from_route,
     candidate_from_values,
@@ -111,7 +112,8 @@ class _DepositBackground:
         if position_id in self.watches:
             return
         position = self.journal.position(position_id)
-        step = self.journal.latest_step(position_id=position_id, step_key="direct_deposit")
+        step = self.journal.latest_step(
+            position_id=position_id, step_key=_direct_step_key(self.journal, position_id))
         if step is None or not step["tx_hash"]:
             raise ValueError("seen deposit has no durable transaction hash")
         started_ms = (
@@ -601,7 +603,7 @@ def execute_group_entries(
                     journal.record_position_state(position_id, "completed")
                     counts["completed"] += 1
                     continue
-                except (DepositNotSeen, DepositSettlementFailed) as exc:
+                except (DepositNotSeen, DepositSettlementFailed, GroupLossLimitExceeded) as exc:
                     reason = _execution_reason(exc)
                     journal.record_position_state(position_id, "manual_review", reason=reason)
                     counts["manual_review"] += 1
@@ -1560,6 +1562,12 @@ def _preflight_live_entry(
             raise ValueError("requote_required:insufficient_spendable_balance")
         fresh = {**entry, "raw_balance": str(balance)}
         request = _direct_request(fresh, wallet=wallet, rpc=rpc, url=url)
+        if request.gas_limit <= 0:
+            request = FeePlanner(rpc).plan(url, request, sender=wallet.public_address)
+        request = replace(request, max_total_fee_cap_wei=request.max_total_fee_wei)
+        if _is_celo_erc20(asset):
+            balance = int(request.data[-64:], 16)
+            fresh["raw_balance"] = str(balance)
         if request.value < target.minimum_raw and asset.is_native:
             raise ValueError("requote_required:below_target_minimum")
         if balance < target.minimum_raw and not asset.is_native:
@@ -2351,7 +2359,54 @@ def _submit_live_step(
     position_id = int(entry["_journal_position_id"])
     if step.get("kind") == "direct_deposit":
         journal.save_checkpoint(position_id, "direct_prepared", entry)
-        saved = journal.latest_step(position_id=position_id, step_key="direct_deposit")
+        recovery = journal.checkpoint(position_id, "direct_recovery")
+        step_key = _direct_step_key(journal, position_id)
+        if recovery:
+            entry = {**entry, "_journal_step_key": step_key, "_observation_restore": True}
+        if recovery and recovery.get("kind") == "scroll_l1_fee":
+            original_receipt = rpc.call(_rpc_url(rpc_urls, int(entry["chain_id"])),
+                "eth_getTransactionReceipt", [recovery["failed_tx_hash"]])
+            if isinstance(original_receipt, dict):
+                if quantity(original_receipt.get("status")) != 1:
+                    raise DepositSettlementFailed("original_replacement_transaction_reverted")
+                recovery["winner_step_key"] = "direct_deposit"
+                journal.save_checkpoint(position_id, "direct_recovery", recovery)
+                entry = {**recovery["original_entry"], "_journal_position_id": position_id}
+                step_key = "direct_deposit"
+            else:
+                entry.update(
+                    _replacement_nonce=recovery["replacement_nonce"],
+                    _replacement_original_request=recovery["original_entry"]["_direct_transaction"],
+                    _actual_balance_raw=str(recovery["original_entry"]["_direct_transaction"].value),
+                )
+        saved = journal.latest_step(position_id=position_id, step_key=step_key)
+        if (saved and saved["tx_hash"] and not recovery and entry.get("automatic_requote")
+                and entry.get("chain_id") == 534352 and entry.get("asset_id") == "native"):
+            receipt = rpc.call(_rpc_url(rpc_urls, 534352),
+                               "eth_getTransactionReceipt", [saved["tx_hash"]])
+            if receipt is None:
+                replacement = _recover_missing_scroll_direct(
+                    entry=entry, saved=saved, position_id=position_id, wallet=wallet,
+                    rpc=rpc, rpc_urls=rpc_urls, jumper=jumper, bitget=bitget,
+                    journal=journal, now_ms=now_ms,
+                )
+                if replacement is not None:
+                    entry = replacement
+                    step_key = entry["_journal_step_key"]
+                    saved = None
+        if (saved is not None and saved["tx_hash"] and entry.get("automatic_requote")
+                and (entry.get("chain_id"), entry.get("asset_id"), entry.get("decimals"))
+                == (CELO_CHAIN_ID, CELO_TOKEN_ADDRESS, 18)):
+            receipt = rpc.call(_rpc_url(rpc_urls, int(entry["chain_id"])),
+                               "eth_getTransactionReceipt", [saved["tx_hash"]])
+            if isinstance(receipt, dict) and quantity(receipt.get("status")) == 0:
+                entry = _recover_reverted_celo_direct(
+                    entry=entry, saved=saved, receipt=receipt, position_id=position_id,
+                    wallet=wallet, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper,
+                    bitget=bitget, journal=journal, now_ms=now_ms,
+                )
+                step_key = entry["_journal_step_key"]
+                saved = None
         if saved is not None and saved["tx_hash"]:
             tx_hash = str(saved["tx_hash"])
             started_ms = (
@@ -2362,7 +2417,12 @@ def _submit_live_step(
                 - 60_000
             )
             if current_deadline() is not None:
-                wait_for_receipt(
+                request = entry.get("_direct_transaction")
+                if (entry.get("automatic_requote") and isinstance(request, TransactionRequest)
+                        and request.max_total_fee_cap_wei is not None):
+                    _replay_missing_direct(entry=entry, saved=saved, wallet=wallet, rpc=rpc,
+                                           rpc_urls=rpc_urls, journal=journal)
+                receipt = wait_for_receipt(
                     rpc,
                     url=_rpc_url(
                         rpc_urls,
@@ -2370,6 +2430,9 @@ def _submit_live_step(
                     ),
                     tx_hash=tx_hash,
                 )
+                if recovery and recovery.get("kind") == "scroll_l1_fee":
+                    recovery["winner_step_key"] = step_key
+                    journal.save_checkpoint(position_id, "direct_recovery", recovery)
             # Recovery observes the known transaction; it never prepares or signs another.
         else:
             if entry.get("_observation_restore") and (
@@ -2385,6 +2448,13 @@ def _submit_live_step(
                     gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper),
                     now_ms=now_ms,
                 )
+                if recovery:
+                    loss = _exact_sum((_entry_loss(entry), Decimal(recovery["failed_fee_usd"])))
+                    group = journal.group(journal.position(position_id)["group_id"])
+                    budget = Decimal(group["source_usd"]) * Decimal(group["loss_budget_pct"]) / 100
+                    if loss > budget:
+                        raise GroupLossLimitExceeded("reverted_deposit_recovery_exceeds_budget")
+                    entry["valuation"] = {**entry["valuation"], "loss_usd": _decimal_string(loss)}
                 journal.save_checkpoint(position_id, "direct_prepared", entry)
             request = entry.get("_direct_transaction")
             if not isinstance(request, TransactionRequest):
@@ -2401,7 +2471,7 @@ def _submit_live_step(
                 position_id=position_id,
                 prepared_request=request,
             )
-            saved = journal.latest_step(position_id=position_id, step_key="direct_deposit")
+            saved = journal.latest_step(position_id=position_id, step_key=step_key)
         try:
             status = bitget.wait_for_deposit_seen(
                 tx_hash=tx_hash,
@@ -2901,7 +2971,7 @@ def _execute_entry(
     if not pending_approval and not (
         prepared_request is not None
         and entry["status"] == "direct_deposit"
-        and entry["asset_id"] == "native"
+        and prepared_request.gas_limit > 0
     ):
         request = FeePlanner(rpc).plan(url, request, sender=wallet.public_address)
     require_ethereum_planned_gas_price_valid(request)
@@ -2915,7 +2985,10 @@ def _execute_entry(
             raise ValueError("requote_required:insufficient_generated_native_balance")
         reserve_balance = min(cap, balance) - request.value
     else:
-        reserve_balance = balance - request.value
+        shared_amount = (int(request.data[-64:], 16) if request.chain_id == CELO_CHAIN_ID
+                         and request.to.lower() == CELO_TOKEN_ADDRESS
+                         and request.data.startswith("0xa9059cbb") else 0)
+        reserve_balance = balance - request.value - shared_amount
     require_native_reserve(
         balance=reserve_balance,
         gas_cost=request.max_total_fee_wei,
@@ -2944,6 +3017,13 @@ def _execute_entry(
                 gas_cost=request.max_total_fee_wei,
             )
     nonce = pending_nonce(rpc, url=url, wallet=wallet.public_address)
+    if entry.get("_replacement_nonce") is not None:
+        latest = quantity(rpc.call(
+            url, "eth_getTransactionCount", [wallet.public_address, "latest"]))
+        replacement_nonce = int(entry["_replacement_nonce"])
+        if latest > replacement_nonce or nonce > replacement_nonce + 1:
+            raise StageDeadlineExceeded("replacement_nonce_consumed_waiting_receipt")
+        nonce = replacement_nonce
     try:
         if callable(before_sign):
             before_sign()
@@ -2964,6 +3044,9 @@ def _execute_entry(
         exc.approval_tx_hash = approval_tx_hash
         raise
     if journal is not None and position_id is not None:
+        if entry["status"] == "direct_deposit":
+            journal.save_checkpoint(position_id, "direct_prepared",
+                                    {**entry, "_direct_transaction": request})
         tx_hash = broadcast_durable_transaction(
             rpc,
             url=url,
@@ -3074,6 +3157,157 @@ def _retryable_provider_error(error):
     return is_transient_error(error)
 
 
+def _recover_reverted_celo_direct(
+    *, entry, saved, receipt, position_id, wallet, rpc, rpc_urls, jumper, bitget, journal, now_ms,
+):
+    """Recover one finalized legacy CELO sweep that spent its shared gas balance."""
+    original = entry.get("_direct_transaction")
+    if (not entry.get("automatic_requote")
+            or (entry.get("chain_id"), entry.get("asset_id"), entry.get("decimals"))
+            != (CELO_CHAIN_ID, CELO_TOKEN_ADDRESS, 18)
+            or saved["step_key"] != "direct_deposit"
+            or journal.checkpoint(position_id, "direct_recovery") is not None
+            or not isinstance(original, TransactionRequest)
+            or original.to.lower() != CELO_TOKEN_ADDRESS or original.value != 0
+            or len(original.data) != 138 or not original.data.startswith("0xa9059cbb")
+            or int(original.data[10:74], 16) != int(wallet.bitget_deposit_address, 16)
+            or sha256(original.data.encode()).hexdigest() != saved["calldata_digest"]
+            or quantity(receipt.get("status")) != 0
+            or str(receipt.get("transactionHash", "")).lower() != saved["tx_hash"].lower()
+            or str(receipt.get("from", "")).lower() != wallet.public_address.lower()
+            or str(receipt.get("to", "")).lower() != CELO_TOKEN_ADDRESS):
+        raise DepositSettlementFailed("source_transaction_reverted")
+    url = _rpc_url(rpc_urls, CELO_CHAIN_ID)
+    if quantity(rpc.call(url, "eth_chainId", [])) != CELO_CHAIN_ID:
+        raise DepositSettlementFailed("reverted_deposit_chain_mismatch")
+    block = quantity(receipt["blockNumber"])
+    finalized = rpc.call(url, "eth_getBlockByNumber", ["finalized", False])
+    if not isinstance(finalized, dict) or quantity(finalized.get("number")) < block:
+        raise StageDeadlineExceeded("reverted_deposit_waiting_finality")
+    before = quantity(rpc.call(url, "eth_getBalance", [wallet.public_address, hex(block - 1)]))
+    if int(original.data[-64:], 16) != before or before != int(entry["raw_balance"]):
+        raise DepositSettlementFailed("reverted_deposit_cause_unverified")
+    position = journal.position(position_id)
+    group = journal.group(position["group_id"])
+    count = journal.connection.execute(
+        "SELECT count(*) FROM route_positions WHERE group_id=?", (group["id"],)
+    ).fetchone()[0]
+    if count != 1:
+        raise DepositSettlementFailed("reverted_deposit_group_not_isolated")
+    fresh = _preflight_live_entry(
+        entry, wallet=wallet, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper, bitget=bitget,
+        gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper), now_ms=now_ms,
+    )
+    paid_raw = (quantity(receipt["gasUsed"]) * quantity(receipt["effectiveGasPrice"])
+                + quantity(receipt.get("l1Fee", "0x0")))
+    price = _token_quote_price(jumper, native_asset_identity(CELO_CHAIN_ID))
+    if not timedelta(0) <= datetime.fromtimestamp(now_ms() / 1000, UTC) - price.observed_at <= (
+        _MAX_PRICE_AGE
+    ):
+        raise ValueError("stale_price_for_reverted_deposit_fee")
+    paid_usd = raw_to_decimal(paid_raw, price.asset) * price.usd_per_token
+    loss = _exact_sum((_entry_loss(fresh), paid_usd))
+    budget = Decimal(group["source_usd"]) * Decimal(group["loss_budget_pct"]) / 100
+    if loss > budget:
+        raise GroupLossLimitExceeded("reverted_deposit_recovery_exceeds_original_budget")
+    fresh["valuation"] = {**fresh["valuation"], "loss_usd": _decimal_string(loss)}
+    fresh["_journal_step_key"] = "direct_deposit:recovery1"
+    journal.record_receipt(saved["id"], status="reverted", finality_block=block)
+    journal.save_checkpoint(position_id, "direct_recovery", {
+        "step_key": fresh["_journal_step_key"], "failed_tx_hash": saved["tx_hash"],
+        "failed_fee_raw": str(paid_raw), "failed_fee_usd": _decimal_string(paid_usd),
+        "finalized_height": quantity(finalized["number"]),
+    })
+    journal.save_checkpoint(position_id, "direct_prepared", fresh)
+    return fresh
+
+
+def _direct_step_key(journal, position_id):
+    recovery = journal.checkpoint(position_id, "direct_recovery")
+    return recovery.get("winner_step_key", recovery["step_key"]) if recovery else "direct_deposit"
+
+
+def _recover_missing_scroll_direct(
+    *, entry, saved, position_id, wallet, rpc, rpc_urls, jumper, bitget, journal, now_ms,
+):
+    """Replace only a missing legacy Scroll sweep that omitted its L1 fee.
+
+    Both hashes remain durable and share one nonce, so at most one can execute.
+    No other missing transaction is eligible for this migration.
+    """
+    original = entry.get("_direct_transaction")
+    created = datetime.fromisoformat(saved["created_at"]).replace(tzinfo=UTC)
+    now = datetime.fromtimestamp(now_ms() / 1000, UTC)
+    if (not entry.get("automatic_requote")
+            or (entry.get("chain_id"), entry.get("asset_id"), entry.get("decimals"))
+            != (534352, "native", 18)
+            or saved["step_key"] != "direct_deposit"
+            or journal.checkpoint(position_id, "direct_recovery") is not None
+            or now - created < timedelta(minutes=2)
+            or not isinstance(original, TransactionRequest) or original.chain_id != 534352
+            or original.to.lower() != wallet.bitget_deposit_address.lower()
+            or original.data != "0x" or original.value <= 0 or original.additional_fee_wei != 0
+            or sha256(original.data.encode()).hexdigest() != saved["calldata_digest"]):
+        return None
+    url = _rpc_url(rpc_urls, 534352)
+    if quantity(rpc.call(url, "eth_chainId", [])) != 534352:
+        raise DepositSettlementFailed("missing_deposit_chain_mismatch")
+    if rpc.call(url, "eth_getTransactionByHash", [saved["tx_hash"]]) is not None:
+        return None
+    for tag in ("latest", "pending"):
+        if quantity(rpc.call(url, "eth_getTransactionCount", [wallet.public_address, tag])) != (
+            saved["nonce"]
+        ):
+            return None
+    group = journal.group(journal.position(position_id)["group_id"])
+    if len(journal.group_positions(group["id"])) != 1:
+        return None
+    fresh = _preflight_live_entry(
+        {**entry, "_replacement_nonce": saved["nonce"],
+         "_replacement_original_request": original, "_actual_balance_raw": str(original.value)},
+        wallet=wallet, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper, bitget=bitget,
+        gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper), now_ms=now_ms,
+    )
+    request = fresh["_direct_transaction"]
+    if request.additional_fee_wei <= 0 or request.value > original.value:
+        raise DepositSettlementFailed("missing_deposit_replacement_shape_invalid")
+    budget = Decimal(group["source_usd"]) * Decimal(group["loss_budget_pct"]) / 100
+    if _entry_loss(fresh) > budget:
+        raise GroupLossLimitExceeded("missing_deposit_replacement_exceeds_original_budget")
+    fresh["_journal_step_key"] = "direct_deposit:replacement1"
+    journal.save_checkpoint(position_id, "direct_recovery", {
+        "kind": "scroll_l1_fee", "step_key": fresh["_journal_step_key"],
+        "replacement_nonce": saved["nonce"], "failed_tx_hash": saved["tx_hash"],
+        "failed_fee_usd": "0", "original_entry": entry,
+    })
+    journal.save_checkpoint(position_id, "direct_prepared", fresh)
+    return fresh
+
+
+def _replay_missing_direct(*, entry, saved, wallet, rpc, rpc_urls, journal):
+    """Rebroadcast identical bytes only; never change a durable signed intent."""
+    url = _rpc_url(rpc_urls, int(entry["chain_id"]))
+    if rpc.call(url, "eth_getTransactionReceipt", [saved["tx_hash"]]) is not None:
+        return
+    if rpc.call(url, "eth_getTransactionByHash", [saved["tx_hash"]]) is not None:
+        return
+    if quantity(rpc.call(url, "eth_getTransactionCount", [wallet.public_address, "latest"])) > (
+        saved["nonce"]
+    ):
+        return
+    request = entry["_direct_transaction"]
+    raw = sign_transaction(request, private_key=wallet.private_key,
+                           expected_sender=wallet.public_address, nonce=saved["nonce"])
+    if (signed_transaction_hash(raw) != saved["tx_hash"]
+            or sha256(raw.encode()).hexdigest() != saved["signed_payload_digest"]
+            or sha256(request.data.encode()).hexdigest() != saved["calldata_digest"]):
+        raise DepositSettlementFailed("durable_replacement_payload_mismatch")
+    journal.record_broadcast_attempt(saved["id"], saved["tx_hash"])
+    returned = broadcast_signed_transaction(rpc, url=url, raw_transaction=raw)
+    if returned.lower() != saved["tx_hash"].lower():
+        raise DepositSettlementFailed("durable_replacement_hash_mismatch")
+
+
 def _direct_request(
     entry: dict, *, wallet: WalletWorkbookRow, rpc: ExecutionRpc, url: str
 ) -> TransactionRequest:
@@ -3088,6 +3322,8 @@ def _direct_request(
             url,
             TransactionRequest(chain_id, wallet.bitget_deposit_address, "0x", 0, 0, 0),
             sender=wallet.public_address,
+            **({"replacement_for": entry["_replacement_original_request"]}
+               if entry.get("_replacement_original_request") is not None else {}),
         )
         amount = balance - GAS_RESERVE_MULTIPLIER * quote.max_total_fee_wei
         if amount < int(target["minimum_raw"]):
@@ -3106,7 +3342,29 @@ def _direct_request(
             raise ValueError("staged USDC is below Bitget minimum")
     recipient = wallet.bitget_deposit_address[2:].lower().rjust(64, "0")
     data = "0xa9059cbb" + recipient + hex(amount)[2:].rjust(64, "0")
+    if chain_id == CELO_CHAIN_ID and asset_id == CELO_TOKEN_ADDRESS:
+        balance = min(amount, _native_balance(rpc, url=url, wallet=wallet.public_address))
+        spend = balance // 2
+        for attempt in range(4):
+            data = "0xa9059cbb" + recipient + hex(spend)[2:].rjust(64, "0")
+            planned = FeePlanner(rpc).plan(
+                url, TransactionRequest(chain_id, asset_id, data, 0, 0, 0),
+                sender=wallet.public_address,
+            )
+            reserve = GAS_RESERVE_MULTIPLIER * planned.max_total_fee_wei
+            if (balance - spend == reserve or attempt == 3 and balance - spend >= reserve):
+                if spend < int(target["minimum_raw"]):
+                    raise ValueError("CELO balance is below Bitget minimum after gas reserve")
+                return planned
+            spend = balance - reserve
+            if spend < int(target["minimum_raw"]):
+                raise ValueError("CELO balance is below Bitget minimum after gas reserve")
+        raise ValueError("CELO gas reserve is unstable")
     return TransactionRequest(chain_id, asset_id, data, 0, 0, 0)
+
+
+def _is_celo_erc20(asset: AssetIdentity) -> bool:
+    return asset == AssetIdentity(CELO_CHAIN_ID, CELO_TOKEN_ADDRESS, 18)
 
 
 def _approve_if_needed(

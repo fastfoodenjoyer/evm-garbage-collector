@@ -214,6 +214,32 @@ def test_planning_progress_hook_runs_before_quota_wait_and_after_refresh(tmp_pat
     assert events == [(1000, 1), (1002, 2)]
 
 
+def test_quota_wait_does_not_delay_unrelated_rpc_retry(tmp_path):
+    import csv
+
+    from evm_inventory.collection import recover_planning
+
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+                      "wallet,1116,native,100,18,success\nwallet,8453,native,100,18,success\n")
+    clock, calls = [1000.0], []
+    waiting = {**entry(8453), "status": "manual_review", "reason": "quota_wait",
+               "search": {"errors": ["quota_wait"], "pending": [{"retry_at": 1008.0}]}}
+    rpc_retry = {**entry(1116), "status": "manual_review", "reason": "route_search_incomplete",
+                 "search": {"errors": ["missing_gas_estimate"]}}
+    def quote(path):
+        with path.open() as stream:
+            chains = [int(row["chain_id"]) for row in csv.DictReader(stream)]
+        calls.append((clock[0], chains))
+        return {"entries": [entry(c) for c in chains]}
+    recover_planning(
+        {"entries": [waiting, rpc_retry]}, source, quote, until=1020,
+        clock=lambda: clock[0], wall_clock=lambda: clock[0],
+        sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+    )
+    assert calls == [(1001, [1116]), (1008, [8453])]
+
+
 @pytest.mark.parametrize("resume_after_crash", [False, True])
 @pytest.mark.parametrize("include_skip", [False, True])
 @pytest.mark.parametrize("prior_defi", [None, "confirmed", "pending", "confirmed_route"])

@@ -323,12 +323,15 @@ def broadcast_durable_transaction(
     a duplicate send for the same durable nonce intent.
     """
 
+    previous = journal.latest_step(position_id=position_id, step_key=step_key)
+    existing_hash = (previous["tx_hash"] if previous and previous["nonce"] == nonce else None)
     intent = journal.record_step_intent(
         position_id=position_id,
         step_key=step_key,
         nonce=nonce,
         calldata_digest=sha256(calldata.encode()).hexdigest(),
         signed_payload_digest=sha256(signed_transaction.encode()).hexdigest(),
+        tx_hash=tx_hash,
     )
     if balance_baseline_raw is not None and expected_delta_raw is not None:
         journal.record_balance_baseline(
@@ -336,7 +339,6 @@ def broadcast_durable_transaction(
             balance_raw=balance_baseline_raw,
             expected_delta_raw=expected_delta_raw,
         )
-    existing_hash = intent.get("tx_hash")
     if existing_hash:
         observed = broadcaster.call(url, "eth_getTransactionByHash", [existing_hash])
         if isinstance(observed, dict) and str(observed.get("hash", "")).lower() == existing_hash:

@@ -131,14 +131,20 @@ def recover_planning(
         ]
         if not unresolved or clock() >= until:
             break
-        times = [
-            p["retry_at"]
-            for e in unresolved
-            for p in e.get("search", {}).get("pending", [])
-            if isinstance(p.get("retry_at"), (int, float))
-        ]
         backoff = min(60, 2 ** min(attempt, 6))
-        delay = max(backoff, min(times) - wall_clock()) if times else backoff
+        due = {}
+        for entry in unresolved:
+            search = entry.get("search", {})
+            errors = set(search.get("errors", []))
+            times = [p["retry_at"] for p in search.get("pending", [])
+                     if isinstance(p.get("retry_at"), (int, float))]
+            # A provider cooldown gates only provider work. Local RPC/fee failures
+            # on another network can be retried while its route quota is waiting.
+            wait = (max(backoff, min(times) - wall_clock()) if times and
+                    errors <= {"quota_wait", "provider_cooldown"} else backoff)
+            chain = entry["chain_id"]
+            due[chain] = min(due.get(chain, math.inf), clock() + wait)
+        delay = min(due.values()) - clock()
         if delay >= until - clock():
             if progress:
                 progress("Provider retry is outside this run's deadline; preserving exact reasons")
@@ -154,7 +160,10 @@ def recover_planning(
                 tick_at = clock() + 60
             if progress and end - clock() > 60 and int(end - clock()) % 60 == 0:
                 progress(f"Provider cooldown: {end - clock():.0f} seconds remaining")
-        chains = {e["chain_id"] for e in unresolved}
+        chains = {chain for chain, when in due.items()
+                  if when <= clock() and chain not in locked_chains}
+        if not chains:
+            continue
         with Path(balances_path).open(newline="") as stream:
             reader = csv.DictReader(stream)
             rows = [r for r in reader if int(r["chain_id"]) in chains]

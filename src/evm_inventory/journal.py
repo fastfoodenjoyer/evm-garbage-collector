@@ -700,6 +700,7 @@ class Journal:
         nonce: int,
         calldata_digest: str,
         signed_payload_digest: str,
+        tx_hash: str | None = None,
     ) -> dict:
         """Persist an intent before broadcasting, storing only one-way digests."""
 
@@ -721,8 +722,15 @@ class Journal:
             or row["signed_payload_digest"] != signed_payload_digest
         ):
             raise ValueError("conflicting durable step intent")
+        if tx_hash is not None:
+            if row["tx_hash"] is not None and row["tx_hash"] != tx_hash:
+                raise ValueError("conflicting durable transaction hash")
+            if row["tx_hash"] is None:
+                self._transition_step(row["id"], "submitted")
+                self.connection.execute("UPDATE route_steps SET tx_hash=? WHERE id=?",
+                                        (tx_hash, row["id"]))
         self.connection.commit()
-        return dict(row)
+        return self.step(row["id"])
 
     def step(self, step_id: int) -> dict:
         row = self.connection.execute("SELECT * FROM route_steps WHERE id=?", (step_id,)).fetchone()
