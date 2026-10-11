@@ -115,10 +115,13 @@ def recover_planning(
     sleep=time.sleep,
     progress=None,
     locked_chains=(),
+    on_plan=None,
 ):
     """Retry unfinished source groups in this invocation without requerying completed groups."""
     attempt = 0
     while clock() < until:
+        if on_plan is not None:
+            on_plan(plan)
         unresolved = [
             e
             for e in plan["entries"]
@@ -143,8 +146,12 @@ def recover_planning(
         if progress:
             progress(f"Retrying {len(unresolved)} unresolved positions in {delay:.0f} seconds")
         end = clock() + delay
+        tick_at = clock() + 60
         while clock() < end:
             sleep(min(1, end - clock()))
+            if on_plan is not None and clock() >= tick_at:
+                on_plan(plan)
+                tick_at = clock() + 60
             if progress and end - clock() > 60 and int(end - clock()) % 60 == 0:
                 progress(f"Provider cooldown: {end - clock():.0f} seconds remaining")
         chains = {e["chain_id"] for e in unresolved}
@@ -550,6 +557,44 @@ def collect_wallets(
                     if position and journal.has_broadcast(position[0]):
                         locked_chains.add(entry["chain_id"])
             balances_path = wallet_output / "inventory" / "balances.csv"
+
+            def execute_round(entries):
+                return execute_fn(
+                    entries,
+                    wallets={row.public_address: row},
+                    rpc_urls=rpc_urls,
+                    journal_path=db_path,
+                    execute=True,
+                    trust_deposit_addresses=True,
+                    max_route_loss_pct=loss_limit,
+                    stage_seconds=min(180, max(0.1, until - clock())),
+                )
+
+            def advance_ready_groups(current):
+                blocked = {e["chain_id"] for e in current["entries"] if _unresolved(e)}
+                ready = [e for e in current["entries"]
+                         if e.get("status") in _READY and e["chain_id"] not in blocked]
+                if not ready or clock() >= until:
+                    return
+                _assign_collection_identities(current, run_id, locked_chains=locked_chains)
+                for e in current["entries"]:
+                    e["automatic_requote"] = True
+                # A crash after the first broadcast must resume this exact plan.
+                _save_run(store, run_id, status="executing", plan=current)
+                (wallet_output / "plan.json").write_text(json.dumps(current, indent=2) + "\n")
+                drive_execution(
+                    {"entries": ready}, db_path, execute_round=execute_round,
+                    until=min(until, clock() + 90), clock=clock, sleep=sleep, progress=progress,
+                )
+                with Journal(db_path) as journal:
+                    for e in ready:
+                        position = journal.connection.execute(
+                            "SELECT id FROM route_positions WHERE position_key=?",
+                            (_position_key(e),),
+                        ).fetchone()
+                        if position and journal.has_broadcast(position[0]):
+                            locked_chains.add(e["chain_id"])
+
             if balances_path.exists():
                 plan = recover_planning(
                     plan,
@@ -571,6 +616,7 @@ def collect_wallets(
                     sleep=sleep,
                     progress=progress,
                     locked_chains=locked_chains,
+                    on_plan=advance_ready_groups if execute else None,
                 )
             _assign_collection_identities(plan, run_id, locked_chains=locked_chains)
             for entry in plan["entries"]:
@@ -616,18 +662,6 @@ def collect_wallets(
             }
             if execute:
                 _save_run(store, run_id, status="executing", plan=plan)
-
-                def execute_round(entries):
-                    return execute_fn(
-                        entries,
-                        wallets={row.public_address: row},
-                        rpc_urls=rpc_urls,
-                        journal_path=db_path,
-                        execute=True,
-                        trust_deposit_addresses=True,
-                        max_route_loss_pct=loss_limit,
-                        stage_seconds=min(180, max(0.1, until - clock())),
-                    )
 
                 report["execution"] = drive_execution(
                     plan,

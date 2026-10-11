@@ -194,11 +194,32 @@ def test_planning_waits_for_quota_and_only_retries_unresolved_network(tmp_path):
     assert all(e["status"] == "direct_deposit" for e in result["entries"])
 
 
+def test_planning_progress_hook_runs_before_quota_wait_and_after_refresh(tmp_path):
+    from evm_inventory.collection import recover_planning
+
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+                      "wallet,8453,native,100,18,success\n")
+    clock, events = [1000.0], []
+    waiting = {**entry(8453), "status": "manual_review", "reason": "quota_wait",
+               "search": {"pending": [{"retry_at": 1002.0}]}}
+    def tick(plan):
+        events.append((clock[0], sum(e["status"] == "direct_deposit" for e in plan["entries"])))
+    recover_planning(
+        {"entries": [entry(10), waiting]}, source,
+        lambda _: {"entries": [entry(8453)]}, until=1010,
+        clock=lambda: clock[0], wall_clock=lambda: clock[0],
+        sleep=lambda s: clock.__setitem__(0, clock[0] + s), on_plan=tick,
+    )
+    assert events == [(1000, 1), (1002, 2)]
+
+
 @pytest.mark.parametrize("resume_after_crash", [False, True])
 @pytest.mark.parametrize("include_skip", [False, True])
 @pytest.mark.parametrize("prior_defi", [None, "confirmed", "pending", "confirmed_route"])
+@pytest.mark.parametrize("early_ready", [False, True])
 def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_send(
-    tmp_path, monkeypatch, capsys, resume_after_crash, include_skip, prior_defi
+    tmp_path, monkeypatch, capsys, resume_after_crash, include_skip, prior_defi, early_ready
 ):
     from openpyxl import load_workbook
 
@@ -254,6 +275,7 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
         )
     clock = [1000.0]
     calls = dict(scan=0, quote=0, execute=0, send=0)
+    events = []
 
     def scan(store, scope, **kw):
         calls["scan"] += 1
@@ -264,6 +286,7 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
         return dict(mandatory_failed=0, discovered_failed=0, timed_out=False)
 
     def quote(source, row, **kw):
+        events.append("quote")
         calls["quote"] += 1
         assert source.exists() and kw["db_path"] == path
         ready = entry()
@@ -275,16 +298,25 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
             "status": "denied",
             "reason": "asset_not_allowlisted",
         }
+        entries = [ready, skipped] if include_skip else [ready]
+        if early_ready and calls["quote"] == 1:
+            entries.append(entry(56))
         return {
-            "entries": [ready, skipped] if include_skip else [ready],
+            "entries": entries,
             "summary": {ready["status"]: 1, **({"denied": 1} if include_skip else {})},
         }
 
     def execute(entries, **kw):
+        events.append("execute")
         calls["execute"] += 1
         assert kw["journal_path"] == path
         assert kw["execute"] and kw["trust_deposit_addresses"]
         with Journal(path) as journal:
+            saved = journal.connection.execute("SELECT plan_json FROM collection_runs "
+                                               "WHERE status='executing'").fetchone()
+            assert saved and all(_position_key(e) in {
+                _position_key(s) for s in json.loads(saved[0])["entries"]
+            } for e in entries)
             for e in entries:
                 p = journal.get_or_create_position(
                     position_key=_position_key(e), wallet=e["wallet"]
@@ -357,8 +389,13 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
     result = json.loads(capsys.readouterr().out)
     expected_status = "completed_with_skips" if include_skip else "completed"
     assert result["status"] == expected_status
-    assert result["wallets"][0]["execution"]["completed"] == 1
-    assert calls == dict(scan=1, quote=2, execute=2, send=1)
+    assert result["wallets"][0]["execution"]["completed"] == (2 if early_ready else 1)
+    assert calls == dict(
+        scan=1, quote=2, execute=3 if early_ready and not resume_after_crash else 2,
+        send=2 if early_ready else 1,
+    )
+    if early_ready:
+        assert events.index("execute") < events.index("quote", 1)
     assert len(list(tmp_path.glob("*.sqlite"))) == 1
     with Store(path) as store:
         saved = store.db.execute("SELECT status,plan_json FROM collection_runs").fetchone()

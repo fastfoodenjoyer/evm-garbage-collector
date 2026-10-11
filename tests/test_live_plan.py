@@ -74,6 +74,23 @@ def test_live_plan_quote_floor_uses_usd_value_for_native_balance(tmp_path):
     assert plan["entries"][0]["status"] == "direct_deposit"
 
 
+def test_direct_native_deposit_does_not_require_lifi_source_chain_support(tmp_path):
+    balances = _balance_rows(tmp_path, [{"wallet": WALLET, "chain_id": 1116,
+        "asset_id": "native", "raw_balance": str(10**18), "decimals": 18,
+        "symbol": "CORE", "status": "success"}])
+    client = _RecordingQuotes(lambda _: pytest.fail("unsupported source must not request routes"))
+    client.supported_chain_ids = lambda: {8453}
+    plan = create_live_plan(
+        balances, deposit_addresses={WALLET: "0x" + "d" * 40},
+        allowlist_path=_allowlist(tmp_path, [(1116, "native", "swap")]),
+        client=client, targets=(BitgetDepositTarget("CORE", 1116, "native", 10**16, "CoreDAO"),),
+        gas_estimator=lambda **_: (FeeQuote(
+            10**12, QuotePrice(AssetIdentity(1116, "native", 18), "2000", NOW)),),
+        now_ms=lambda: int(NOW.timestamp() * 1000), allow_partial_search=True,
+    )
+    assert plan["entries"][0]["status"] == "direct_deposit"
+
+
 def test_live_plan_accepts_price_fetched_after_plan_started(tmp_path):
     balances = _balance_rows(tmp_path, [{
         "wallet": WALLET,

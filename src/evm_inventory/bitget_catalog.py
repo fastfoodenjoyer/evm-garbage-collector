@@ -13,13 +13,38 @@ from .stages import http_request
 _EVM_CHAINS = {
     "ETH": 1,
     "ETHEREUM": 1,
+    "ERC20": 1,
     "OPTIMISM": 10,
     "ARBITRUMONE": 42161,
     "ARBITRUM": 42161,
     "BASE": 8453,
     "CELO": 42220,
+    "BEP20": 56,
+    "POLYGON": 137,
+    "ZKSYNCERA": 324,
+    "METISTOKEN": 1088,
+    "COREDAO": 1116,
+    "AVAXC-CHAIN": 43114,
+    "BLAST": 81457,
+    "SCROLL": 534352,
+    "MORPH": 2818,
 }
-_COIN_DECIMALS = {"ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18}
+_COIN_DECIMALS = {
+    "ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18,
+    "BNB": 18, "POL": 18, "METIS": 18, "CORE": 18, "AVAX": 18,
+}
+_NATIVE_COINS = {
+    1: "ETH", 10: "ETH", 56: "BNB", 137: "POL", 324: "ETH", 1088: "METIS",
+    1116: "CORE", 2818: "ETH", 8453: "ETH", 42161: "ETH", 42220: "CELO",
+    43114: "AVAX", 81457: "ETH", 534352: "ETH",
+}
+
+
+def deposit_decimals(coin: str, chain: str) -> int | None:
+    """Known network-specific units, shared by catalog and credit matching."""
+    if coin.upper() in {"USDC", "USDT"} and _EVM_CHAINS.get(chain.upper()) == 56:
+        return 18
+    return _COIN_DECIMALS.get(coin.upper())
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,22 +85,29 @@ def deposit_targets(coins: Iterable[dict]) -> tuple[BitgetDepositTarget, ...]:
     targets: list[BitgetDepositTarget] = []
     for coin_data in coins:
         coin = str(coin_data.get("coin", "")).upper()
-        decimals = _COIN_DECIMALS.get(coin)
         chains = coin_data.get("chains")
-        if decimals is None or not isinstance(chains, list):
+        if coin not in _COIN_DECIMALS or not isinstance(chains, list):
             continue
         for chain in chains:
             if not isinstance(chain, dict) or str(chain.get("rechargeable")).lower() != "true":
+                continue
+            if str(chain.get("needTag", "false")).lower() != "false":
                 continue
             chain_id = _EVM_CHAINS.get(str(chain.get("chain", "")).upper())
             if chain_id is None:
                 continue
             contract = chain.get("contractAddress")
-            asset_id = "native" if coin == "ETH" else str(contract or "").lower()
+            asset_id = str(contract or "").lower()
+            if not contract and _NATIVE_COINS.get(chain_id) == coin:
+                asset_id = "native"
             if asset_id != "native" and not _valid_address(asset_id):
                 continue
+            decimals = deposit_decimals(coin, str(chain["chain"]))
             try:
-                minimum_raw = int(Decimal(str(chain["minDepositAmount"])) * 10**decimals)
+                minimum = Decimal(str(chain["minDepositAmount"])) * 10**decimals
+                if not minimum.is_finite() or minimum != minimum.to_integral_value():
+                    continue
+                minimum_raw = int(minimum)
             except (InvalidOperation, KeyError, ValueError):
                 continue
             if minimum_raw > 0:

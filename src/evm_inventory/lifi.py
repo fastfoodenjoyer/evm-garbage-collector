@@ -459,6 +459,8 @@ class LifiClient:
 
         if not isinstance(asset, AssetIdentity):
             raise ValueError("LI.FI token price identity is invalid")
+        if asset == AssetIdentity(1116, "native", 18):
+            return self._core_native_price(asset)
         token = lifi_token_address(asset.chain_id, asset.contract_address)
         response = http_request(
             self.http_client,
@@ -511,6 +513,42 @@ class LifiClient:
                     asset, str(reference), observed_at, "defillama:ethereum:canonical_weth", price
                 )
         return LifiPriceEvidence(asset, price, _response_timestamp(response), "lifi", price)
+
+    def _core_native_price(self, asset: AssetIdentity) -> LifiPriceEvidence:
+        """Price native CORE from its exact spot pair, converting USDT to fresh USD."""
+        response = http_request(
+            self.http_client, "get", "https://api.bitget.com/api/v2/spot/market/tickers",
+            params={"symbol": "COREUSDT"}, headers={}, timeout=20,
+        )
+        response.raise_for_status()
+        body = response.json()
+        try:
+            if body["code"] != "00000" or len(body["data"]) != 1:
+                raise ValueError("invalid Bitget ticker response")
+            ticker = body["data"][0]
+            if ticker["symbol"] != "COREUSDT":
+                raise ValueError("Bitget ticker symbol mismatch")
+            bid, ask = Decimal(ticker["bidPr"]), Decimal(ticker["askPr"])
+            observed = datetime.fromtimestamp(int(ticker["ts"]) / 1000, UTC)
+            age = datetime.now(UTC) - observed
+            if (not bid.is_finite() or not ask.is_finite() or bid <= 0 or ask < bid
+                    or ask / bid > Decimal("1.05")
+                    or age < timedelta(0) or age > timedelta(minutes=5)):
+                raise ValueError("invalid or stale Bitget CORE price")
+        except (KeyError, TypeError, InvalidOperation, OverflowError, IndexError) as exc:
+            raise ValueError("Bitget CORE price unavailable") from exc
+        usdt = self._token_price(
+            AssetIdentity(1, "0xdac17f958d2ee523a2206206994597c13d831ec7", 6)
+        )
+        usd_observed = _parse_timestamp(usdt.timestamp)
+        age = datetime.now(UTC) - usd_observed
+        if age < timedelta(0) or age > timedelta(minutes=5):
+            raise ValueError("stale USDT USD price for Bitget CORE")
+        price = (bid + ask) / 2 * Decimal(usdt.price_usd)
+        return LifiPriceEvidence(
+            asset, str(price), min(observed, usd_observed).isoformat(),
+            "bitget_spot:COREUSDT:lifi_usdt_usd",
+        )
 
     def _ethereum_reference_price(self) -> tuple[Decimal, str]:
         key = "ethereum:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"

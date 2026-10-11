@@ -2,6 +2,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -1120,6 +1121,39 @@ def test_exact_token_price_endpoint_still_rejects_invalid_values(untrusted_price
 
     with pytest.raises(ValueError, match="price"):
         LifiClient(InvalidPriceHttp()).token_price(asset)
+
+
+@pytest.mark.parametrize("change,valid", [
+    ({}, True), ({"symbol": "OTHERUSDT"}, False),
+    ({"bidPr": "NaN"}, False), ({"askPr": "0"}, False),
+    ({"bidPr": "0.1"}, False), ({"ts": "1"}, False),
+])
+def test_core_native_price_uses_fresh_exact_bitget_market_and_usdt_usd(change, valid):
+    import httpx
+
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if request.url.host == "api.bitget.com":
+            assert request.url.params["symbol"] == "COREUSDT"
+            ticker = {"symbol": "COREUSDT", "bidPr": "0.0199", "askPr": "0.0201",
+                      "ts": str(int(datetime.now(UTC).timestamp() * 1000)), **change}
+            return httpx.Response(200, json={"code": "00000", "data": [ticker]})
+        assert request.url.params["chain"] == "1"
+        assert request.url.params["token"] == "0xdac17f958d2ee523a2206206994597c13d831ec7"
+        return httpx.Response(200, json={"address": request.url.params["token"],
+            "chainId": 1, "decimals": 6, "priceUSD": "0.98"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = LifiClient(http)
+        if valid:
+            price = client.token_price(AssetIdentity(1116, "native", 18))
+            assert Decimal(price.price_usd) == Decimal("0.01960")
+            assert price.source == "bitget_spot:COREUSDT:lifi_usdt_usd"
+            assert len(calls) == 2
+        else:
+            with pytest.raises(ValueError, match="Bitget"):
+                client.token_price(AssetIdentity(1116, "native", 18))
 
 
 def test_missing_native_gas_price_is_fetched_by_exact_token_identity():

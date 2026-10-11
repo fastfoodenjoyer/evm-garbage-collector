@@ -338,6 +338,12 @@ def create_live_plan(
                 supported_groups = []
                 for key, items in wallet_groups:
                     if key[1] not in supported:
+                        # Direct deposits use this network's RPC and Bitget catalog;
+                        # they have no dependency on a bridge provider's chain list.
+                        direct = [item for item in items if _target(item.asset, wallet_targets)]
+                        if direct:
+                            supported_groups.append((key, direct))
+                        items = [item for item in items if item not in direct]
                         relay_factory = getattr(quote_client, "relay_for_wallet", None)
                         if relay_factory is not None and (
                             key[1] in RELAY_SOURCE_CHAINS or allow_partial_search
@@ -395,7 +401,8 @@ def create_live_plan(
                     valuation_now,
                     wallet_gas_estimator,
                     quoted_at,
-                    route_targets=route_targets,
+                    route_targets=(route_targets if supported is None
+                                   or group_key[1] in supported else ()),
                 )
 
             results = run_parallel(plan_group, wallet_groups, deadline=deadline, workers=workers)

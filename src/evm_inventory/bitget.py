@@ -14,6 +14,7 @@ import httpx
 
 from .bitget_catalog import (
     BitgetDepositTarget,
+    deposit_decimals,
     deposit_targets,
     fetch_public_coins,
     validate_live_target,
@@ -24,8 +25,6 @@ from .stages import (
     current_deadline,
     http_request,
 )
-
-_COIN_DECIMALS = {"ETH": 18, "USDC": 6, "USDT": 6, "OP": 18, "ARB": 18, "CELO": 18}
 
 
 class BitgetClient:
@@ -112,7 +111,7 @@ class BitgetClient:
                 and record.get("coin") == coin
                 and str(record.get("chain", "")).casefold() == chain.casefold()
                 and str(recorded_recipient).lower() == recipient.lower()
-                and _record_raw_amount(record, coin) >= minimum_raw
+                and _record_raw_amount(record, coin, chain) >= minimum_raw
             ):
                 return str(record.get("status", "")) or None
         return None
@@ -222,8 +221,8 @@ class BitgetClient:
         return None
 
 
-def _record_raw_amount(record: dict, coin: str) -> int:
-    decimals = _COIN_DECIMALS.get(coin)
+def _record_raw_amount(record: dict, coin: str, chain: str = "") -> int:
+    decimals = deposit_decimals(coin, chain)
     if decimals is None:
         return -1
     try:

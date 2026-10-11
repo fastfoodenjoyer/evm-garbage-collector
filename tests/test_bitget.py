@@ -4,6 +4,24 @@ import pytest
 from evm_inventory.bitget import BitgetClient
 
 
+@pytest.mark.parametrize("coin,chain,minimum", [
+    ("CORE", "CoreDAO", 10**16), ("BNB", "BEP20", 10**16),
+    ("POL", "Polygon", 10**16), ("METIS", "MetisToken", 10**16),
+    ("AVAX", "AVAXC-Chain", 10**16), ("USDT", "BEP20", 10**16),
+])
+def test_credit_amount_precision_matches_deposit_network(coin, chain, minimum):
+    class Client(BitgetClient):
+        def deposit_records(self, **_):
+            return ({"txId": "0xabc", "coin": coin, "chain": chain,
+                     "address": "0x" + "1" * 40, "size": "0.01", "status": "success"},)
+
+    client = Client(api_key="key", secret_key="secret", passphrase="pass")
+    assert client.deposit_status(
+        tx_hash="0xabc", start_ms=1, end_ms=2, coin=coin, chain=chain,
+        recipient="0x" + "1" * 40, minimum_raw=minimum,
+    ) == "success"
+
+
 def test_deposit_status_matches_transaction_hash_fields():
     class Client(BitgetClient):
         def deposit_records(self, **_):

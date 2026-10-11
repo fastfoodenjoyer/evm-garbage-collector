@@ -36,3 +36,43 @@ def test_live_target_revalidation_requires_exact_enabled_target_and_user_address
         )
     with pytest.raises(ValueError, match="invalid Bitget deposit address"):
         validate_live_target(planned, live_targets=live, user_address="not-an-address")
+
+
+@pytest.mark.parametrize("coin,chain,chain_id", [
+    ("BNB", "BEP20", 56), ("CORE", "CoreDAO", 1116),
+    ("POL", "Polygon", 137), ("METIS", "MetisToken", 1088),
+    ("AVAX", "AVAXC-Chain", 43114), ("ETH", "SCROLL", 534352),
+    ("ETH", "zkSyncEra", 324),
+])
+def test_catalog_recognizes_enabled_native_deposits(coin, chain, chain_id):
+    targets = deposit_targets([{"coin": coin, "chains": [{
+        "chain": chain, "rechargeable": "true", "needTag": "false",
+        "contractAddress": None, "minDepositAmount": "0.01",
+    }]}])
+    assert targets == (BitgetDepositTarget(coin, chain_id, "native", 10**16, chain, 18),)
+
+
+def test_catalog_uses_contract_for_eth_on_bsc_and_network_specific_stablecoin_precision():
+    contract = "0x" + "a" * 40
+    data = [{"coin": coin, "chains": [{
+        "chain": "BEP20", "rechargeable": "true", "contractAddress": contract,
+        "minDepositAmount": "0.01",
+    }]} for coin in ("ETH", "USDT", "USDC")]
+    targets = deposit_targets(data)
+    assert len(targets) == 3
+    assert all(t.asset_id == contract and t.decimals == 18 and t.minimum_raw == 10**16
+               for t in targets)
+
+
+@pytest.mark.parametrize("chain,coin,contract,need_tag", [
+    ("AVAXX-Chain", "AVAX", None, "false"),
+    ("BEP20", "ETH", None, "false"),
+    ("Polygon", "ETH", None, "false"),
+    ("CoreDAO", "CORE", None, "true"),
+    ("CoreDAO", "CORE", "invalid", "false"),
+])
+def test_catalog_rejects_non_evm_wrong_native_tag_and_bad_contract(chain, coin, contract, need_tag):
+    assert not deposit_targets([{"coin": coin, "chains": [{
+        "chain": chain, "rechargeable": "true", "contractAddress": contract,
+        "needTag": need_tag, "minDepositAmount": "0.01",
+    }]}])
