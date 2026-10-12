@@ -26,6 +26,7 @@ from .consolidation import (
     candidate_from_values,
     combine_candidates,
 )
+from .diagnostics import exception_diagnostic
 from .executor import (
     GAS_RESERVE_MULTIPLIER,
     AmbiguousBroadcast,
@@ -418,6 +419,50 @@ def _account_confirmed_local_unwrap_loss(journal: Journal, position_id: int, ent
         journal.account_position_loss(position_id, loss_usd=_decimal_string(confirmed_loss))
 
 
+def _observe_halted_route_credits(entries, *, journal, group_id, submit_step):
+    """A failed sibling cannot prevent observing an already delivered deposit."""
+    counts = {"group_id": group_id, "completed": 0, "deposit_pending": 0, "manual_review": 0}
+    for entry in entries:
+        row = journal.connection.execute(
+            "SELECT id,state FROM route_positions WHERE position_key=? AND group_id=?",
+            (_position_key(entry), group_id),
+        ).fetchone()
+        if row is None:
+            counts["manual_review"] += 1
+            continue
+        if row["state"] == "completed" and not route_credit_unverified(entry, journal, row["id"]):
+            counts["completed"] += 1
+            continue
+        if row["state"] not in {"deposit_pending", "completed"} or not journal.checkpoint(
+                row["id"], "route_deposit"):
+            counts["manual_review"] += 1
+            continue
+        try:
+            result = submit_step({**entry, "_journal_position_id": row["id"]},
+                                 {"kind": "observe_route_deposit"})
+            if result.get("state") == "completed":
+                if row["state"] != "completed":
+                    journal.account_position_loss(
+                        row["id"], loss_usd=str(result["realized_loss_usd"]),
+                    )
+                journal.record_position_state(row["id"], "completed")
+                counts["completed"] += 1
+            elif result.get("state") == "deposit_pending":
+                counts["deposit_pending"] += 1
+            else:
+                raise ValueError("deposit reconciliation returned no result")
+        except DepositSettlementFailed as error:
+            if row["state"] != "completed":
+                journal.record_position_state(row["id"], "manual_review", reason=str(error))
+            counts["manual_review"] += 1
+        except Exception as error:
+            journal.save_checkpoint(
+                row["id"], "route_credit_diagnostic", exception_diagnostic(error),
+            )
+            counts["deposit_pending"] += 1
+    return counts
+
+
 def execute_group_entries(
     entries: list[dict],
     *,
@@ -497,7 +542,9 @@ def execute_group_entries(
         "manual_review_group_threshold_exceeded",
         "manual_review_group_halted",
     }:
-        raise ValueError("route group is already terminal in the journal")
+        return _observe_halted_route_credits(
+            entries, journal=journal, group_id=group["id"], submit_step=submit_step,
+        )
     journal.record_group_state(group["id"], "active")
 
     positions = []

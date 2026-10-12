@@ -10,6 +10,65 @@ from evm_inventory.runbook import create_route_plan
 from evm_inventory.stages import Deadline, deadline_scope, request_timeout
 
 
+@pytest.mark.parametrize("legacy_completed", [False, True])
+def test_halted_sibling_does_not_hide_or_block_known_route_credit(tmp_path, legacy_completed):
+    from decimal import Decimal
+
+    from test_route_execution import ASSET_A, ASSET_B, WALLET, _entry
+
+    from evm_inventory.collection import execution_positions
+    from evm_inventory.journal import Journal
+    from evm_inventory.route_execution import _position_key, execute_group_entries
+
+    entries = [{**_entry(ASSET_A, status="route_ready", steps=[{"kind": "bridge"}]),
+                "automatic_requote": True}, _entry(ASSET_B)]
+    path = tmp_path / "inventory.sqlite"
+    calls = []
+    with Journal(path) as journal:
+        group = journal.get_or_create_group(group_key=entries[0]["group"]["key"], wallet=WALLET,
+            source_chain_id=10, source_usd="100", loss_budget_pct="15")
+        positions = [journal.get_or_create_position(position_key=_position_key(e), wallet=WALLET,
+                     group_id=group["id"]) for e in entries]
+        p = positions[0]
+        journal.record_step_intent(position_id=p["id"], step_key="bridge:saved:0", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64, tx_hash="0x" + "c" * 64)
+        journal.save_checkpoint(p["id"], "route_deposit", {"saved": "observation context"})
+        journal.record_position_state(p["id"], "bridge_submitted")
+        journal.record_position_state(p["id"], "deposit_pending")
+        if legacy_completed:
+            journal.record_position_state(p["id"], "completed")
+            journal.record_group_realized_loss(group["id"], realized_loss_usd="3")
+        else:
+            journal.account_position_loss(p["id"], loss_usd="3")
+        journal.record_position_state(positions[1]["id"], "manual_review", reason="missing gas")
+        journal.record_group_state(group["id"], "active")
+        journal.record_group_state(group["id"], "manual_review_group_halted", reason="missing gas")
+        assert execution_positions(entries, path)[0]["state"] == (
+            "route_credit_pending" if legacy_completed else "deposit_pending")
+        outcomes = iter([{"state": "deposit_pending"}, RuntimeError("provider unavailable"),
+                         {"state": "completed", "realized_loss_usd": "3"}])
+        def submit(entry, step):
+            calls.append((entry["_journal_position_id"], step["kind"]))
+            result = next(outcomes)
+            if isinstance(result, Exception):
+                raise result
+            if result["state"] == "completed":
+                journal.save_checkpoint(p["id"], "bitget_credit", {"status": "success"})
+            return result
+        for expected in ("deposit_pending", "deposit_pending", "completed"):
+            result = execute_group_entries(entries, journal=journal,
+                max_route_loss_pct=Decimal("15"),
+                preflight=lambda _: pytest.fail("halted group must not prepare another send"),
+                submit_step=submit)
+            assert result[expected] == 1
+        assert result["completed"] == 1
+        assert journal.group(group["id"])["state"] == "manual_review_group_halted"
+        assert journal.group(group["id"])["realized_loss_usd"] == "3"
+        assert journal.position(positions[1]["id"])["state"] == "manual_review"
+        assert execution_positions(entries, path)[0]["state"] == "completed"
+    assert calls == [(p["id"], "observe_route_deposit")] * 3
+
+
 @pytest.mark.parametrize("cross_chain", [False, True])
 @pytest.mark.parametrize("legacy_completed", [False, True])
 def test_route_waits_for_exchange_credit_without_sending_again(

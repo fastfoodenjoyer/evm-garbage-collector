@@ -260,7 +260,10 @@ def execution_positions(entries, db_path):
             state, reason = (row["state"], row["reason"]) if row else ("planned", None)
             if row and state == "completed" and route_credit_unverified(entry, journal, row["id"]):
                 state, reason = "route_credit_pending", "bitget_credit_unverified"
-            if row and str(row["group_state"]).startswith("manual_review"):
+            if (row and str(row["group_state"]).startswith("manual_review")
+                    and state not in {"completed", "route_credit_pending"}
+                    and not (state == "deposit_pending" and journal.checkpoint(
+                        row["id"], "route_deposit"))):
                 state = row["group_state"]
                 reason = reason or row["group_reason"]
             result.append(
