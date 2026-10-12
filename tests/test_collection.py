@@ -316,7 +316,7 @@ def test_quota_wait_does_not_delay_unrelated_rpc_retry(tmp_path):
     assert calls == [(1001, [1116]), (1008, [8453])]
 
 
-@pytest.mark.parametrize("resume_after_crash", [False, True])
+@pytest.mark.parametrize("resume_after_crash", [False, "pending", "completed", "superseded"])
 @pytest.mark.parametrize("include_skip", [False, True])
 @pytest.mark.parametrize("prior_defi", [None, "confirmed", "pending", "confirmed_route"])
 @pytest.mark.parametrize("early_ready", [False, True])
@@ -436,6 +436,8 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
                     )
                     journal.record_broadcast_attempt(step["id"], "0x" + "a" * 64)
                 state = "deposit_pending" if calls["execute"] == 1 else "completed"
+                if resume_after_crash in {"completed", "superseded"}:
+                    state = "completed"
                 journal.record_position_state(p["id"], state)
         if resume_after_crash and calls["execute"] == 1:
             import httpx
@@ -477,12 +479,17 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
     if resume_after_crash:
         assert first == 4
         capsys.readouterr()
+        if resume_after_crash == "superseded":
+            with Store(path) as store:
+                with store.db:
+                    store.db.execute("UPDATE collection_runs SET status='superseded'")
         dry_args = [a for a in args if a != "--execute"]
         assert main(dry_args) == 3
         capsys.readouterr()
         with Store(path) as store:
             assert (
-                store.db.execute("SELECT status FROM collection_runs").fetchone()[0] == "executing"
+                store.db.execute("SELECT status FROM collection_runs").fetchone()[0]
+                == ("superseded" if resume_after_crash == "superseded" else "executing")
             )
         args[args.index("--output") + 1] = str(tmp_path / "resumed-output")
         assert main(args) == 0
@@ -493,7 +500,9 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
     assert result["status"] == expected_status
     assert result["wallets"][0]["execution"]["completed"] == (2 if early_ready else 1)
     assert calls == dict(
-        scan=1, quote=2, execute=3 if early_ready and not resume_after_crash else 2,
+        scan=1, quote=2, execute=(
+            1 if resume_after_crash in {"completed", "superseded"} and not early_ready
+            else 3 if early_ready and not resume_after_crash else 2),
         send=2 if early_ready else 1,
     )
     if early_ready:
@@ -507,6 +516,18 @@ def test_single_cli_invocation_scans_recovers_plans_and_settles_without_second_s
             store.db.execute("SELECT recipient FROM collection_recipients").fetchone()[0]
             == "0x" + "d" * 40
         )
+    if resume_after_crash == "superseded":
+        with Store(path) as store:
+            current = store.db.execute("SELECT * FROM collection_runs").fetchone()
+            with store.db:
+                store.db.execute(
+                    "INSERT INTO collection_runs "
+                    "(id,wallet,request_digest,status,plan_json,updated_at) "
+                    "VALUES ('historical-plan',?,?,'superseded',?,0)",
+                    (current["wallet"], current["request_digest"], current["plan_json"]),
+                )
+        assert main(args) == 0
+        assert calls["scan"] == 2  # New completed run prevents resurrecting historical plans.
 
 
 def test_long_planning_does_not_destroy_route_needed_for_automatic_preflight():

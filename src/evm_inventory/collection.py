@@ -489,11 +489,15 @@ def collect_wallets(
             digest = sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
             # A nonterminal plan is never replaced on restart: it may already own funds in flight.
             previous = store.db.execute(
-                "SELECT * FROM collection_runs WHERE wallet=? AND status IN "
-                "('executing','incomplete','planned') AND plan_json IS NOT NULL "
+                "SELECT * FROM collection_runs WHERE wallet=? AND (status IN "
+                "('executing','incomplete','planned') OR "
+                "(status='superseded' AND request_digest=? AND NOT EXISTS "
+                "(SELECT 1 FROM collection_runs newer WHERE newer.wallet=collection_runs.wallet "
+                "AND newer.updated_at>collection_runs.updated_at "
+                "AND newer.plan_json IS NOT NULL))) AND plan_json IS NOT NULL "
                 "ORDER BY updated_at DESC "
                 "LIMIT 1",
-                (row.public_address,),
+                (row.public_address, digest),
             ).fetchone()
             if previous:
                 old_plan = json.loads(previous["plan_json"])
@@ -506,11 +510,12 @@ def collect_wallets(
                         ).fetchone()
                         if (
                             position
-                            and position["state"] != "completed"
+                            and (position["state"] != "completed" or route_credit_unverified(
+                                entry, journal, position["id"]))
                             and journal.has_broadcast(position["id"])
                         ):
                             pending_broadcast = True
-                if not pending_broadcast:
+                if not pending_broadcast and previous["request_digest"] != digest:
                     _save_run(store, previous["id"], status="superseded")
                     previous = None
             if previous and previous["request_digest"] != digest:
