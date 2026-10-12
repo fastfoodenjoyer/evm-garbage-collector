@@ -898,11 +898,14 @@ def test_native_reserve_uses_rpc_fee_cap_when_provider_understates_gas(tmp_path)
     assert balance - int(e["route"]["evidence"]["input_amount"]) >= actual * 3
 
 
-@pytest.mark.parametrize("revert", ["allowance_text", "lifi_transfer_from_custom"])
+@pytest.mark.parametrize("revert", ["allowance_text", "lifi_transfer_from_custom", "erc6093"])
 @pytest.mark.parametrize("allowance,native", [(0, False), (1000, False), (0, True)])
+@pytest.mark.parametrize("gas_hint", [50_000, 1_422_200, 0, 20_000_000])
 def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed(
-    revert, allowance, native,
+    revert, allowance, native, gas_hint,
 ):
+    from dataclasses import replace
+
     from test_live_plan import _quoted_route
     from test_planner_gas import SPENDER, TOKEN, WALLET, PriceClient, Rpc
 
@@ -919,11 +922,18 @@ def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed(
                                    if revert == "allowance_text" else "execution reverted")
                 if revert == "lifi_transfer_from_custom":
                     error.diagnostic = {"provider_error": {"data": "0x7939f424"}}
+                elif revert == "erc6093":
+                    error.diagnostic = {"provider_error": {"data": (
+                        "0xfb8f41b2" + SPENDER[2:].rjust(64, "0")
+                        + f"{allowance:064x}" + f"{1000:064x}")}}
                 raise error
             return super().call(url, method, params)
 
     rpc = AllowanceRpc()
-    estimator = PlannerGasEstimator(rpc, {10: "rpc"}, PriceClient())
+    class HintClient(PriceClient):
+        def step_transaction(self, step):
+            return replace(super().step_transaction(step), gas_limit=gas_hint)
+    estimator = PlannerGasEstimator(rpc, {10: "rpc"}, HintClient())
     route = _quoted_route(
         LifiRouteRequest(10, 8453, "0x" + "0" * 40 if native else TOKEN,
                          "0x" + "c" * 40, "1000", WALLET, WALLET),
@@ -940,7 +950,7 @@ def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed(
         amount=1000,
         recipient=WALLET,
     )
-    if native or allowance >= 1000:
+    if native or allowance >= 1000 or gas_hint in {0, 20_000_000}:
         assert fees is None
         assert route.route_id not in estimator.prepared_fee_caps
         return
@@ -949,6 +959,38 @@ def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed(
     prepared = estimator.prepared_fee_caps[route.route_id][0]
     assert prepared.max_total_fee_cap_wei == fees[0].raw_amount
     assert prepared.fee_quote_fallback_reason == "pending_approval"
+    assert prepared.gas_limit <= 30_000_000
+
+
+@pytest.mark.parametrize("change", [None, "spender", "needed", "allowance", "padding", "length",
+                                    "calldata", "message", "malformed", "named_error_message"])
+def test_erc6093_allowance_revert_requires_exact_expected_abi_fields(change):
+    from test_planner_gas import SPENDER
+
+    from evm_inventory.planner_gas import _approval_dependent_revert
+    data = "0xfb8f41b2" + SPENDER[2:].rjust(64, "0") + f"{0:064x}" + f"{1000:064x}"
+    if change in {"spender", "named_error_message"}:
+        data = "0xfb8f41b2" + ("1" * 40).rjust(64, "0") + f"{0:064x}" + f"{1000:064x}"
+    elif change == "needed":
+        data = data[:-64] + f"{1001:064x}"
+    elif change == "allowance":
+        data = data[:74] + f"{1000:064x}" + f"{1000:064x}"
+    elif change == "padding":
+        data = data[:10] + "f" + data[11:]
+    elif change == "length":
+        data += "00"
+    elif change == "malformed":
+        data = data[:-1] + "g"
+    diagnostic = {"provider_error": {"data": data}}
+    if change == "named_error_message":
+        diagnostic["provider_error"]["message"] = "execution reverted: ERC20InsufficientAllowance"
+    if change == "calldata":
+        diagnostic = {"params": [{"data": data}]}
+    elif change == "message":
+        diagnostic = {"provider_error": {"message": data}}
+    error = ValueError("estimate_gas_rpc_error:" + json.dumps({"diagnostic": diagnostic}))
+    assert _approval_dependent_revert(error, expected_spender=SPENDER,
+                                     expected_amount=1000) is (change is None)
 
 
 @pytest.mark.parametrize("detail", [
@@ -1009,6 +1051,65 @@ def test_automatic_execution_allows_full_request_time_with_bounded_run():
         _execution_deadline(180, [{}])
     with deadline_scope(Deadline(5)):
         assert _execution_deadline(180, [{"automatic_requote": True}]).remaining() <= 5
+
+
+@pytest.mark.parametrize("confirmed_allowance", [0, 1_000_000])
+def test_fresh_approval_checks_confirmed_allowance_and_retains_intent(
+    tmp_path, monkeypatch, confirmed_allowance,
+):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from test_route_execution import ASSET_A, DEPOSIT, WALLET, _entry
+
+    from evm_inventory.journal import Journal
+    from evm_inventory.lifi import TransactionRequest
+    from evm_inventory.route_execution import _approve_if_needed
+
+    phases = []
+    spender = "0x" + "c" * 40
+    approval_hash = "0x" + "a" * 64
+    request = TransactionRequest(10, DEPOSIT, "0x", 0, 21_000, 1)
+    entry = {**_entry(ASSET_A, status="route_ready"),
+             "route": {"step": {"estimate": {"approvalAddress": spender}}}}
+
+    def allowance(*_, **kw):
+        assert (kw["token"], kw["owner"], kw["spender"]) == (ASSET_A, WALLET, spender)
+        phases.append("allowance")
+        return confirmed_allowance if "receipt" in phases else 0
+
+    def broadcast(*_, journal, position_id, step_key, **kw):
+        phases.append("approval_sent")
+        journal.record_step_intent(position_id=position_id, step_key=step_key,
+            nonce=kw["nonce"], calldata_digest="b" * 64, signed_payload_digest="c" * 64,
+            tx_hash=kw["tx_hash"])
+        return approval_hash
+
+    module = "evm_inventory.route_execution."
+    monkeypatch.setattr(module + "token_allowance", allowance)
+    monkeypatch.setattr(module + "recover_durable_broadcast", lambda *a, **kw: None)
+    monkeypatch.setattr(module + "FeePlanner", lambda _: SimpleNamespace(
+        plan=lambda url, tx, **kw: replace(tx, gas_limit=21_000, gas_price_wei=1)))
+    monkeypatch.setattr(module + "_native_balance", lambda *a, **kw: 1_000_000)
+    monkeypatch.setattr(module + "pending_nonce", lambda *a, **kw: 1)
+    monkeypatch.setattr(module + "sign_transaction", lambda *a, **kw: "approval-payload")
+    monkeypatch.setattr(module + "signed_transaction_hash", lambda _: approval_hash)
+    monkeypatch.setattr(module + "broadcast_durable_transaction", broadcast)
+    monkeypatch.setattr(module + "wait_for_receipt", lambda *a, **kw: phases.append("receipt"))
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        position = journal.get_or_create_position(position_key="approval", wallet=WALLET)
+        kwargs = dict(entry=entry, request=request,
+            wallet=SimpleNamespace(public_address=WALLET, private_key="secret"),
+            rpc=object(), url="rpc", journal=journal, position_id=position["id"],
+            route_step_key="bridge:test:0")
+        if confirmed_allowance:
+            assert _approve_if_needed(**kwargs) == approval_hash
+        else:
+            with pytest.raises(ValueError, match="approval confirmed without sufficient"):
+                _approve_if_needed(**kwargs)
+        assert journal.latest_step(position_id=position["id"],
+            step_key="approval:bridge:test:0")["tx_hash"] == approval_hash
+    assert phases == ["allowance", "approval_sent", "receipt", "allowance"]
 
 
 @pytest.mark.parametrize("simulation_ok", [True, False])

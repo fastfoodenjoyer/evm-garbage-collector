@@ -3938,6 +3938,9 @@ def _approve_if_needed(
     else:
         tx_hash = broadcast_signed_transaction(rpc, url=url, raw_transaction=raw)
     wait_for_receipt(rpc, url=url, tx_hash=tx_hash)
+    if token_allowance(rpc, url=url, token=asset_id, owner=wallet.public_address,
+                       spender=spender) < amount:
+        raise ValueError("approval confirmed without sufficient token allowance")
     return tx_hash
 
 

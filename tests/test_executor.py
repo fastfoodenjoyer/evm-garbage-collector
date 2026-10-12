@@ -546,7 +546,9 @@ def test_approval_and_main_transaction_get_fresh_ethereum_gas_probes(monkeypatch
             "0x1", "0x1",  # main guard
         ]
     )
-    monkeypatch.setattr("evm_inventory.route_execution.token_allowance", lambda *args, **kwargs: 0)
+    allowances = iter([0, 2**256 - 1])
+    monkeypatch.setattr("evm_inventory.route_execution.token_allowance",
+                        lambda *args, **kwargs: next(allowances))
     monkeypatch.setattr(
         "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
     )
@@ -580,7 +582,9 @@ def test_main_guard_deferral_preserves_confirmed_approval_hash(monkeypatch):
     wallet = _wallet()
     request = TransactionRequest(1, "0x" + "4" * 40, "0x", 0, 21_000, 1)
     rpc = _Rpc(["0x1", "0x1", "0x1", "0x1dcd6500"])
-    monkeypatch.setattr("evm_inventory.route_execution.token_allowance", lambda *args, **kwargs: 0)
+    allowances = iter([0, 2**256 - 1])
+    monkeypatch.setattr("evm_inventory.route_execution.token_allowance",
+                        lambda *args, **kwargs: next(allowances))
     monkeypatch.setattr(
         "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
     )
@@ -620,7 +624,9 @@ def test_expired_quote_after_approval_defers_route_without_route_signature(monke
     clock = [1_000_000]
     signed = []
     broadcast = []
-    monkeypatch.setattr("evm_inventory.route_execution.token_allowance", lambda *args, **kwargs: 0)
+    allowances = iter([0, 2**256 - 1])
+    monkeypatch.setattr("evm_inventory.route_execution.token_allowance",
+                        lambda *args, **kwargs: next(allowances))
     monkeypatch.setattr(
         "evm_inventory.route_execution._native_balance", lambda *args, **kwargs: 1_000_000
     )

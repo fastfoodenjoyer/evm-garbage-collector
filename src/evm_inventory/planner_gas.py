@@ -8,6 +8,9 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Lock
 
+from eth_abi import decode
+from eth_abi.exceptions import DecodingError
+
 from .diagnostics import exception_diagnostic, redact_text
 from .executor import approve_transaction, token_allowance
 from .fee_planner import FeePlanner, native_asset_identity
@@ -24,20 +27,34 @@ _TRANSFER_SELECTOR = "a9059cbb"
 _UINT256_MAX = 2**256 - 1
 
 
-def _approval_dependent_revert(error: ValueError) -> bool:
+def _approval_dependent_revert(
+    error: ValueError, *, expected_spender: str | None = None, expected_amount: int | None = None,
+) -> bool:
     text = str(error).lower()
-    if any(marker in text for marker in ("allowance", "transfer_from_failed")):
-        return True
     prefix = "estimate_gas_rpc_error:"
     if not text.startswith(prefix):
-        return False
+        return any(marker in text for marker in ("insufficient allowance", "transfer_from_failed"))
     try:
         failure = json.loads(str(error)[len(prefix):])
         diagnostic = failure.get("diagnostic")
         provider = diagnostic.get("provider_error") if isinstance(diagnostic, dict) else None
-        # LI.FI/Solady TransferFromFailed(): only decoded RPC revert data qualifies.
-        return isinstance(provider, dict) and provider.get("data") == "0x7939f424"
-    except (ValueError, AttributeError):
+        provider = provider if isinstance(provider, dict) else {}
+        data = provider.get("data")
+        # LI.FI/Solady TransferFromFailed(): only structured RPC revert data qualifies.
+        if data == "0x7939f424":
+            return True
+        if isinstance(data, str) and data.lower().startswith("0xfb8f41b2"):
+            if (len(data) != 202 or not isinstance(expected_spender, str)
+                    or isinstance(expected_amount, bool) or not isinstance(expected_amount, int)):
+                return False
+            spender, allowance, needed = decode(
+                ("address", "uint256", "uint256"), bytes.fromhex(data[10:]), strict=True)
+            return (spender.lower() == expected_spender.lower()
+                    and allowance < needed == expected_amount)
+        message = str(provider.get("message", failure.get("message", ""))).lower()
+        return any(marker in message for marker in (
+            "insufficient allowance", "transfer_from_failed"))
+    except (ValueError, AttributeError, TypeError, DecodingError):
         return False
 
 
@@ -156,13 +173,15 @@ class PlannerGasEstimator:
             except ValueError as error:
                 spender = step.get("estimate", {}).get("approvalAddress")
                 token = action.get("fromToken", {}).get("address", "").lower()
-                if (not _approval_dependent_revert(error)
+                if (not _approval_dependent_revert(error, expected_spender=spender,
+                                                 expected_amount=int(action["fromAmount"]))
                         or token in {"", "0x" + "0" * 40} or not isinstance(spender, str)
                         or token_allowance(self.rpc, url=url, token=token, owner=wallet,
                                            spender=spender) >= int(action["fromAmount"])
-                        or not 0 < request.gas_limit <= 1_000_000):
+                        or request.gas_limit <= 0):
                     raise
                 # This is a cap for staged preparation, not a successful RPC simulation.
+                # FeePlanner's buffered network ceiling and fee cap bound large provider hints.
                 # Execution confirms approval, then must simulate under this fee cap before signing.
                 planned = FeePlanner(_PendingApprovalRpc(self.rpc, request.gas_limit * 2)).plan(
                     url, request, sender=wallet
