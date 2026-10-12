@@ -646,6 +646,9 @@ def execute_group_entries(
             )
         if before_step is not None:
             before_step()
+        if entry.get("_source_gas_held") and not journal.has_broadcast(positions[index]["id"]):
+            return yield_stage(positions[index]["id"],
+                               StageDeadlineExceeded("source_gas_for_unsettled_tokens"))
         position_id = positions[index]["id"]
         position_state = journal.position(position_id)["state"]
         if position_state == "completed":

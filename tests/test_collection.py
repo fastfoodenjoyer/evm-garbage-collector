@@ -160,9 +160,10 @@ def test_planning_waits_for_quota_and_only_retries_unresolved_network(tmp_path):
     from evm_inventory.collection import recover_planning
 
     path = tmp_path / "balances.csv"
+    wallet = entry()["wallet"]
     path.write_text(
         "wallet,chain_id,asset_id,raw_balance,decimals,status\n"
-        "wallet,10,native,100,18,success\nwallet,8453,native,200,18,success\n"
+        f"{wallet},10,native,100,18,success\n{wallet},8453,native,200,18,success\n"
     )
     clock = [1000.0]
     waiting = {
@@ -290,14 +291,141 @@ def test_planning_progress_hook_runs_before_quota_wait_and_after_refresh(tmp_pat
     assert events == [(1000, 1), (1002, 2)]
 
 
+def test_planning_retry_preserves_ready_unsent_sibling_on_same_network(tmp_path):
+    import csv
+
+    from evm_inventory.collection import recover_planning
+    native = {**entry(10), "wallet": "wallet"}
+    waiting = {**native, "asset_id": "0xabc", "status": "manual_review", "reason": "quota_wait",
+               "search": {"pending": [{"retry_at": 1002}]}}
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+                      "wallet,10,native,100,18,success\n"
+                      "wallet,10,0xabc,200,18,success\n")
+    clock, calls = [1000.0], []
+    def quote(path):
+        calls.extend(csv.DictReader(path.open()))
+        return {"entries": [{**waiting, "status": "route_ready", "reason": None}]}
+    result = recover_planning({"entries": [native, waiting]}, source, quote, until=1010,
+        clock=lambda: clock[0], wall_clock=lambda: clock[0],
+        sleep=lambda s: clock.__setitem__(0, clock[0]+s), frozen_keys=set())
+    assert [r["asset_id"] for r in calls] == ["0xabc"]
+    assert next(e for e in result["entries"] if e["asset_id"] == "native") == native
+
+
+def test_planning_retry_does_not_query_future_job_on_same_network(tmp_path):
+    import csv
+
+    from evm_inventory.collection import recover_planning
+    waiting = {**entry(10), "wallet": "wallet", "asset_id": "0xaaa", "status": "manual_review",
+               "reason": "quota_wait", "search": {"pending": [{"retry_at": 1002}]}}
+    later = {**waiting, "asset_id": "0xbbb", "search": {"pending": [{"retry_at": 2000}]}}
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+                      "wallet,10,0xaaa,100,18,success\n"
+                      "wallet,10,0xbbb,200,18,success\n")
+    clock, calls = [1000.0], []
+    def quote(path):
+        calls.extend(csv.DictReader(path.open()))
+        return {"entries": [{**waiting, "status": "route_ready", "reason": None}]}
+    result = recover_planning({"entries": [waiting, later]}, source, quote, until=1010,
+        clock=lambda: clock[0], wall_clock=lambda: clock[0],
+        sleep=lambda s: clock.__setitem__(0, clock[0]+s))
+    assert [r["asset_id"] for r in calls] == ["0xaaa"]
+    assert next(e for e in result["entries"] if e["asset_id"] == "0xbbb") == later
+
+
+def test_missing_retry_result_does_not_remove_owned_balance(tmp_path):
+    from evm_inventory.collection import recover_planning
+    waiting = {**entry(10), "wallet": "wallet", "status": "manual_review", "reason": "quota_wait"}
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+                      "wallet,10,native,100,18,success\n")
+    clock = [1000.0]
+    result = recover_planning({"entries": [waiting]}, source, lambda _: {"entries": []}, until=1003,
+        clock=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0]+s))
+    assert result["entries"] == [waiting]
+
+
+@pytest.mark.parametrize("same_group", (False, True))
+def test_native_waits_for_retried_token_with_real_group_identity(tmp_path, same_group):
+    from evm_inventory.collection import drive_execution
+    native = {**entry(10), "status": "route_ready", "routing_provider": "lifi"}
+    token = {**native, "asset_id": "0xabc", "group": {
+        **native["group"], "key": native["group"]["key"] if same_group else "new-token-group"}}
+    path, calls, clock = tmp_path / "fixture.sqlite", [], [1000.0]
+    def execute(entries):
+        calls.append([e["asset_id"] for e in entries if not e.get("_source_gas_held")])
+        with Journal(path) as journal:
+            for e in entries:
+                if e.get("_source_gas_held"):
+                    continue
+                p = journal.get_or_create_position(
+                    position_key=_position_key(e), wallet=e["wallet"])
+                journal.record_position_state(p["id"], "completed")
+    result = drive_execution({"entries": [native, token]}, path, execute_round=execute,
+        until=1010, clock=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0]+s))
+    assert calls == ([["0xabc", "native"]] if same_group else [["0xabc"], ["native"]])
+    assert result["status"] == "completed"
+    assert native["group"]["source_usd"] == "100"
+
+
+def test_group_keeps_native_gas_hold_before_any_preparation_or_signature(tmp_path):
+    from decimal import Decimal
+
+    from evm_inventory.route_execution import execute_group_entries
+    native = {**entry(10), "_source_gas_held": True}
+    with Journal(tmp_path / "fixture.sqlite") as journal:
+        result = execute_group_entries([native], journal=journal,
+            max_route_loss_pct=Decimal("15"),
+            preflight=lambda _: pytest.fail("held native must not prepare"),
+            submit_step=lambda *_: pytest.fail("held native must not send"))
+        assert result["deferred"] == 1
+        group = journal.group(result["group_id"])
+        assert group["state"] == "active" and group["source_usd"] == "100"
+        position = journal.connection.execute(
+            "SELECT * FROM route_positions WHERE position_key=?",
+            (_position_key(native),)).fetchone()
+        assert position["state"] == "planned"
+        assert position["reason"] == "source_gas_for_unsettled_tokens"
+        assert not journal.has_broadcast(position["id"])
+
+
+@pytest.mark.parametrize("conflict", (False, True))
+def test_celo_retry_selects_native_alias_and_retains_conflicting_views(tmp_path, conflict):
+    import csv
+
+    from evm_inventory.celo import CELO_TOKEN_ADDRESS, normalize_celo_balances
+    from evm_inventory.collection import recover_planning
+    waiting = {**entry(42220), "wallet": "wallet", "asset_id": CELO_TOKEN_ADDRESS,
+               "status": "manual_review", "reason": "quota_wait"}
+    source = tmp_path / "balances.csv"
+    source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
+        "wallet,42220,native,100,18,success\n" +
+        (f"wallet,42220,{CELO_TOKEN_ADDRESS},200,18,success\n" if conflict else ""))
+    calls, clock = [], [1000.0]
+    def quote(path):
+        rows = list(csv.DictReader(path.open()))
+        calls.extend(rows)
+        normalized = normalize_celo_balances(rows)
+        assert normalized[0].get("balance_conflict", False) == conflict
+        return {"entries": [{**waiting, "status": "route_ready", "reason": None}]}
+    recover_planning({"entries": [waiting]}, source, quote, until=1010,
+        clock=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0]+s))
+    assert len(calls) == (2 if conflict else 1)
+    assert calls[0]["asset_id"] == "native"
+
+
 def test_quota_wait_does_not_delay_unrelated_rpc_retry(tmp_path):
     import csv
 
     from evm_inventory.collection import recover_planning
 
     source = tmp_path / "balances.csv"
+    wallet = entry()["wallet"]
     source.write_text("wallet,chain_id,asset_id,raw_balance,decimals,status\n"
-                      "wallet,1116,native,100,18,success\nwallet,8453,native,100,18,success\n")
+                      f"{wallet},1116,native,100,18,success\n"
+                      f"{wallet},8453,native,100,18,success\n")
     clock, calls = [1000.0], []
     waiting = {**entry(8453), "status": "manual_review", "reason": "quota_wait",
                "search": {"errors": ["quota_wait"], "pending": [{"retry_at": 1008.0}]}}

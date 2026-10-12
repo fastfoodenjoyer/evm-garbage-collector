@@ -12,6 +12,7 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+from .celo import CELO_CHAIN_ID, CELO_TOKEN_ADDRESS
 from .config import add_allowlisted_tokens, snapshot
 from .executor import ExecutionRpc
 from .journal import Journal
@@ -104,6 +105,23 @@ def _asset_key(entry):
     return (str(entry["wallet"]).lower(), int(entry["chain_id"]), str(entry["asset_id"]).lower())
 
 
+def _spends_native_balance(entry):
+    return entry["asset_id"] == "native" or (
+        entry["chain_id"] == CELO_CHAIN_ID and entry["asset_id"] == CELO_TOKEN_ADDRESS)
+
+
+def _retry_row_key(row):
+    key = _asset_key(row)
+    if (key[1:] == (CELO_CHAIN_ID, "native") and row.get("status") == "success"
+            and str(row.get("decimals")) == "18"):
+        return (key[0], CELO_CHAIN_ID, CELO_TOKEN_ADDRESS)
+    return key
+
+
+def _group_key(entry):
+    return entry.get("group", {}).get("key") or _position_key(entry)
+
+
 def _search_error_reasons(search):
     return {e if isinstance(e, str) else e.get("reason", (
         "quota_wait" if isinstance(e.get("retry_at"), (int, float)) else "quote_request_failed"
@@ -161,8 +179,8 @@ def recover_planning(
             # on another network can be retried while its route quota is waiting.
             wait = (max(backoff, min(times) - wall_clock()) if times and
                     errors <= {"quota_wait", "provider_cooldown"} else backoff)
-            chain = entry["chain_id"]
-            due[chain] = min(due.get(chain, math.inf), clock() + wait)
+            key = _asset_key(entry)
+            due[key] = min(due.get(key, math.inf), clock() + wait)
         delay = min(due.values()) - clock()
         if delay >= until - clock():
             if progress:
@@ -179,16 +197,13 @@ def recover_planning(
                 tick_at = clock() + 60
             if progress and end - clock() > 60 and int(end - clock()) % 60 == 0:
                 progress(f"Provider cooldown: {end - clock():.0f} seconds remaining")
-        chains = {chain for chain, when in due.items() if when <= clock() and (
-            frozen_keys is not None or chain not in locked_chains
-        )}
-        if not chains:
+        retry_keys = {key for key, when in due.items() if when <= clock()}
+        if not retry_keys:
             continue
+        chains = {key[1] for key in retry_keys}
         with Path(balances_path).open(newline="") as stream:
             reader = csv.DictReader(stream)
-            rows = [r for r in reader if int(r["chain_id"]) in chains and (
-                frozen_keys is None or _asset_key(r) not in frozen_keys
-            )]
+            rows = [r for r in reader if _retry_row_key(r) in retry_keys]
             fields = reader.fieldnames
         retry_path = Path(balances_path).parent.parent / "retry-balances.csv"
         with retry_path.open("w", newline="") as stream:
@@ -196,13 +211,12 @@ def recover_planning(
             writer.writeheader()
             writer.writerows(rows)
         refreshed = quote(retry_path)
+        replacements = [e for e in refreshed["entries"] if _asset_key(e) in retry_keys]
+        replaced_keys = {_asset_key(e) for e in replacements}
         plan = {
             **plan,
-            "entries": [e for e in plan["entries"] if e["chain_id"] not in chains or (
-                frozen_keys is not None and _asset_key(e) in frozen_keys
-            )] + [e for e in refreshed["entries"] if frozen_keys is None or (
-                _asset_key(e) not in frozen_keys
-            )],
+            "entries": [e for e in plan["entries"] if _asset_key(e) not in replaced_keys]
+            + replacements,
         }
         plan["summary"] = dict(Counter(e["status"] for e in plan["entries"]))
         plan.setdefault("recovery_attempts", []).append(
@@ -336,17 +350,6 @@ def drive_execution(
         def eligible(e):
             return e["chain_id"] not in unresolved_chains or _position_key(e) in observed_keys
         active = [e for e in active if eligible(e)]
-        blocked_chains = {
-            p["chain_id"]
-            for p in positions
-            if p["asset_id"] != "native" and p["state"] != "completed"
-        }
-        active = [
-            e
-            for e in active
-            if not (e.get("routing_provider") == "relay" and e["chain_id"] in blocked_chains
-                    and _position_key(e) not in observed_keys)
-        ]
         if not active and (failure or unresolved_chains):
             return {
                 "status": "incomplete",
@@ -366,6 +369,22 @@ def drive_execution(
             and (_position_key(e) in active_keys or e.get("group", {}).get("key") in groups)
             and eligible(e)
         ]
+        unfinished_tokens = [e for e in plan["entries"] if e.get("status") in _READY
+                             and not _spends_native_balance(e)
+                             and any(p["position_key"] == _position_key(e)
+                                     and p["state"] != "completed" for p in positions)]
+        active = [{**e, "_source_gas_held": (
+            _spends_native_balance(e) and _position_key(e) not in observed_keys
+            and any(_asset_key(e)[:2] == _asset_key(token)[:2]
+                    and (_group_key(e) != _group_key(token)
+                         or e.get("routing_provider") == "relay")
+                    for token in unfinished_tokens))} for e in active]
+        # Relay native sends have their own group/adapter; ordinary groups retain
+        # all members and defer their unsigned native member inside the executor.
+        active = [e for e in active if not (
+            e.get("routing_provider") == "relay" and e.get("_source_gas_held"))]
+        # Keep complete group membership/budgets; inside each group tokens go first.
+        active.sort(key=_spends_native_balance)
         state = tuple((p["position_key"], p["state"], p["reason"]) for p in positions)
         if progress and state != last_progress:
             progress(f"Settlement: {completed}/{len(positions)} completed; {len(pending)} pending")
