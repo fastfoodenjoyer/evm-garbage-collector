@@ -114,12 +114,16 @@ def verified_transaction(quote, chains):
     }
     if order["solverChainId"] not in evm_ids:
         raise ValueError("Relay solver VM is unsupported")
+    allowed_refunds = {
+        (source_id, request["user"].lower(), request["originCurrency"]),
+        (destination_id, request["recipient"].lower(), request["destinationCurrency"]),
+    }
     for refund in order["inputs"][0]["refunds"]:
-        if (
-            refund["chainId"] not in evm_ids
-            or refund["recipient"].lower() != request["user"].lower()
-        ):
-            raise ValueError("Relay refund must return to the source wallet on EVM")
+        # Relay orders may refund on either leg. Only the exact source wallet
+        # and approved destination payment identities are authorized here.
+        identity = (refund["chainId"], refund["recipient"].lower(), refund["currency"].lower())
+        if identity not in allowed_refunds:
+            raise ValueError("Relay refund differs from the authorized source or destination")
     # EVM addresses encode to their original 20 bytes in the settlement SDK.
     order["salt"] = (
         int(str(order["salt"]), 0) if str(order["salt"]).startswith("0x") else int(order["salt"])

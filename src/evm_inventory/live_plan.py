@@ -510,6 +510,20 @@ def _apply_relay_fallback(entries, wallet, clients, targets, limit, floor, recip
                 "from": "lifi", "reason": entry.get("reason"), "search": entry.get("search")
             }
             entries[index] = alternative
+        else:
+            entry["relay_fallback"] = {
+                "status": alternative.get("status"),
+                "reason": alternative.get("reason"),
+                "search": alternative.get("search"),
+                "diagnostic": alternative.get("diagnostic"),
+                "candidates": [
+                    {key: candidate[key] for key in (
+                        "target", "loss_pct", "deposit_minimum_met",
+                        "gas_reserve_sufficient", "within_loss_limit",
+                    ) if key in candidate}
+                    for candidate in alternative.get("relay_candidates", [])
+                ],
+            }
 
 
 def _invalidate_expired_comparisons(entries: list[dict], now: datetime, *,
