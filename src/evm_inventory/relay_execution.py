@@ -22,7 +22,7 @@ from .executor import (
 from .fee_planner import FeePlanner
 from .journal import Journal
 from .relay_protocol import verified_transaction
-from .rpc import quantity
+from .rpc import quantity, uint256
 from .stages import (
     Deadline,
     StageDeadlineExceeded,
@@ -137,7 +137,7 @@ def _destination_transfer(rpc, rpc_urls, checkpoint, hashes):
                 and topics[0].lower() == _TRANSFER
                 and topics[2].lower() == recipient_topic
             ):
-                received += quantity(log["data"])
+                received += uint256(log["data"])
         if received:
             total += received
             matched.append(tx_hash)
@@ -206,6 +206,11 @@ def _observe(journal, position, checkpoint, client, rpc, rpc_urls, bitget):
         raise RelayTerminalFailure(f"Bitget Relay deposit failed: {credit}")
     if str(credit).lower() != "success":
         return "pending"
+    journal.save_checkpoint(position["id"], "bitget_credit", {
+        "tx_hash": destination_hash, "coin": target["coin"], "chain": target["chain"],
+        "recipient": checkpoint["recipient"], "status": "success",
+        "observed_at": int(time.time() * 1000),
+    })
     journal.record_step_state(step["id"], "credited")
     journal.record_position_state(position["id"], "completed")
     return "completed"
