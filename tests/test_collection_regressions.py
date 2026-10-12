@@ -55,9 +55,10 @@ def test_live_route_valuation_reads_clock_after_fetching_fresh_gas_prices():
     assert candidate.is_valid
 
 
+@pytest.mark.parametrize("reason", ["requote_required:stale_price", "native_gas_reserve_unstable"])
 @pytest.mark.parametrize("broadcast", [None, "approval:router", "bridge:0"])
 def test_stale_price_group_recovery_preserves_approvals_and_never_unlocks_spent_assets(
-    tmp_path, broadcast,
+    tmp_path, broadcast, reason,
 ):
     from evm_inventory.journal import Journal
 
@@ -69,11 +70,10 @@ def test_stale_price_group_recovery_preserves_approvals_and_never_unlocks_spent_
             journal.record_step_intent(position_id=p["id"], step_key=broadcast, nonce=1,
                 calldata_digest="a" * 64, signed_payload_digest="b" * 64,
                 tx_hash="0x" + "c" * 64)
-        reason = "requote_required:stale_price"
         journal.record_position_state(p["id"], "manual_review", reason=reason)
         journal.record_group_state(g["id"], "manual_review_group_halted", reason=reason)
-        assert not journal.reactivate_stale_price_group(g["id"], {"another-position"})
-        assert journal.reactivate_stale_price_group(g["id"], {"p"}) is (broadcast != "bridge:0")
+        assert not journal.reactivate_unsigned_retry_group(g["id"], {"another-position"})
+        assert journal.reactivate_unsigned_retry_group(g["id"], {"p"}) is (broadcast != "bridge:0")
         if broadcast != "bridge:0":
             assert journal.position(p["id"])["state"] == "planned"
             assert journal.group(g["id"])["state"] == "active"
@@ -82,7 +82,8 @@ def test_stale_price_group_recovery_preserves_approvals_and_never_unlocks_spent_
                 assert journal.latest_step(position_id=p["id"], step_key=broadcast)["tx_hash"]
 
 
-def test_automatic_stale_price_failure_yields_and_retries_instead_of_halting(tmp_path):
+@pytest.mark.parametrize("reason", ["requote_required:stale_price", "native_gas_reserve_unstable"])
+def test_automatic_stale_price_failure_yields_and_retries_instead_of_halting(tmp_path, reason):
     from decimal import Decimal
 
     from test_route_execution import ASSET_A, _entry
@@ -93,7 +94,7 @@ def test_automatic_stale_price_failure_yields_and_retries_instead_of_halting(tmp
     e = {**_entry(ASSET_A), "automatic_requote": True}
     with Journal(tmp_path / "inventory.sqlite") as journal:
         def stale(_):
-            raise ValueError("requote_required:stale_price")
+            raise ValueError(reason)
 
         result = execute_group_entries([e], journal=journal, max_route_loss_pct=Decimal("15"),
                                       preflight=stale, submit_step=lambda *_: pytest.fail("send"))
@@ -108,7 +109,7 @@ def test_collection_resumes_only_explicit_automatic_stale_price_groups(
 ):
     from test_route_execution import ASSET_A, ASSET_B, _entry
 
-    from evm_inventory.collection import _resume_stale_price_groups
+    from evm_inventory.collection import _resume_unsigned_retry_groups
     from evm_inventory.journal import Journal
     from evm_inventory.route_execution import _position_key
 
@@ -126,7 +127,7 @@ def test_collection_resumes_only_explicit_automatic_stale_price_groups(
     if skipped_sibling:
         entries.append({**_entry(ASSET_B), "status": "manual_review",
                         "reason": "below_target_minimum", "automatic_requote": automatic})
-    _resume_stale_price_groups(entries, path)
+    _resume_unsigned_retry_groups(entries, path)
     with Journal(path) as journal:
         assert journal.group(g["id"])["state"] == (
             "active" if automatic else "manual_review_group_halted")
@@ -928,9 +929,13 @@ def test_automatic_requote_accepts_new_quote_id_after_identity_and_fee_validatio
 
 
 @pytest.mark.parametrize("provider_hint", [1, 100, 10_000])
-@pytest.mark.parametrize("fee_values", [(10,), (10, 11, 10)])
+@pytest.mark.parametrize("native_balance,fee_values", [
+    (2000, (10,)), (2000, (10, 11, 10)), (2000, (10, 11, 12)),
+    (2000, (20, 21, 22)), (100, (30,)),
+])
+@pytest.mark.parametrize("saved_cap", [None, 10])
 def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
-    provider_hint, fee_values
+    provider_hint, fee_values, saved_cap, native_balance,
 ):
     from types import SimpleNamespace
 
@@ -953,8 +958,10 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
     )
     step = {"kind": "bridge", "route": _route_data(old)}
     e = {**_entry("native", status="route_ready", steps=[step]), "automatic_requote": True}
+    if saved_cap is not None:
+        e["reservations"] = {"source_native_gas_cap_raw": str(saved_cap)}
     gas = SimpleNamespace(
-        rpc=SimpleNamespace(call=lambda *_: hex(2000)),
+        rpc=SimpleNamespace(call=lambda *_: hex(native_balance)),
         rpc_urls={10: "rpc"},
         estimate_prepared_route=lambda **_: (
             FeeQuote(
@@ -990,9 +997,12 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
         bitget=bitget,
     )
     assert candidate.is_valid
-    expected = 1970 if len(fee_values) == 1 else 1967
+    expected = native_balance - (fee_values[0] * 3 * 12 + 9) // 10
+    if expected <= 0:
+        expected = native_balance - fee_values[0] * 3
     assert int(fresh["route"]["from_amount"]) == expected
     assert amounts[-1] == expected
+    assert len(amounts) == (2 if saved_cap is None or fee_values[0] > saved_cap else 1)
 
 
 @pytest.mark.parametrize(

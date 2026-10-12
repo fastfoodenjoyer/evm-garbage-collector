@@ -1756,16 +1756,21 @@ def _refresh_route_step(
         and step.get("kind") != "unwrap_to_native"
     )
     native_available = None
+    prepared_cap = 0
     if allow_replacement and source.is_native:
         native_available = _asset_balance(
             gas_estimator.rpc, url=_rpc_url(gas_estimator.rpc_urls, source.chain_id),
             asset=source, wallet=wallet.public_address,
         )
         hint = sum(cost.amount for cost in planned.gas_costs if cost.token == source)
+        saved_cap = entry.get("reservations", {}).get("source_native_gas_cap_raw")
+        prepared_cap = _raw_amount(saved_cap) if saved_cap is not None else 0
         if _spend_amount is not None:
             amount = _spend_amount
         else:
-            hinted_available = native_available - hint * GAS_RESERVE_MULTIPLIER * 2
+            reserve = ((prepared_cap * GAS_RESERVE_MULTIPLIER * 12 + 9) // 10
+                       if prepared_cap else hint * GAS_RESERVE_MULTIPLIER * 2)
+            hinted_available = native_available - reserve
             amount = min(amount, hinted_available if hinted_available > 0
                          else max(1, native_available // 2))
         if native_available <= 0:
@@ -1839,16 +1844,20 @@ def _refresh_route_step(
     if native_available is not None and extra_gas:
         fee_cap = sum(f.raw_amount for f in extra_gas if f.price and f.price.asset == source)
         spendable = native_available - GAS_RESERVE_MULTIPLIER * fee_cap
-        if amount != spendable and not (_reserve_attempt >= 2 and amount < spendable):
+        if amount > spendable or (not prepared_cap and _reserve_attempt == 0
+                                  and amount < spendable):
             if spendable <= 0:
                 raise ValueError("insufficient_source_gas")
             if _reserve_attempt >= 2:
                 raise ValueError("native_gas_reserve_unstable")
+            padded_spendable = native_available - (
+                fee_cap * GAS_RESERVE_MULTIPLIER * 12 + 9) // 10
             return _refresh_route_step(
                 entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
                 jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
                 now_fn=now_fn,
-                _spend_amount=spendable, _reserve_attempt=_reserve_attempt + 1,
+                _spend_amount=padded_spendable if padded_spendable > 0 else spendable,
+                _reserve_attempt=_reserve_attempt + 1,
             )
     prepared_requests = getattr(gas_estimator, "prepared_fee_caps", {}).get(
         live.route_id, prepared_requests
@@ -3165,7 +3174,9 @@ def _execution_reason(exc: Exception) -> str:
 def _retryable_provider_error(error):
     if isinstance(error, (LifiRequestLimit, JobInProgress)):
         return True
-    if isinstance(error, ValueError) and str(error) == "requote_required:stale_price":
+    if isinstance(error, ValueError) and str(error) in {
+        "requote_required:stale_price", "native_gas_reserve_unstable"
+    }:
         return True
     return is_transient_error(error)
 

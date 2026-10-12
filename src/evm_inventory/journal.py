@@ -435,17 +435,18 @@ class Journal:
         self.connection.commit()
         return True
 
-    def reactivate_stale_price_group(self, group_id: int, position_keys: set[str]) -> bool:
-        """Retry exact unsigned members after a legacy price-timestamp failure."""
-        reason = "requote_required:stale_price"
+    def reactivate_unsigned_retry_group(self, group_id: int, position_keys: set[str]) -> bool:
+        """Retry exact unsigned members after temporary valuation/fee preparation failures."""
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
             group = self.group(group_id)
+            reason = group["reason"]
             rows = self.connection.execute(
                 "SELECT id,position_key,state,reason FROM route_positions WHERE group_id=?",
                 (group_id,),
             ).fetchall()
-            if (group["state"] != "manual_review_group_halted" or group["reason"] != reason
+            if (group["state"] != "manual_review_group_halted" or reason not in {
+                    "requote_required:stale_price", "native_gas_reserve_unstable"}
                     or not rows or {r["position_key"] for r in rows} != position_keys
                     or any(r["state"] not in {"manual_review", "manual_review_group_halted"}
                            or r["reason"] != reason or self.has_asset_broadcast(r["id"])

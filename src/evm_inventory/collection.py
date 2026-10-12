@@ -275,7 +275,7 @@ def execution_positions(entries, db_path):
     return result
 
 
-def _resume_stale_price_groups(entries, db_path):
+def _resume_unsigned_retry_groups(entries, db_path):
     groups = {}
     for entry in entries:
         if entry.get("status") in _READY and entry.get("group"):
@@ -288,8 +288,8 @@ def _resume_stale_price_groups(entries, db_path):
                 "SELECT id FROM route_groups WHERE group_key=?", (key,),
             ).fetchone()
             if group:
-                journal.reactivate_stale_price_group(group["id"],
-                                                     {_position_key(e) for e in members})
+                journal.reactivate_unsigned_retry_group(group["id"],
+                                                       {_position_key(e) for e in members})
 
 
 def drive_execution(
@@ -605,7 +605,7 @@ def collect_wallets(
                     seconds=max(0.1, planning_until - clock()),
                 )
             if execute:
-                _resume_stale_price_groups(plan["entries"], db_path)
+                _resume_unsigned_retry_groups(plan["entries"], db_path)
             locked_chains = set()
             frozen_keys = set()
             if not previous:
