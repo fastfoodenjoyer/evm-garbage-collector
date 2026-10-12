@@ -97,6 +97,17 @@ def test_relay_refund_change_still_requires_matching_order_hash():
         verified_transaction(quote, CHAINS)
 
 
+def test_relay_rejects_old_order_id_even_when_calldata_commits_to_new_terms():
+    original = _quote()
+    refunds = original["response"]["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"]
+    refunds[1]["minimumAmount"] = "1"
+    changed = _quote(refunds)
+    changed["response"]["protocol"]["v2"]["orderId"] = original["response"]["protocol"][
+        "v2"]["orderId"]
+    with pytest.raises(ValueError, match="order hash"):
+        verified_transaction(changed, CHAINS)
+
+
 def test_relay_planner_advances_quote_with_approved_destination_refund():
     from decimal import Decimal
 
