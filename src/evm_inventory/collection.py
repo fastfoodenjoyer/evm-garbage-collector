@@ -313,10 +313,128 @@ def _resume_unsigned_retry_groups(entries, db_path):
                                                              {_position_key(e) for e in members})
 
 
+def _wallet_arrival_chains(entry, wallet):
+    """Use top-level route evidence to identify a wallet-executed destination leg."""
+    if str(entry.get("wallet", "")).lower() != wallet:
+        return set()
+    chains = set()
+    for step in entry.get("steps", []):
+        for leg in step.get("route", {}).get("evidence", {}).get("steps", []):
+            destination = leg.get("destination")
+            if (not leg.get("is_substep") and isinstance(destination, dict)
+                    and str(leg.get("recipient", "")).lower() == wallet):
+                chains.add(int(destination["chain_id"]))
+    return chains
+
+
+def _destination_gas_dependencies(plan, db_path):
+    """Keep gas for unfinished wallet arrivals and recoverable saved continuations."""
+    dependencies = {}
+
+    def reserve(wallet, chain, owner):
+        dependencies.setdefault((wallet, int(chain)), set()).add(owner)
+
+    enabled = {int(t["chain_id"]) for t in plan.get("search_scope", {}).get("enabled_targets", [])}
+    with Journal(db_path) as journal:
+        for entry in plan["entries"]:
+            owner, wallet = _position_key(entry), str(entry["wallet"]).lower()
+            position = journal.connection.execute(
+                "SELECT id,state,wallet FROM route_positions WHERE position_key=?", (owner,)
+            ).fetchone()
+            if position and position["wallet"].lower() != wallet:
+                continue
+            if (position and position["state"] == "completed"
+                    and not route_credit_unverified(entry, journal, position["id"])):
+                continue
+            if _unresolved(entry) and entry.get("reason") not in _PERMANENT_REASONS:
+                for chain in enabled:
+                    reserve(wallet, chain, owner)
+            if entry.get("status") not in _READY and position is None:
+                continue
+            chains = _wallet_arrival_chains(entry, wallet)
+            if position:
+                saved_keys = journal.connection.execute(
+                    "SELECT checkpoint_key FROM route_checkpoints WHERE position_id=? AND "
+                    "(checkpoint_key IN ('prepared','bridge_prepared','canonical_prepared') "
+                    "OR checkpoint_key LIKE 'route:%')", (position["id"],)
+                ).fetchall()
+                for row in saved_keys:
+                    saved = journal.checkpoint(position["id"], row["checkpoint_key"])
+                    continuation = saved.get("continuation")
+                    context = continuation if isinstance(continuation, dict) else saved
+                    if str(context.get("wallet", "")).lower() != wallet:
+                        continue
+                    chains.update(_wallet_arrival_chains(context, wallet))
+                    # An advanced child may only contain a local withdrawal/deposit.
+                    if (isinstance(continuation, dict)
+                            or int(context.get("chain_id", entry["chain_id"]))
+                            != int(entry["chain_id"])):
+                        chains.add(int(context["chain_id"]))
+            for chain in chains:
+                reserve(wallet, chain, owner)
+    return dependencies
+
+
+def _native_gas_dependency_cycles(entries, positions, destination_gas):
+    """Identify mutually blocked unsigned native owners without releasing their gas."""
+    unsigned = {p["position_key"] for p in positions if not p["has_broadcast"]
+                and p["state"] != "completed" and not p["state"].startswith("manual_review")}
+    owners = {_position_key(e): e for e in entries if e.get("status") in _READY
+              and _spends_native_balance(e) and _position_key(e) in unsigned}
+    graph = {key: (destination_gas.get(_asset_key(e)[:2], set()) & owners.keys()) - {key}
+             for key, e in owners.items()}
+
+    def reachable(start):
+        found, pending_nodes = set(), [start]
+        while pending_nodes:
+            current = pending_nodes.pop()
+            if current not in found:
+                found.add(current)
+                pending_nodes.extend(graph[current] - found)
+        return found
+
+    reach = {key: reachable(key) for key in graph}
+    remaining, cycles = set(graph), []
+    while remaining:
+        start = min(remaining)
+        component = {key for key in reach[start] if start in reach[key]}
+        remaining -= component
+        if len(component) > 1:
+            cycles.append({
+                "wallet": str(owners[start]["wallet"]).lower(),
+                "members": [{"position_key": key, "chain_id": int(owners[key]["chain_id"]),
+                             "depends_on": sorted(graph[key] & component)}
+                            for key in sorted(component)],
+            })
+    return cycles
+
+
+def _record_native_gas_cycles(cycles, active_keys, db_path):
+    """Attach cycle evidence only after the normal executor created an exact position."""
+    with Journal(db_path) as journal:
+        for cycle in cycles:
+            for member in cycle["members"]:
+                if member["position_key"] not in active_keys:
+                    continue
+                position = journal.connection.execute(
+                    "SELECT id,state FROM route_positions WHERE position_key=?",
+                    (member["position_key"],),
+                ).fetchone()
+                if (not position or position["state"] == "completed"
+                        or position["state"].startswith("manual_review")
+                        or journal.has_broadcast(position["id"])):
+                    continue
+                journal.save_checkpoint(position["id"], "native_gas_dependency_cycle", cycle)
+                journal.record_position_state(position["id"], position["state"],
+                                              reason="native_gas_dependency_cycle")
+
+
 def drive_execution(
-    plan, db_path, *, execute_round, until, clock=time.monotonic, sleep=time.sleep, progress=None
+    plan, db_path, *, execute_round, until, clock=time.monotonic, sleep=time.sleep, progress=None,
+    dependency_plan=None,
 ):
     """Continue the same immutable plan; known broadcasts are observed by its journal."""
+    dependencies = plan if dependency_plan is None else dependency_plan
     rounds = 0
     last_progress = None
     last_result = {}
@@ -369,20 +487,47 @@ def drive_execution(
             and (_position_key(e) in active_keys or e.get("group", {}).get("key") in groups)
             and eligible(e)
         ]
-        unfinished_tokens = [e for e in plan["entries"] if e.get("status") in _READY
+        dependency_positions = (positions if dependencies is plan else
+                                execution_positions(dependencies["entries"], db_path))
+        unfinished_tokens = [e for e in dependencies["entries"] if e.get("status") in _READY
                              and not _spends_native_balance(e)
                              and any(p["position_key"] == _position_key(e)
-                                     and p["state"] != "completed" for p in positions)]
+                                     and p["state"] != "completed" for p in dependency_positions)]
+        destination_gas = _destination_gas_dependencies(dependencies, db_path)
+        native_cycles = _native_gas_dependency_cycles(
+            dependencies["entries"], dependency_positions, destination_gas)
         active = [{**e, "_source_gas_held": (
             _spends_native_balance(e) and _position_key(e) not in observed_keys
             and any(_asset_key(e)[:2] == _asset_key(token)[:2]
                     and (_group_key(e) != _group_key(token)
                          or e.get("routing_provider") == "relay")
-                    for token in unfinished_tokens))} for e in active]
+                    for token in unfinished_tokens)), "_destination_gas_held": (
+            _spends_native_balance(e) and _position_key(e) in pending
+            and _position_key(e) not in observed_keys
+            and bool(destination_gas.get(_asset_key(e)[:2], set()) - {_position_key(e)}))}
+            for e in active]
+        held_only = any(e.get("_destination_gas_held") for e in active) and all(
+            e.get("_source_gas_held") or e.get("_destination_gas_held")
+            for e in active if _position_key(e) in pending
+        )
+        held_cycle_keys = {_position_key(e) for e in active if e.get("_destination_gas_held")}
         # Relay native sends have their own group/adapter; ordinary groups retain
         # all members and defer their unsigned native member inside the executor.
+        held_relay = [e for e in active if e.get("routing_provider") == "relay"
+                      and (e.get("_source_gas_held") or e.get("_destination_gas_held"))]
+        if held_relay:
+            with Journal(db_path) as journal:
+                for entry in held_relay:
+                    position = journal.get_or_create_position(
+                        position_key=_position_key(entry), wallet=entry["wallet"])
+                    if position["state"] == "completed" or journal.has_broadcast(position["id"]):
+                        continue
+                    reason = ("source_gas_for_unsettled_tokens" if entry.get("_source_gas_held")
+                              else "destination_gas_for_unsettled_routes")
+                    journal.record_position_state(position["id"], position["state"], reason=reason)
         active = [e for e in active if not (
-            e.get("routing_provider") == "relay" and e.get("_source_gas_held"))]
+            e.get("routing_provider") == "relay"
+            and (e.get("_source_gas_held") or e.get("_destination_gas_held")))]
         # Keep complete group membership/budgets; inside each group tokens go first.
         active.sort(key=_spends_native_balance)
         state = tuple((p["position_key"], p["state"], p["reason"]) for p in positions)
@@ -400,6 +545,19 @@ def drive_execution(
         except StageDeadlineExceeded:
             last_result = {"deferred": len(active)}
         rounds += 1
+        if native_cycles:
+            _record_native_gas_cycles(native_cycles, held_cycle_keys, db_path)
+        if held_only:
+            blocked_cycles = [cycle for cycle in native_cycles if any(
+                member["position_key"] in held_cycle_keys for member in cycle["members"])]
+            return {
+                "status": "incomplete", "reason": (
+                    "native_gas_dependency_cycle" if blocked_cycles else "planning_incomplete"),
+                "completed": completed, "rounds": rounds,
+                "positions": execution_positions(plan["entries"], db_path),
+                "last_round": last_result,
+                **({"native_gas_dependency_cycles": blocked_cycles} if blocked_cycles else {}),
+            }
         if clock() < until:
             sleep(min(3, max(0, until - clock())))
 
@@ -684,6 +842,7 @@ def collect_wallets(
                 drive_execution(
                     {"entries": ready}, db_path, execute_round=execute_round,
                     until=min(until, clock() + 90), clock=clock, sleep=sleep, progress=progress,
+                    dependency_plan=current,
                 )
                 with Journal(db_path) as journal:
                     for e in ready:
