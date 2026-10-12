@@ -155,6 +155,29 @@ def test_unauthenticated_quota_uses_published_limits_with_execution_reserves():
     }
 
 
+def test_settlement_sleep_cannot_be_negative_when_clock_crosses_runtime(tmp_path):
+    from test_route_execution import _entry
+
+    from evm_inventory.collection import drive_execution
+
+    armed = [False]
+    samples = iter([1009.0, 1011.0])
+
+    def clock():
+        return next(samples, 1011.0) if armed[0] else 1000.0
+
+    def execute(_):
+        armed[0] = True
+        return {}
+
+    def sleep(seconds):
+        assert seconds >= 0
+
+    result = drive_execution({"entries": [_entry("native")]}, tmp_path / "inventory.sqlite",
+                             execute_round=execute, until=1010.0, clock=clock, sleep=sleep)
+    assert result["status"] == "incomplete"
+
+
 def test_live_route_valuation_reads_clock_after_fetching_fresh_gas_prices():
     from datetime import timedelta
     from types import SimpleNamespace

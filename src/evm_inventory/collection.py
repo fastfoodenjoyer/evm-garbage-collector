@@ -173,7 +173,7 @@ def recover_planning(
         end = clock() + delay
         tick_at = clock() + 60
         while clock() < end:
-            sleep(min(1, end - clock()))
+            sleep(min(1, max(0, end - clock())))
             if on_plan is not None and clock() >= tick_at:
                 on_plan(plan)
                 tick_at = clock() + 60
@@ -365,16 +365,19 @@ def drive_execution(
         if progress and state != last_progress:
             progress(f"Settlement: {completed}/{len(positions)} completed; {len(pending)} pending")
             last_progress = state
+        remaining = until - clock()
+        if remaining <= 0:
+            continue
         try:
             with deadline_scope(
-                Deadline(min(180, until - clock()), "collection_execution", max_seconds=86_400)
+                Deadline(min(180, remaining), "collection_execution", max_seconds=86_400)
             ):
                 last_result = execute_round(active) if active else {}
         except StageDeadlineExceeded:
             last_result = {"deferred": len(active)}
         rounds += 1
         if clock() < until:
-            sleep(min(3, until - clock()))
+            sleep(min(3, max(0, until - clock())))
 
 
 def _quote_wallet(

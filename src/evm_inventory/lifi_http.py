@@ -243,7 +243,7 @@ class LifiHttpClient:
                     dispatch = self.quota.reserve_dispatch_time()
                     while dispatch > self.clock():
                         check_deadline()
-                        self.sleep(min(1, dispatch - self.clock()))
+                        self.sleep(min(1, max(0, dispatch - self.clock())))
                     check_deadline()
                     kwargs["timeout"] = request_timeout(kwargs.get("timeout", 30))
                     while True:

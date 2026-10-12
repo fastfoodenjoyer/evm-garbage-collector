@@ -85,6 +85,32 @@ def test_provider_remaining_and_local_quota_survive_restart(tmp_path):
     resumed.close()
 
 
+def test_dispatch_clock_crossing_deadline_never_sleeps_negative_duration(tmp_path):
+    armed = [False]
+    samples = iter([999.0, 1001.0])
+    delays = []
+
+    def clock():
+        return next(samples, 1001.0) if armed[0] else 0.0
+
+    def sleep(seconds):
+        assert seconds >= 0
+        delays.append(seconds)
+
+    c = LifiHttpClient(httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(
+        200, json={"routes": []}))), db_path=tmp_path / "inventory.sqlite", proxy=PROXY,
+        clock=clock, sleep=sleep)
+
+    def dispatch():
+        armed[0] = True
+        return 1000.0
+
+    c.quota.reserve_dispatch_time = dispatch
+    assert c.post(URL, json={"n": 1}).status_code == 200
+    assert all(delay >= 0 for delay in delays)
+    c.close()
+
+
 def test_distinct_requests_have_bounded_parallelism(tmp_path):
     import threading
     import time
