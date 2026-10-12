@@ -2,6 +2,60 @@ import httpx
 import pytest
 
 from evm_inventory.bitget import BitgetClient
+from evm_inventory.bitget_catalog import BitgetDepositTarget
+
+
+def test_native_deposit_target_returns_exact_live_target(monkeypatch):
+    target = BitgetDepositTarget("ETH", 10, "native", 123, "Optimism", 18)
+    monkeypatch.setattr("evm_inventory.bitget.fetch_public_coins", lambda _http: (object(),))
+    monkeypatch.setattr("evm_inventory.bitget.deposit_targets", lambda _coins: (target,))
+    client = BitgetClient(api_key="key", secret_key="secret", passphrase="pass")
+
+    assert client.native_deposit_target(10) is target
+
+
+def test_native_deposit_target_requires_exact_native_eth_identity(monkeypatch):
+    targets = (
+        BitgetDepositTarget("ETH", 1, "native", 11, "ERC20", 18),
+        BitgetDepositTarget("ETH", 10, "0x" + "1" * 40, 12, "Optimism", 18),
+        BitgetDepositTarget("WETH", 10, "native", 13, "Optimism", 18),
+        BitgetDepositTarget("ETH", 10, "native", 13, "Optimism", 6),
+        BitgetDepositTarget("ETH", 10, "native", 14, "Optimism", 18),
+    )
+    monkeypatch.setattr("evm_inventory.bitget.fetch_public_coins", lambda _http: ())
+    monkeypatch.setattr("evm_inventory.bitget.deposit_targets", lambda _coins: targets)
+    client = BitgetClient(api_key="key", secret_key="secret", passphrase="pass")
+
+    assert client.native_deposit_target(10) is targets[-1]
+
+
+def test_native_deposit_target_ignores_disabled_catalog_entries(monkeypatch):
+    catalog = ({"coin": "ETH", "chains": [{
+        "chain": "Optimism", "rechargeable": "false", "needTag": "false",
+        "contractAddress": "", "minDepositAmount": "0.01",
+    }]},)
+    monkeypatch.setattr("evm_inventory.bitget.fetch_public_coins", lambda _http: catalog)
+    client = BitgetClient(api_key="key", secret_key="secret", passphrase="pass")
+
+    assert client.native_deposit_target(10) is None
+
+
+def test_native_deposit_target_rejects_ambiguous_native_eth_matches(monkeypatch):
+    targets = tuple(BitgetDepositTarget("ETH", 10, "native", amount, "Optimism", 18)
+                    for amount in (1, 2))
+    monkeypatch.setattr("evm_inventory.bitget.fetch_public_coins", lambda _http: ())
+    monkeypatch.setattr("evm_inventory.bitget.deposit_targets", lambda _coins: targets)
+    client = BitgetClient(api_key="key", secret_key="secret", passphrase="pass")
+
+    with pytest.raises(ValueError, match="ambiguous native ETH deposit target"):
+        client.native_deposit_target(10)
+
+
+@pytest.mark.parametrize("chain_id", (0, -1, True, False, 1.0, "1"))
+def test_native_deposit_target_rejects_invalid_chain_id(chain_id):
+    client = BitgetClient(api_key="key", secret_key="secret", passphrase="pass")
+    with pytest.raises(ValueError, match="chain_id"):
+        client.native_deposit_target(chain_id)
 
 
 @pytest.mark.parametrize("coin,chain,minimum", [

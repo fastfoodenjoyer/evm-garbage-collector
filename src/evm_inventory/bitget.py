@@ -66,6 +66,23 @@ class BitgetClient:
             raise ValueError("Bitget deposit record request failed")
         return tuple(item for item in body["data"] if isinstance(item, dict))
 
+    def native_deposit_target(self, chain_id: int) -> BitgetDepositTarget | None:
+        """Return Bitget's unique enabled native ETH deposit target, if any."""
+
+        if isinstance(chain_id, bool) or not isinstance(chain_id, int) or chain_id <= 0:
+            raise ValueError("chain_id must be a positive integer")
+        matches = tuple(
+            target
+            for target in deposit_targets(fetch_public_coins(self.http))
+            if target.chain_id == chain_id
+            and target.coin == "ETH"
+            and target.asset_id == "native"
+            and target.decimals == 18
+        )
+        if len(matches) > 1:
+            raise ValueError("ambiguous native ETH deposit target")
+        return matches[0] if matches else None
+
     def revalidate_deposit_target(self, target: dict, *, recipient: str) -> BitgetDepositTarget:
         """Validate enabled asset/network/minimum, trusting the workbook recipient.
 
