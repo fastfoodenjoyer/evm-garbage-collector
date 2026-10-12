@@ -74,7 +74,13 @@ from .stages import (
 from .transport import Transport, is_transient_error
 from .valuation import FeeQuote, QuotePrice, raw_to_decimal
 from .wallet_lifi import WalletLifiClients
-from .weth import WETH_WITHDRAW_TOOL, withdraw_transaction_fields
+from .weth import (
+    WETH_CONTRACTS,
+    WETH_WITHDRAW_TOOL,
+    unwrap_route_payload,
+    withdraw_transaction_fields,
+)
+from .weth_continuation import unsigned_delivery, withdrawal_reserve
 from .workbook import (
     DEPOSIT_ADDRESS_WARNING,
     WalletWorkbookRow,
@@ -253,6 +259,20 @@ def _token_quote_price(jumper: LifiClient, asset: AssetIdentity) -> QuotePrice:
     return _quote_price(jumper, asset)
 
 
+def _canonical_unwrap_route(jumper, asset, amount, wallet, now_fn):
+    native = native_asset_identity(asset.chain_id)
+    prices = (_quote_price(jumper, asset), _quote_price(jumper, native))
+    now = now_fn()
+    if any(not timedelta(0) <= now - p.observed_at <= _MAX_PRICE_AGE for p in prices):
+        raise ValueError("requote_required:stale_price")
+    request = LifiRouteRequest(asset.chain_id, asset.chain_id,
+        _lifi_token(asset), _lifi_token(native), str(amount), wallet.public_address,
+        wallet.public_address)
+    return _route_from_dict(unwrap_route_payload(request,
+        str(prices[0].usd_per_token), str(prices[1].usd_per_token)),
+        quote_timestamp=min(p.observed_at for p in prices).isoformat())
+
+
 def _gas_fee_quote(raw_amount: int, native_asset: AssetIdentity, jumper: LifiClient) -> FeeQuote:
     return FeeQuote(raw_amount, _quote_price(jumper, native_asset))
 
@@ -400,7 +420,9 @@ def revalidate_route_evidence(
 def _account_confirmed_local_unwrap_loss(journal: Journal, position_id: int, entry: dict) -> None:
     """Retain paid conversion costs when a dependent deposit halts the group."""
     if not entry.get("local_unwrap"):
-        return
+        entry = journal.checkpoint(position_id, "canonical_prepared") or {}
+        if not entry.get("local_unwrap"):
+            return
     for step in entry.get("steps", []):
         if step.get("kind") != "unwrap_to_native":
             continue
@@ -537,6 +559,11 @@ def execute_group_entries(
             else:
                 observed["completed"] += 1
         return observed
+    if (group["state"] == "manual_review_group_halted"
+            and all(e.get("automatic_requote") for e in entries)
+            and journal.reactivate_unsigned_weth_continuation(
+                group["id"], {_position_key(e) for e in entries})):
+        group = journal.group(group["id"])
     if group["state"] in {
         "manual_review_after_swap",
         "manual_review_group_threshold_exceeded",
@@ -735,7 +762,8 @@ def execute_group_entries(
                 journal.record_group_state(group["id"], "manual_review_group_halted", reason=reason)
             return counts
 
-        projected = _exact_sum((realized, current_loss, future_loss))
+        accounted = Decimal(journal.position(position_id)["accounted_loss_usd"] or "0")
+        projected = _exact_sum((realized, max(Decimal(0), current_loss - accounted), future_loss))
         projected_pct = _exact_percentage(projected, source_usd)
         journal.record_group_projection(
             group["id"],
@@ -761,7 +789,7 @@ def execute_group_entries(
             return counts
 
         def check_dependent_route_loss(position_loss: Decimal) -> None:
-            dependent_projection = _exact_sum((realized, position_loss, future_loss))
+            dependent_projection = _exact_sum((realized - accounted, position_loss, future_loss))
             dependent_pct = _exact_percentage(dependent_projection, source_usd)
             journal.record_group_projection(
                 group["id"],
@@ -965,7 +993,8 @@ def execute_group_entries(
                         break
                     if result.get("state") not in {"confirmed", "completed"}:
                         raise ValueError("route step did not confirm")
-                    if step.get("kind") == "direct_deposit" or fresh.get("local_unwrap"):
+                    if (step.get("kind") == "direct_deposit" or fresh.get("local_unwrap")
+                            or journal.checkpoint(position_id, "canonical_prepared")):
                         realized = Decimal(
                             journal.account_position_loss(
                                 position_id,
@@ -1763,6 +1792,10 @@ def _preflight_live_entry(
             < target.minimum_raw
         ):
             raise ValueError("requote_required:below_target_minimum")
+        entry = {**entry, "reservations": {
+            **entry.get("reservations", {}),
+            "final_deposit_native_gas_cap_raw": str(direct_cap),
+        }}
     _require_valid_candidate(candidate)
     fresh = {**entry, "steps": fresh_steps}
     if entry.get("automatic_requote"):
@@ -1827,6 +1860,9 @@ def _refresh_route_step(
         ):
             raise ValueError("requote_required:local_unwrap_identity_invalid")
     live = step.get("_live_route")
+    if step.get("kind") == "unwrap_to_native" and entry.get("automatic_requote"):
+        planned = live = _canonical_unwrap_route(
+            jumper, source, amount, wallet, now_fn or (lambda: now))
     allow_replacement = bool(entry.get("automatic_requote")) and (
         source_amount is None and not entry.get("_journal_position_id")
         and step.get("kind") != "unwrap_to_native"
@@ -1993,6 +2029,31 @@ def _requote_from_intermediate(
     """Build a fresh, gas-priced route from a correlated intermediate arrival."""
 
     target = _require_live_target(entry, wallet=wallet, bitget=bitget)
+    native_target_resolver = getattr(bitget, "native_deposit_target", None)
+    if (entry.get("automatic_requote") and entry.get("_journal_position_id")
+            and asset.contract_address == WETH_CONTRACTS.get(asset.chain_id)
+            and asset.decimals == 18 and callable(native_target_resolver)):
+        native_target = native_target_resolver(asset.chain_id)
+        if native_target is not None:
+            native_target_data = {
+                "coin": native_target.coin, "chain_id": native_target.chain_id,
+                "asset_id": native_target.asset_id, "decimals": native_target.decimals,
+                "chain": native_target.chain, "minimum_raw": str(native_target.minimum_raw),
+            }
+            route = _canonical_unwrap_route(jumper, asset, amount, wallet,
+                lambda: datetime.fromtimestamp(now_ms() / 1000, UTC))
+            dynamic = {key: value for key, value in entry.items()
+                       if key not in {"_actual_asset_id", "_actual_balance_raw"}}
+            dynamic.update(status="route_ready", local_unwrap=True, chain_id=asset.chain_id,
+                asset_id=asset.contract_address, decimals=18, raw_balance=str(amount),
+                target=native_target_data, quoted_at=now_ms(),
+                steps=[{"kind": "unwrap_to_native", "route": _route_data(route)}],
+                canonical_continuation={"wallet": wallet.public_address,
+                    "recipient": wallet.bitget_deposit_address, "amount_raw": str(amount),
+                    "chain_id": asset.chain_id, "target": native_target_data,
+                    "previous_target": entry["target"]})
+            return _preflight_live_entry(dynamic, wallet=wallet, rpc=rpc, rpc_urls=rpc_urls,
+                jumper=jumper, bitget=bitget, gas_estimator=gas_estimator, now_ms=now_ms)
     dynamic = {
         **entry,
         "status": "direct_deposit",
@@ -2366,6 +2427,8 @@ def route_credit_unverified(entry, journal, position_id):
 def _observe_route_deposit(entry, *, wallet, jumper, rpc, rpc_urls, bitget, journal,
                             position_id, now_ms):
     if journal.checkpoint(position_id, "route_deposit"):
+        if journal.checkpoint(position_id, "route_deposit")["target"] != entry.get("target"):
+            entry = _saved_native_settlement_entry(entry, wallet, journal, position_id)
         return _poll_route_deposit(entry, wallet=wallet, bitget=bitget, journal=journal,
                                    position_id=position_id, now_ms=now_ms)
     prepared = (journal.checkpoint(position_id, "bridge_prepared")
@@ -2391,9 +2454,13 @@ def _observe_route_deposit(entry, *, wallet, jumper, rpc, rpc_urls, bitget, jour
                     _entry_loss(direct), Decimal(direct.get(
                         "_realized_loss_before_current_usd", "0"))))),
             })
-            return _poll_route_deposit(entry, wallet=wallet, bitget=bitget, journal=journal,
+            observed = entry
+            if direct["target"] != entry.get("target"):
+                observed = _saved_native_settlement_entry(entry, wallet, journal, position_id)
+            return _poll_route_deposit(observed, wallet=wallet, bitget=bitget, journal=journal,
                                        position_id=position_id, now_ms=now_ms)
-        if step.get("kind") != "bridge" or not isinstance(step.get("_live_route"), LifiRoute):
+        if step.get("kind") not in {"bridge", "unwrap_to_native"} or not isinstance(
+                step.get("_live_route"), LifiRoute):
             raise DepositNotSeen("route_deposit_observation_context_invalid")
         key = f"route:{step['kind']}:{step['route']['id']}"
         if key in seen:
@@ -2414,6 +2481,76 @@ def _observe_route_deposit(entry, *, wallet, jumper, rpc, rpc_urls, bitget, jour
         jumper=jumper, rpc=rpc, rpc_urls=rpc_urls, bitget=bitget, journal=journal,
         position_id=position_id, now_ms=now_ms, sleep=entry.get("_sleep", time.sleep),
     )
+
+
+def _saved_native_settlement_entry(entry, wallet, journal, position_id):
+    """Bind an altered final target to the saved canonical conversion and direct intent."""
+    prepared = (journal.checkpoint(position_id, "bridge_prepared")
+                or journal.checkpoint(position_id, "prepared") or {})
+    seen = set()
+    migrated = False
+    while prepared.get("steps"):
+        step = prepared["steps"][-1]
+        if step.get("kind") == "direct_deposit":
+            direct = journal.checkpoint(position_id, "direct_prepared")
+            if (not migrated or not direct or direct.get("target") != prepared.get("target")
+                    or direct.get("chain_id") != prepared["target"]["chain_id"]
+                    or direct.get("asset_id") != "native" or direct.get("decimals") != 18):
+                break
+            return direct
+        if step.get("kind") not in {"bridge", "unwrap_to_native"}:
+            break
+        key = f"route:{step['kind']}:{step['route']['id']}"
+        if key in seen:
+            break
+        seen.add(key)
+        progress = journal.checkpoint(position_id, key) or {}
+        child = progress.get("continuation")
+        if not isinstance(child, dict):
+            break
+        if child.get("target") != prepared.get("target"):
+            marker = child.get("canonical_continuation") or {}
+            source_key = marker.get("source_step_key", "")
+            prefix = f"bridge:{step['route']['id']}:"
+            normalized = tuple(s for s in step["_live_route"].evidence.steps if not s.is_substep)
+            try:
+                index = int(source_key.removeprefix(prefix))
+                source_step = (normalized[index]
+                               if source_key.startswith(prefix) and index >= 0 else None)
+            except (ValueError, IndexError):
+                source_step = None
+            saved = journal.latest_step(position_id=position_id, step_key=source_key)
+            delivery = journal.checkpoint(position_id, f"bridge_delivery:{source_key}") or {}
+            target = child.get("target") or {}
+            if (migrated or source_step is None or source_step.destination is None
+                    or (source_step.destination.chain_id, source_step.destination.contract_address,
+                        source_step.destination.decimals)
+                    != (child.get("chain_id"), child.get("asset_id"), 18)
+                    or str(source_step.recipient).lower() != wallet.public_address.lower()
+                    or marker.get("previous_target") != prepared.get("target")
+                    or marker.get("target") != target
+                    or marker.get("wallet", "").lower() != wallet.public_address.lower()
+                    or marker.get("recipient", "").lower() != wallet.bitget_deposit_address.lower()
+                    or child.get("asset_id") != WETH_CONTRACTS.get(child.get("chain_id"))
+                    or (target.get("coin"), target.get("chain_id"), target.get("asset_id"),
+                        target.get("decimals")) != ("ETH", child.get("chain_id"), "native", 18)
+                    or not saved or saved["state"] != "credited"
+                    or saved["tx_hash"] != delivery.get("source_hash")
+                    or delivery.get("recipient", "").lower() != wallet.public_address.lower()
+                    or (delivery.get("chain_id"), delivery.get("asset_id"),
+                        delivery.get("decimals"))
+                    != (child.get("chain_id"), child.get("asset_id"), 18)
+                    or delivery.get("amount_raw") != marker.get("amount_raw")):
+                break
+            migrated = True
+        if step.get("kind") == "unwrap_to_native":
+            unwrap = journal.latest_step(position_id=position_id,
+                step_key=f"unwrap_to_native:{step['route']['id']}:0")
+            if not unwrap or not unwrap["tx_hash"] or not progress.get("unwrap_result"):
+                break
+            withdraw_transaction_fields(step["_live_route"].raw_steps[0])
+        prepared = child
+    raise ValueError("route_deposit_native_continuation_identity_mismatch")
 
 
 def _settle_route_deposit(entry, step, final_step, *, result, wallet, jumper, rpc,
@@ -2582,6 +2719,7 @@ def _continue_local_unwrap(
         _journal_position_id=position_id,
         _realized_loss_before_current_usd=_decimal_string(accrued),
     )
+    dynamic.pop("_observation_restore", None)
     dynamic.update({key: value for key, value in entry.items() if callable(value)})
     progress["continuation"] = dynamic
     journal.save_checkpoint(position_id, progress_key, progress)
@@ -2707,6 +2845,10 @@ def _submit_live_step(
                     gas_estimator=PlannerGasEstimator(rpc, rpc_urls, jumper),
                     now_ms=now_ms,
                 )
+                group_check = entry.get("_check_group_loss")
+                if callable(group_check):
+                    group_check(_exact_sum((_entry_loss(entry), Decimal(entry.get(
+                        "_realized_loss_before_current_usd", "0")))))
                 if recovery:
                     loss = _exact_sum((_entry_loss(entry), Decimal(recovery["failed_fee_usd"])))
                     group = journal.group(journal.position(position_id)["group_id"])
@@ -2820,6 +2962,32 @@ def _submit_live_step(
     progress = journal.checkpoint(position_id, progress_key) or {}
     continuation = progress.get("continuation")
     if isinstance(continuation, dict):
+        proof = unsigned_delivery(journal, position_id)
+        requote = entry.get("_requote_after_intermediate")
+        if proof and proof["progress_key"] == progress_key and callable(requote):
+            delivery = proof["delivery"]
+            asset = AssetIdentity(delivery["chain_id"], delivery["asset_id"], delivery["decimals"])
+            refreshed = requote({**continuation, "_journal_position_id": position_id},
+                                asset, int(delivery["amount_raw"]))
+            if refreshed.get("canonical_continuation"):
+                accrued = Decimal(continuation["_realized_loss_before_current_usd"])
+                group_check = entry.get("_check_group_loss")
+                if not callable(group_check):
+                    raise ValueError("canonical_continuation_group_check_missing")
+                group_check(_exact_sum((accrued, _entry_loss(refreshed))))
+                refreshed.update(_realized_loss_before_current_usd=_decimal_string(accrued),
+                                 _journal_position_id=position_id)
+                refreshed["canonical_continuation"]["source_progress_key"] = progress_key
+                refreshed["canonical_continuation"]["source_step_key"] = proof["source_step_key"]
+                progress["continuation"] = refreshed
+                journal.save_checkpoint(position_id, progress_key, progress)
+                journal.save_checkpoint(position_id, "canonical_prepared", refreshed)
+                journal.save_checkpoint(position_id, "canonical_continuation_migration", {
+                    "source_hash": proof["source_hash"], "delivery": delivery,
+                    "previous_target": continuation["target"], "target": refreshed["target"],
+                    "paid_loss_usd": _decimal_string(accrued),
+                })
+                continuation = refreshed
         continuation.update({key: value for key, value in entry.items() if callable(value)})
         continuation["_observation_restore"] = True
         return _submit_live_step(
@@ -2966,6 +3134,17 @@ def _submit_live_step(
                 candidate = local_fresh["_candidate"]
                 refreshed = local_fresh["steps"][0]
                 entry["_step_candidates"] = local_fresh["_step_candidates"]
+                route_entry["reservations"] = local_fresh["reservations"]
+                route_entry["quoted_at"] = local_fresh["quoted_at"]
+                if entry.get("canonical_continuation"):
+                    # Persist the exact refreshed loss/caps before a durable intent can exist.
+                    parent_key = entry["canonical_continuation"].get("source_progress_key")
+                    parent = journal.checkpoint(position_id, parent_key) if parent_key else None
+                    if not parent or not isinstance(parent.get("continuation"), dict):
+                        raise ValueError("canonical_continuation_parent_checkpoint_missing")
+                    parent["continuation"] = local_fresh
+                    journal.save_checkpoint(position_id, parent_key, parent)
+                    journal.save_checkpoint(position_id, "canonical_prepared", local_fresh)
             group_check = entry.get("_check_group_loss")
             if callable(group_check):
                 group_check(
@@ -3107,6 +3286,10 @@ def _submit_live_step(
                     "_check_group_loss": group_loss_check,
                     "_sleep": sleep,
                 }
+                if dynamic_entry.get("canonical_continuation"):
+                    dynamic_entry["canonical_continuation"]["source_progress_key"] = progress_key
+                    dynamic_entry["canonical_continuation"]["source_step_key"] = step_key
+                    journal.save_checkpoint(position_id, "canonical_prepared", dynamic_entry)
                 progress["continuation"] = dynamic_entry
                 journal.save_checkpoint(position_id, progress_key, progress)
                 return _submit_live_step(
@@ -3225,6 +3408,17 @@ def _execute_entry(
         raise ValueError("route transaction chain does not match source balance")
     step_key = str(entry.get("_journal_step_key", entry["status"]))
     if journal is not None and position_id is not None:
+        saved = journal.latest_step(position_id=position_id, step_key=step_key)
+        signing = journal.checkpoint(position_id, f"canonical_signing:{step_key}")
+        if saved and saved["tx_hash"] and signing and entry.get("canonical_continuation"):
+            signed_entry = {**signing["entry"],
+                **{key: value for key, value in entry.items() if callable(value)}}
+            withdrawal_reserve(signed_entry, signing["request"], wallet)
+            _replay_missing_direct(entry={**signed_entry,
+                "_direct_transaction": signing["request"]}, saved=saved, wallet=wallet,
+                rpc=rpc, rpc_urls=rpc_urls, journal=journal)
+            wait_for_receipt(rpc, url=url, tx_hash=saved["tx_hash"])
+            return ExecutedTransactionHash(saved["tx_hash"], None)
         recovered = recover_durable_broadcast(
             rpc, url=url, journal=journal, position_id=position_id, step_key=step_key
         )
@@ -3256,10 +3450,11 @@ def _execute_entry(
                          and request.to.lower() == CELO_TOKEN_ADDRESS
                          and request.data.startswith("0xa9059cbb") else 0)
         reserve_balance = balance - request.value - shared_amount
-    require_native_reserve(
-        balance=reserve_balance,
-        gas_cost=request.max_total_fee_wei,
-    )
+    canonical_reserve = withdrawal_reserve(entry, request, wallet)
+    require_native_reserve(balance=reserve_balance,
+        gas_cost=(canonical_reserve if canonical_reserve is not None
+                  else request.max_total_fee_wei),
+        multiplier=(1 if canonical_reserve is not None else GAS_RESERVE_MULTIPLIER))
     asset_id = str(entry["asset_id"])
     approval_tx_hash = None
     before_sign = entry.get("_before_sign")
@@ -3314,6 +3509,9 @@ def _execute_entry(
         if entry["status"] == "direct_deposit":
             journal.save_checkpoint(position_id, "direct_prepared",
                                     {**entry, "_direct_transaction": request})
+        elif entry.get("canonical_continuation"):
+            journal.save_checkpoint(position_id, f"canonical_signing:{step_key}",
+                                    {"entry": entry, "request": request})
         tx_hash = broadcast_durable_transaction(
             rpc,
             url=url,

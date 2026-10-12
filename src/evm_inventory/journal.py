@@ -68,6 +68,8 @@ _POSITION_TRANSITIONS = {
         "manual_review",
     },
     "source_asset_converted_bridge_pending": {
+        "completed",
+        "deposit_pending",
         "requote_required",
         "bridge_submitted",
         "manual_review_after_swap",
@@ -81,6 +83,7 @@ _POSITION_TRANSITIONS = {
         "manual_review_group_threshold_exceeded",
     },
     "bridge_submitted": {
+        "source_asset_converted_bridge_pending",
         "deposit_pending",
         "bridge_timeout",
         "completed",
@@ -483,6 +486,59 @@ class Journal:
             (loss, percentage, group_id),
         )
         self.connection.commit()
+
+    def reactivate_unsigned_weth_continuation(self, group_id: int, position_keys: set[str]) -> bool:
+        """Recover one legacy gas halt with an exact credited bridge and unsigned child."""
+        from .weth_continuation import unsigned_delivery
+
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            group = self.group(group_id)
+            rows = self.connection.execute(
+                "SELECT * FROM route_positions WHERE group_id=?", (group_id,),
+            ).fetchall()
+            candidates = [r for r in rows if r["state"] != "completed"]
+            reason = str(group["reason"] or "")
+            if (group["state"] != "manual_review_group_halted"
+                    or not reason.startswith("insufficient native balance for gas reserve:")
+                    or {r["position_key"] for r in rows} != position_keys
+                    or len(candidates) != 1 or candidates[0]["state"] != "manual_review"
+                    or candidates[0]["reason"] != reason
+                    or candidates[0]["accounted_loss_usd"] is not None):
+                return False
+            position_id = candidates[0]["id"]
+            proof = unsigned_delivery(self, position_id)
+            if proof is None:
+                return False
+            try:
+                accrued = Decimal(_decimal_text(proof["continuation"].get(
+                    "_realized_loss_before_current_usd"), "accrued continuation loss"))
+            except ValueError:
+                return False
+            budget = Decimal(group["source_usd"]) * Decimal(group["loss_budget_pct"]) / 100
+            if (not accrued.is_finite() or accrued < 0
+                    or accrued + Decimal(group["realized_loss_usd"]) > budget):
+                return False
+            self.connection.execute(
+                "INSERT INTO route_checkpoints VALUES (?, 'canonical_recovery', ?) "
+                "ON CONFLICT(position_id,checkpoint_key) DO UPDATE SET "
+                "payload_json=excluded.payload_json",
+                (position_id, json.dumps({"reason": reason, "source_hash": proof["source_hash"],
+                    "progress_key": proof["progress_key"], "delivery": proof["delivery"],
+                    "original_budget_pct": group["loss_budget_pct"],
+                    "original_source_usd": group["source_usd"],
+                    "paid_group_loss_usd": group["realized_loss_usd"]})),
+            )
+            self.connection.execute(
+                "UPDATE route_positions SET state='bridge_submitted',reason=NULL,"
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?", (position_id,),
+            )
+            self.connection.execute(
+                "UPDATE route_groups SET state='active',reason=NULL,"
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (group_id,),
+            )
+        return True
 
     def record_group_realized_loss(self, group_id: int, *, realized_loss_usd: str) -> None:
         loss = _decimal_text(realized_loss_usd, "realised group loss")

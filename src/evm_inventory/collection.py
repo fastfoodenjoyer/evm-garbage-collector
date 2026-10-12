@@ -295,6 +295,8 @@ def _resume_unsigned_retry_groups(entries, db_path):
             if group:
                 journal.reactivate_unsigned_retry_group(group["id"],
                                                        {_position_key(e) for e in members})
+                journal.reactivate_unsigned_weth_continuation(group["id"],
+                                                             {_position_key(e) for e in members})
 
 
 def drive_execution(
