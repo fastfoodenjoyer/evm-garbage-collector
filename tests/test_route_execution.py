@@ -908,12 +908,16 @@ def test_submit_requotes_and_continues_after_confirmed_cross_chain_intermediate(
         def token_price(self, asset):
             return LifiPriceEvidence(asset, "1", NOW.isoformat())
 
-    def fake_execute_entry(*, entry, **_kwargs):
+    def fake_execute_entry(*, entry, journal, position_id, **_kwargs):
         sent.append((entry["chain_id"], entry["asset_id"], entry["raw_balance"]))
         if entry["asset_id"].lower() == ASSET_A:
             balances[(10, ASSET_A)] = 0
             balances[(8453, ASSET_B)] = 850
-        return tx_hashes[len(sent) - 1]
+        tx_hash = tx_hashes[len(sent) - 1]
+        journal.record_step_intent(position_id=position_id, step_key=entry["_journal_step_key"],
+            nonce=len(sent), calldata_digest="a" * 64, signed_payload_digest="b" * 64,
+            tx_hash=tx_hash)
+        return tx_hash
 
     initial_candidate = SimpleNamespace(
         loss_usd=Decimal("20"), source_usd=Decimal("1000")
@@ -1007,7 +1011,7 @@ def test_submit_requotes_and_continues_after_confirmed_cross_chain_intermediate(
                         42161: "https://arb.example",
                     },
                     jumper=Jumper(),
-                    bitget=object(),
+                    bitget=SimpleNamespace(wait_for_deposit_seen=lambda **_: "success"),
                     journal=journal,
                     now_ms=lambda: int(NOW.timestamp() * 1000),
                 )
@@ -1024,7 +1028,7 @@ def test_submit_requotes_and_continues_after_confirmed_cross_chain_intermediate(
                     42161: "https://arb.example",
                 },
                 jumper=Jumper(),
-                bitget=object(),
+                bitget=SimpleNamespace(wait_for_deposit_seen=lambda **_: "success"),
                 journal=journal,
                 now_ms=lambda: int(NOW.timestamp() * 1000),
             )
@@ -1036,7 +1040,7 @@ def test_submit_requotes_and_continues_after_confirmed_cross_chain_intermediate(
         assert result is None
     else:
         assert sent == [(10, ASSET_A, "1000"), (8453, ASSET_B, "850")]
-        assert result == {"state": "confirmed", "realized_loss_usd": "160"}
+        assert result == {"state": "completed", "realized_loss_usd": "160"}
     assert projections == [Decimal("160")]
     assert position_events[0]["event_type"] == "requote_after_bridge"
     assert position_events[0]["input_amount_raw"] == "850"
@@ -1124,9 +1128,12 @@ def test_cross_chain_wait_polls_pending_and_credits_only_correlated_balance(tmp_
     assert saved_step["state"] == "credited"
 
 
+@pytest.mark.parametrize("deposit_status", [None, "pending", "success"])
 def test_direct_final_hop_keeps_losses_from_completed_intermediate_hops(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, deposit_status,
 ):
+    from evm_inventory.stages import Deadline, deadline_scope
+
     wallet = WalletWorkbookRow(2, 1, WALLET, "0x" + "1" * 64, DEPOSIT)
     entry = {
         "status": "direct_deposit",
@@ -1152,13 +1159,13 @@ def test_direct_final_hop_keeps_losses_from_completed_intermediate_hops(
         def wait_for_deposit_seen(self, **kwargs):
             events.append("wait")
             assert kwargs["started_ms"] == 1234567
-            return "success"
+            return deposit_status
 
     monkeypatch.setattr(
         "evm_inventory.route_execution._execute_entry",
         lambda **_kwargs: events.append("send") or "0x" + "1" * 64,
     )
-    with Journal(tmp_path / "journal.sqlite") as journal:
+    with Journal(tmp_path / "journal.sqlite") as journal, deadline_scope(Deadline(30)):
         position = journal.get_or_create_position(
             position_key="wallet:8453:direct-final", wallet=WALLET
         )
@@ -1174,9 +1181,12 @@ def test_direct_final_hop_keeps_losses_from_completed_intermediate_hops(
             journal=journal,
             now_ms=lambda: events.append("clock") or 1234567,
         )
+        if deposit_status == "success":
+            assert journal.checkpoint(position["id"], "bitget_credit")["status"] == "success"
     assert events[:3] == ["clock", "send", "wait"]
 
-    assert result == {"state": "completed", "realized_loss_usd": "5"}
+    assert result["state"] == ("completed" if deposit_status == "success" else "deposit_pending")
+    assert result["realized_loss_usd"] == "5"
 
 
 def test_dependent_route_loss_recheck_halts_before_next_signature(tmp_path):

@@ -10,6 +10,143 @@ from evm_inventory.runbook import create_route_plan
 from evm_inventory.stages import Deadline, deadline_scope, request_timeout
 
 
+@pytest.mark.parametrize("cross_chain", [False, True])
+@pytest.mark.parametrize("legacy_completed", [False, True])
+def test_route_waits_for_exchange_credit_without_sending_again(
+    tmp_path, monkeypatch, cross_chain, legacy_completed,
+):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from test_live_plan import _quoted_route
+    from test_route_execution import ASSET_A, DEPOSIT, WALLET, _entry
+
+    from evm_inventory.collection import execution_positions
+    from evm_inventory.journal import Journal
+    from evm_inventory.lifi import LifiRouteRequest, TransactionRequest
+    from evm_inventory.live_plan import _route_data
+    from evm_inventory.route_execution import (
+        _position_key,
+        _submit_live_step,
+        execute_group_entries,
+    )
+
+    target_chain = 8453 if cross_chain else 10
+    route = _quoted_route(LifiRouteRequest(10, target_chain, ASSET_A, "0x" + "e" * 40,
+                         "1000", WALLET, DEPOSIT), route_id="deposit-swap", output_amount=900)
+    step = {"kind": "bridge", "route": _route_data(route), "_live_route": route,
+            "_prepared_requests": (TransactionRequest(10, DEPOSIT, "0x", 0, 21000, 1),)}
+    e = {**_entry(ASSET_A, status="route_ready", steps=[step]),
+         "_candidate": SimpleNamespace(loss_usd=Decimal("1")), "automatic_requote": True}
+    chain = "Base" if cross_chain else "Optimism"
+    e["target"] = {**e["target"], "chain_id": target_chain, "chain": chain}
+    tx_hash = "0x" + "a" * 64
+    deposit_hash = "0x" + "f" * 64 if cross_chain else tx_hash
+    sends, polls, bridge_polls = [], [], []
+    statuses = iter(["pending", None, "success"])
+
+    def execute(*, entry, journal, position_id, **_):
+        sends.append(entry["_journal_step_key"])
+        journal.record_step_intent(position_id=position_id, step_key=sends[-1], nonce=1,
+            calldata_digest="b" * 64, signed_payload_digest="c" * 64, tx_hash=tx_hash)
+        return tx_hash
+
+    def poll(**kw):
+        polls.append(kw)
+        return next(statuses)
+
+    def bridge_status(**kw):
+        bridge_polls.append(kw)
+        return {"sending": {"txHash": tx_hash}, "receiving": {
+            "txHash": deposit_hash, "amount": "900"}, "fromAddress": WALLET,
+            "toAddress": DEPOSIT, "status": "DONE", "substatus": "COMPLETED"}
+
+    monkeypatch.setattr("evm_inventory.route_execution._execute_entry", execute)
+    path = tmp_path / "inventory.sqlite"
+    with Journal(path) as journal:
+        kw = dict(wallet=SimpleNamespace(public_address=WALLET, bitget_deposit_address=DEPOSIT),
+                  rpc=SimpleNamespace(call=lambda *_: "0x" + f"{1000:064x}"),
+                  rpc_urls={10: "rpc", 8453: "rpc"},
+                  jumper=SimpleNamespace(transaction_status=bridge_status), journal=journal,
+                  bitget=SimpleNamespace(wait_for_deposit_seen=poll), now_ms=lambda: 100000)
+        def round():
+            return execute_group_entries([e], journal=journal, max_route_loss_pct=Decimal("15"),
+                preflight=lambda e: e, submit_step=lambda e, step: _submit_live_step(e, step, **kw))
+
+        assert round()["deposit_pending"] == 1
+        p = journal.connection.execute("SELECT * FROM route_positions WHERE position_key=?",
+                                       (_position_key(e),)).fetchone()
+        if legacy_completed:
+            journal.record_position_state(p["id"], "completed")
+            journal.record_group_state(p["group_id"], "completed")
+            journal.connection.execute("DELETE FROM route_checkpoints WHERE position_id=? "
+                                       "AND checkpoint_key='route_deposit'", (p["id"],))
+            journal.connection.commit()
+        assert execution_positions([e], path)[0]["state"] != "completed"
+        assert round()["deposit_pending"] == 1
+        assert round()["completed"] == 1
+        assert execution_positions([e], path)[0]["state"] == "completed"
+        assert journal.group(p["group_id"])["realized_loss_usd"] == "1"
+        assert journal.checkpoint(p["id"], "bitget_credit")["tx_hash"] == deposit_hash
+    assert len(sends) == 1 and len(polls) == 3
+    assert len(bridge_polls) == int(cross_chain)
+    assert all(p["tx_hash"] == deposit_hash and p["chain"] == chain for p in polls)
+
+
+def test_legacy_direct_continuation_observes_saved_hash_without_send(tmp_path, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from test_live_plan import _quoted_route
+    from test_route_execution import ASSET_A, DEPOSIT, WALLET, _entry
+
+    from evm_inventory.collection import execution_positions
+    from evm_inventory.journal import Journal
+    from evm_inventory.lifi import LifiRouteRequest
+    from evm_inventory.live_plan import _route_data
+    from evm_inventory.route_execution import (
+        _position_key,
+        _submit_live_step,
+        execute_group_entries,
+    )
+
+    route = _quoted_route(LifiRouteRequest(10, 8453, ASSET_A, "0x" + "e" * 40,
+                         "1000", WALLET, WALLET), route_id="intermediate", output_amount=900)
+    step = {"kind": "bridge", "route": _route_data(route), "_live_route": route}
+    e = {**_entry(ASSET_A, status="route_ready", steps=[step]), "automatic_requote": True}
+    direct = {**e, "status": "direct_deposit", "chain_id": 8453,
+              "asset_id": "0x" + "e" * 40, "steps": [{"kind": "direct_deposit"}]}
+    tx_hash = "0x" + "d" * 64
+    polls = []
+    monkeypatch.setattr("evm_inventory.route_execution._execute_entry",
+                        lambda **_: pytest.fail("observation must not send"))
+    path = tmp_path / "inventory.sqlite"
+    with Journal(path) as journal:
+        g = journal.get_or_create_group(group_key=e["group"]["key"], wallet=WALLET,
+                                       source_chain_id=10, source_usd="100", loss_budget_pct="15")
+        p = journal.get_or_create_position(position_key=_position_key(e), wallet=WALLET,
+                                           group_id=g["id"])
+        journal.record_step_intent(position_id=p["id"], step_key="direct_deposit", nonce=1,
+            calldata_digest="a" * 64, signed_payload_digest="b" * 64, tx_hash=tx_hash)
+        journal.save_checkpoint(p["id"], "prepared", e)
+        journal.save_checkpoint(p["id"], "direct_prepared", direct)
+        journal.save_checkpoint(p["id"], "route:bridge:intermediate", {"continuation": direct})
+        journal.record_position_state(p["id"], "bridge_submitted")
+        journal.record_position_state(p["id"], "completed")
+        journal.record_group_state(g["id"], "active")
+        journal.record_group_state(g["id"], "completed")
+        assert execution_positions([e], path)[0]["state"] == "route_credit_pending"
+        wallet = SimpleNamespace(public_address=WALLET, bitget_deposit_address=DEPOSIT)
+        result = execute_group_entries([e], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda _: pytest.fail("observation must not quote"),
+            submit_step=lambda e, step: _submit_live_step(e, step, wallet=wallet, rpc=object(),
+                rpc_urls={}, jumper=object(), bitget=SimpleNamespace(wait_for_deposit_seen=lambda
+                    **kw: polls.append(kw) or "success"), journal=journal, now_ms=lambda: 100000))
+        assert result["completed"] == 1
+        assert execution_positions([e], path)[0]["state"] == "completed"
+    assert len(polls) == 1 and polls[0]["tx_hash"] == tx_hash
+
+
 def test_unauthenticated_quota_uses_published_limits_with_execution_reserves():
     from evm_inventory.lifi_quota import LifiQuotaStore
 
@@ -488,6 +625,28 @@ def test_available_search_never_executes_candidate_without_gas_evidence(tmp_path
         allow_partial_search=True,
     )
     assert plan["entries"][0]["status"] != "route_ready"
+
+
+def test_best_available_sorts_missing_cost_candidate_without_aborting_group(tmp_path):
+    from dataclasses import replace
+
+    from test_live_plan import DESTINATION, _quoted_route, _RecordingQuotes
+    from test_route_search import gas_quote, plan_for
+
+    from evm_inventory.bitget_catalog import BitgetDepositTarget
+    from evm_inventory.lifi import LifiFeeCost
+    from evm_inventory.models import AssetIdentity
+
+    quotes = _RecordingQuotes(lambda r: (
+        replace(_quoted_route(r, route_id="unknown-cost", output_amount=9_999_000, gas_amount=1),
+                fee_costs=(LifiFeeCost(1, AssetIdentity(8453, "0x" + "f" * 40, 18),
+                                       None, None, None),)),
+        _quoted_route(r, route_id="valid-cost", output_amount=9_999_000, gas_amount=1),
+    ))
+    entry = plan_for(tmp_path, (BitgetDepositTarget("USDC", 10, DESTINATION, 1, decimals=6),),
+                     quotes, lambda **_: gas_quote(1), allow_partial_search=True)["entries"][0]
+    assert entry["status"] == "route_ready"
+    assert entry["route"]["id"] == "valid-cost"
 
 
 @pytest.mark.parametrize("first_prepares", [True, False])

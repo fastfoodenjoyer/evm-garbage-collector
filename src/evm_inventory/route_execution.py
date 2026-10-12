@@ -472,8 +472,27 @@ def execute_group_entries(
         )
     ):
         group = journal.group(group["id"])
+    if group["state"] == "completed":
+        observed = {"group_id": group["id"], "completed": 0, "deposit_pending": 0}
+        for entry in entries:
+            position = journal.connection.execute(
+                "SELECT id,state FROM route_positions WHERE position_key=? AND group_id=?",
+                (_position_key(entry), group["id"]),
+            ).fetchone()
+            if position is None or position["state"] != "completed":
+                raise ValueError("terminal_route_group_position_mismatch")
+            if route_credit_unverified(entry, journal, position["id"]):
+                try:
+                    result = submit_step({**entry, "_journal_position_id": position["id"]},
+                                         {"kind": "observe_route_deposit"})
+                except (StageDeadlineExceeded, DepositNotSeen):
+                    result = {"state": "deposit_pending"}
+                observed["completed" if result.get("state") == "completed"
+                         else "deposit_pending"] += 1
+            else:
+                observed["completed"] += 1
+        return observed
     if group["state"] in {
-        "completed",
         "manual_review_after_swap",
         "manual_review_group_threshold_exceeded",
         "manual_review_group_halted",
@@ -556,7 +575,16 @@ def execute_group_entries(
         position_id = positions[index]["id"]
         position_state = journal.position(position_id)["state"]
         if position_state == "completed":
-            counts["completed"] += 1
+            if route_credit_unverified(entry, journal, position_id):
+                try:
+                    result = submit_step({**entry, "_journal_position_id": position_id},
+                                         {"kind": "observe_route_deposit"})
+                except (StageDeadlineExceeded, DepositNotSeen):
+                    result = {"state": "deposit_pending"}
+                counts["completed" if result.get("state") == "completed"
+                       else "deposit_pending"] += 1
+            else:
+                counts["completed"] += 1
             continue
         unresolved = journal.unresolved_direct_deposit(
             wallet=wallet,
@@ -578,7 +606,8 @@ def execute_group_entries(
                             **(journal.checkpoint(position_id, "direct_prepared") or entry),
                             "_journal_position_id": position_id,
                         },
-                        {"kind": "direct_deposit"},
+                        {"kind": "observe_route_deposit" if journal.checkpoint(
+                            position_id, "route_deposit") else "direct_deposit"},
                     )
                     if result.get("state") == "deposit_pending":
                         realized = Decimal(
@@ -2264,6 +2293,11 @@ def _await_cross_chain_transfer(
                 _pending_bridge_sleep(sleep)
                 continue
 
+        journal.save_checkpoint(position_id, f"bridge_delivery:{step_key}", {
+            "source_hash": tx_hash, "tx_hash": receiving_hash, "recipient": recipient,
+            "chain_id": destination.chain_id, "asset_id": destination.contract_address,
+            "decimals": destination.decimals, "amount_raw": str(received_raw),
+        })
         if step_id is not None:
             latest_state = str(journal.step(step_id)["state"])
             if latest_state == "confirmed":
@@ -2272,6 +2306,148 @@ def _await_cross_chain_transfer(
             if latest_state == "awaiting_bridge":
                 journal.record_step_state(step_id, "credited")
         return received_raw
+
+
+def route_credit_unverified(entry, journal, position_id):
+    return (bool(entry.get("automatic_requote")) and entry.get("status") == "route_ready"
+            and entry.get("routing_provider") != "relay" and not entry.get("local_unwrap")
+            and isinstance(entry.get("target"), dict)
+            and any(s.get("kind") == "bridge" for s in entry.get("steps", []))
+            and (journal.checkpoint(position_id, "bitget_credit") or {}).get("status") != "success")
+
+
+def _observe_route_deposit(entry, *, wallet, jumper, rpc, rpc_urls, bitget, journal,
+                            position_id, now_ms):
+    if journal.checkpoint(position_id, "route_deposit"):
+        return _poll_route_deposit(entry, wallet=wallet, bitget=bitget, journal=journal,
+                                   position_id=position_id, now_ms=now_ms)
+    prepared = (journal.checkpoint(position_id, "bridge_prepared")
+                or journal.checkpoint(position_id, "prepared"))
+    if not isinstance(prepared, dict):
+        raise DepositNotSeen("route_deposit_observation_context_missing")
+    seen = set()
+    while True:
+        step = prepared["steps"][-1]
+        if step.get("kind") == "direct_deposit":
+            direct = journal.checkpoint(position_id, "direct_prepared") or prepared
+            saved = journal.latest_step(position_id=position_id,
+                                        step_key=_direct_step_key(journal, position_id))
+            if saved is None or not saved["tx_hash"]:
+                raise DepositNotSeen("route_deposit_direct_hash_missing")
+            started_ms = int(datetime.fromisoformat(saved["created_at"]).replace(
+                tzinfo=UTC).timestamp() * 1000) - 60_000
+            journal.save_checkpoint(position_id, "route_deposit", {
+                "target": direct["target"], "recipient": wallet.bitget_deposit_address,
+                "tx_hash": saved["tx_hash"], "source_hash": saved["tx_hash"],
+                "step_key": saved["step_key"], "started_ms": started_ms,
+                "realized_loss_usd": _decimal_string(_exact_sum((
+                    _entry_loss(direct), Decimal(direct.get(
+                        "_realized_loss_before_current_usd", "0"))))),
+            })
+            return _poll_route_deposit(entry, wallet=wallet, bitget=bitget, journal=journal,
+                                       position_id=position_id, now_ms=now_ms)
+        if step.get("kind") != "bridge" or not isinstance(step.get("_live_route"), LifiRoute):
+            raise DepositNotSeen("route_deposit_observation_context_invalid")
+        key = f"route:{step['kind']}:{step['route']['id']}"
+        if key in seen:
+            raise ValueError("route_deposit_observation_context_cycle")
+        seen.add(key)
+        progress = journal.checkpoint(position_id, key) or {}
+        continuation = progress.get("continuation")
+        if not isinstance(continuation, dict):
+            break
+        prepared = continuation
+    if progress.get("next_index", 0) != len(step["_live_route"].raw_steps):
+        raise DepositNotSeen("route_deposit_delivery_incomplete")
+    normalized = tuple(s for s in step["_live_route"].evidence.steps if not s.is_substep)
+    return _settle_route_deposit(
+        prepared, step, normalized[-1], result={"realized_loss_usd": _decimal_string(
+            _exact_sum((_entry_loss(prepared), Decimal(prepared.get(
+                "_realized_loss_before_current_usd", "0")))))}, wallet=wallet,
+        jumper=jumper, rpc=rpc, rpc_urls=rpc_urls, bitget=bitget, journal=journal,
+        position_id=position_id, now_ms=now_ms, sleep=entry.get("_sleep", time.sleep),
+    )
+
+
+def _settle_route_deposit(entry, step, final_step, *, result, wallet, jumper, rpc,
+                          rpc_urls, bitget, journal, position_id, now_ms, sleep):
+    target = entry["target"]
+    destination = final_step.destination
+    if (destination is None or final_step.source is None
+            or (destination.chain_id, destination.contract_address, destination.decimals)
+            != (int(target["chain_id"]), str(target["asset_id"]).lower(), int(target["decimals"]))
+            or str(final_step.recipient).lower() != wallet.bitget_deposit_address.lower()):
+        raise ValueError("route_deposit_identity_mismatch")
+    step_key = f"{step.get('kind')}:{step['route']['id']}:{len(step['_live_route'].raw_steps)-1}"
+    saved = journal.latest_step(position_id=position_id, step_key=step_key)
+    if saved is None or not saved["tx_hash"]:
+        raise ValueError("route_deposit_hash_missing")
+    tx_hash = str(saved["tx_hash"])
+    if final_step.source.chain_id != destination.chain_id:
+        delivery = journal.checkpoint(position_id, f"bridge_delivery:{step_key}")
+        if delivery is None:
+            _await_cross_chain_transfer(
+                jumper=jumper, rpc=rpc, rpc_urls=rpc_urls, journal=journal,
+                position_id=position_id, step_key=step_key, tx_hash=tx_hash,
+                bridge=final_step.provider or "", source=final_step.source,
+                destination=destination, sender=wallet.public_address,
+                recipient=wallet.bitget_deposit_address, baseline_raw=None, sleep=sleep,
+            )
+            delivery = journal.checkpoint(position_id, f"bridge_delivery:{step_key}")
+        if (delivery is None or str(delivery.get("source_hash")).lower() != tx_hash.lower()
+                or str(delivery.get("recipient")).lower() != wallet.bitget_deposit_address.lower()
+                or (delivery.get("chain_id"), delivery.get("asset_id"), delivery.get("decimals"))
+                != (destination.chain_id, destination.contract_address, destination.decimals)):
+            raise ValueError("route_deposit_delivery_mismatch")
+        tx_hash = str(delivery["tx_hash"])
+    started_ms = int(datetime.fromisoformat(saved["created_at"]).replace(tzinfo=UTC).timestamp()
+                     * 1000) - 60_000
+    journal.save_checkpoint(position_id, "route_deposit", {
+        "target": target, "recipient": wallet.bitget_deposit_address,
+        "tx_hash": tx_hash, "source_hash": saved["tx_hash"], "step_key": step_key,
+        "started_ms": started_ms, "realized_loss_usd": result["realized_loss_usd"],
+    })
+    return _poll_route_deposit(entry, wallet=wallet, bitget=bitget, journal=journal,
+                               position_id=position_id, now_ms=now_ms)
+
+
+def _poll_route_deposit(entry, *, wallet, bitget, journal, position_id, now_ms):
+    context = journal.checkpoint(position_id, "route_deposit")
+    if (not isinstance(context, dict) or context.get("target") != entry.get("target")
+            or str(context.get("recipient")).lower() != wallet.bitget_deposit_address.lower()):
+        raise ValueError("route_deposit_observation_identity_mismatch")
+    saved = journal.latest_step(position_id=position_id, step_key=context["step_key"])
+    if saved is None or saved["tx_hash"] != context.get("source_hash"):
+        raise ValueError("route_deposit_observation_source_mismatch")
+    target, tx_hash = context["target"], context["tx_hash"]
+    result = {"realized_loss_usd": context["realized_loss_usd"]}
+    try:
+        status = bitget.wait_for_deposit_seen(
+            tx_hash=tx_hash, started_ms=context["started_ms"], coin=str(target["coin"]),
+            chain=str(target["chain"]), recipient=wallet.bitget_deposit_address,
+            minimum_raw=int(target["minimum_raw"]),
+        )
+    except StageDeadlineExceeded:
+        raise
+    except Exception as error:
+        raise DepositNotSeen(_execution_reason(error)) from error
+    status = str(status or "").lower()
+    if status in {"fail", "failed"}:
+        raise DepositSettlementFailed("bitget_deposit_failed")
+    if status not in {"", "pending", "success"}:
+        raise DepositSettlementFailed("bitget_deposit_unknown_status")
+    if status != "success":
+        return {**result, "state": "deposit_pending",
+                "reason": "bitget_seen_pending" if status else "bitget_deposit_not_seen"}
+    if journal.step(saved["id"])["state"] == "submitted":
+        journal.record_step_state(saved["id"], "deposit_seen")
+    if journal.step(saved["id"])["state"] != "credited":
+        journal.record_step_state(saved["id"], "credited")
+    journal.save_checkpoint(position_id, "bitget_credit", {
+        "tx_hash": tx_hash, "coin": target["coin"], "chain": target["chain"],
+        "recipient": wallet.bitget_deposit_address, "status": "success", "observed_at": now_ms(),
+    })
+    return {**result, "state": "completed"}
 
 
 def _actual_gas_paid_usd(
@@ -2388,6 +2564,11 @@ def _submit_live_step(
     now_ms: Callable[[], int],
 ) -> dict:
     position_id = int(entry["_journal_position_id"])
+    if step.get("kind") == "observe_route_deposit":
+        return _observe_route_deposit(
+            entry, wallet=wallet, jumper=jumper, rpc=rpc, rpc_urls=rpc_urls,
+            bitget=bitget, journal=journal, position_id=position_id, now_ms=now_ms,
+        )
     if step.get("kind") == "direct_deposit":
         journal.save_checkpoint(position_id, "direct_prepared", entry)
         recovery = journal.checkpoint(position_id, "direct_recovery")
@@ -2503,6 +2684,14 @@ def _submit_live_step(
                 prepared_request=request,
             )
             saved = journal.latest_step(position_id=position_id, step_key=step_key)
+        realized_before = _exact_money(
+            entry.get("_realized_loss_before_current_usd", "0"),
+            "realized loss before direct deposit",
+        )
+        loss_usd = _decimal_string(
+            _exact_sum((realized_before,
+                        _exact_money(entry["valuation"]["loss_usd"], "direct deposit loss")))
+        )
         try:
             status = bitget.wait_for_deposit_seen(
                 tx_hash=tx_hash,
@@ -2521,7 +2710,7 @@ def _submit_live_step(
             return {
                 "state": "deposit_pending",
                 "reason": "bitget_deposit_not_seen",
-                "realized_loss_usd": str(entry["valuation"]["loss_usd"]),
+                "realized_loss_usd": loss_usd,
             }
         if not normalized_status:
             raise DepositNotSeen("bitget_deposit_not_seen")
@@ -2539,24 +2728,17 @@ def _submit_live_step(
                 "awaiting_bridge",
             }:
                 journal.record_step_state(saved["id"], "credited")
-        realized_before = _exact_money(
-            entry.get("_realized_loss_before_current_usd", "0"),
-            "realized loss before direct deposit",
-        )
-        loss_usd = _decimal_string(
-            _exact_sum(
-                (
-                    realized_before,
-                    _exact_money(entry["valuation"]["loss_usd"], "direct deposit loss"),
-                )
-            )
-        )
         if normalized_status == "pending":
             return {
                 "state": "deposit_pending",
                 "reason": "bitget_seen_pending",
                 "realized_loss_usd": loss_usd,
             }
+        journal.save_checkpoint(position_id, "bitget_credit", {
+            "tx_hash": tx_hash, "coin": entry["target"]["coin"],
+            "chain": entry["target"]["chain"], "recipient": wallet.bitget_deposit_address,
+            "status": "success", "observed_at": now_ms(),
+        })
         return {
             "state": "completed",
             "realized_loss_usd": loss_usd,
@@ -2957,6 +3139,12 @@ def _submit_live_step(
             entry, result, position_id=position_id, progress_key=progress_key,
             progress=progress, wallet=wallet, rpc=rpc, rpc_urls=rpc_urls,
             jumper=jumper, bitget=bitget, journal=journal, now_ms=now_ms,
+        )
+    if step.get("kind") == "bridge" and isinstance(entry.get("target"), dict):
+        return _settle_route_deposit(
+            entry, step, route_steps[-1], result=result, wallet=wallet, jumper=jumper,
+            rpc=rpc, rpc_urls=rpc_urls, bitget=bitget, journal=journal,
+            position_id=position_id, now_ms=now_ms, sleep=sleep,
         )
     return result
 

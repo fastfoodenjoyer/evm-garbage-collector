@@ -1026,7 +1026,12 @@ def _route_choices(
                 return
             for index, target in enumerate(targets):
                 batch = sorted(target_quotes(target), key=lambda c: (
-                    c.candidate.loss_pct, c.candidate.loss_usd, c.candidate.route_ids
+                    not c.candidate.is_valid,
+                    (c.candidate.loss_pct if c.candidate.loss_pct is not None
+                     else Decimal("Infinity")),
+                    (c.candidate.loss_usd if c.candidate.loss_usd is not None
+                     else Decimal("Infinity")),
+                    c.candidate.route_ids,
                 ))
                 for route_index, choice in enumerate(batch):
                     if not choice.candidate.is_valid:

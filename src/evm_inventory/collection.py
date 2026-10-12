@@ -18,7 +18,7 @@ from .journal import Journal
 from .live_plan import create_live_plan
 from .planner_gas import PlannerGasEstimator
 from .report import export_current
-from .route_execution import _position_key, execute_entries
+from .route_execution import _position_key, execute_entries, route_credit_unverified
 from .rpc import RpcReader, quantity
 from .scanner import scan
 from .stages import Deadline, StageDeadlineExceeded, deadline_scope
@@ -258,6 +258,8 @@ def execution_positions(entries, db_path):
                 (key,),
             ).fetchone()
             state, reason = (row["state"], row["reason"]) if row else ("planned", None)
+            if row and state == "completed" and route_credit_unverified(entry, journal, row["id"]):
+                state, reason = "route_credit_pending", "bitget_credit_unverified"
             if row and str(row["group_state"]).startswith("manual_review"):
                 state = row["group_state"]
                 reason = reason or row["group_reason"]
