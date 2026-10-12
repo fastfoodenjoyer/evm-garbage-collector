@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -21,6 +22,23 @@ from .valuation import FeeQuote, QuotePrice
 
 _TRANSFER_SELECTOR = "a9059cbb"
 _UINT256_MAX = 2**256 - 1
+
+
+def _approval_dependent_revert(error: ValueError) -> bool:
+    text = str(error).lower()
+    if any(marker in text for marker in ("allowance", "transfer_from_failed")):
+        return True
+    prefix = "estimate_gas_rpc_error:"
+    if not text.startswith(prefix):
+        return False
+    try:
+        failure = json.loads(str(error)[len(prefix):])
+        diagnostic = failure.get("diagnostic")
+        provider = diagnostic.get("provider_error") if isinstance(diagnostic, dict) else None
+        # LI.FI/Solady TransferFromFailed(): only decoded RPC revert data qualifies.
+        return isinstance(provider, dict) and provider.get("data") == "0x7939f424"
+    except (ValueError, AttributeError):
+        return False
 
 
 class PlannerGasEstimator:
@@ -136,10 +154,9 @@ class PlannerGasEstimator:
             try:
                 planned = FeePlanner(self.rpc).plan(url, request, sender=wallet)
             except ValueError as error:
-                text = str(error).lower()
                 spender = step.get("estimate", {}).get("approvalAddress")
                 token = action.get("fromToken", {}).get("address", "").lower()
-                if (not any(marker in text for marker in ("allowance", "transfer_from_failed"))
+                if (not _approval_dependent_revert(error)
                         or token in {"", "0x" + "0" * 40} or not isinstance(spender, str)
                         or token_allowance(self.rpc, url=url, token=token, owner=wallet,
                                            spender=spender) >= int(action["fromAmount"])

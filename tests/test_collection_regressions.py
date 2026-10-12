@@ -648,7 +648,11 @@ def test_native_reserve_uses_rpc_fee_cap_when_provider_understates_gas(tmp_path)
     assert balance - int(e["route"]["evidence"]["input_amount"]) >= actual * 3
 
 
-def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed():
+@pytest.mark.parametrize("revert", ["allowance_text", "lifi_transfer_from_custom"])
+@pytest.mark.parametrize("allowance,native", [(0, False), (1000, False), (0, True)])
+def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed(
+    revert, allowance, native,
+):
     from test_live_plan import _quoted_route
     from test_planner_gas import SPENDER, TOKEN, WALLET, PriceClient, Rpc
 
@@ -658,14 +662,21 @@ def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed():
 
     class AllowanceRpc(Rpc):
         def call(self, url, method, params):
+            if method == "eth_call" and params[0]["data"].startswith("0xdd62ed3e"):
+                return "0x" + f"{allowance:064x}"
             if method == "eth_estimateGas" and params[0]["to"] == "0x" + "d" * 40:
-                raise ValueError("execution reverted: ERC20: insufficient allowance")
+                error = ValueError("execution reverted: ERC20: insufficient allowance"
+                                   if revert == "allowance_text" else "execution reverted")
+                if revert == "lifi_transfer_from_custom":
+                    error.diagnostic = {"provider_error": {"data": "0x7939f424"}}
+                raise error
             return super().call(url, method, params)
 
     rpc = AllowanceRpc()
     estimator = PlannerGasEstimator(rpc, {10: "rpc"}, PriceClient())
     route = _quoted_route(
-        LifiRouteRequest(10, 8453, TOKEN, "0x" + "c" * 40, "1000", WALLET, WALLET),
+        LifiRouteRequest(10, 8453, "0x" + "0" * 40 if native else TOKEN,
+                         "0x" + "c" * 40, "1000", WALLET, WALLET),
         route_id="needs-approval",
         output_amount=900,
         approval_address=SPENDER,
@@ -679,11 +690,28 @@ def test_missing_allowance_uses_bounded_fee_quote_until_approval_is_confirmed():
         amount=1000,
         recipient=WALLET,
     )
+    if native or allowance >= 1000:
+        assert fees is None
+        assert route.route_id not in estimator.prepared_fee_caps
+        return
     assert fees is not None and len(fees) == 2
     assert fees[0].raw_amount > fees[1].raw_amount
     prepared = estimator.prepared_fee_caps[route.route_id][0]
     assert prepared.max_total_fee_cap_wei == fees[0].raw_amount
     assert prepared.fee_quote_fallback_reason == "pending_approval"
+
+
+@pytest.mark.parametrize("detail", [
+    {"diagnostic": {"provider_error": {"data": "0xdeadbeef"}}},
+    {"diagnostic": {"params": [{"data": "0x7939f424"}]}},
+    {"message": "0x7939f424"},
+    {"diagnostic": None},
+])
+def test_custom_approval_revert_requires_exact_rpc_error_data(detail):
+    from evm_inventory.planner_gas import _approval_dependent_revert
+
+    assert not _approval_dependent_revert(
+        ValueError("estimate_gas_rpc_error:" + json.dumps(detail)))
 
 
 def test_automatic_preflight_timeout_keeps_original_group_retryable(tmp_path):
