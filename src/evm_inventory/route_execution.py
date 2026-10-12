@@ -1876,7 +1876,19 @@ def _refresh_route_step(
     )
     _require_valid_candidate(candidate)
     if step.get("kind") not in {"swap_to_native", "unwrap_to_native"}:
-        _require_target_minimum(entry, bitget, wallet, candidate)
+        try:
+            _require_target_minimum(entry, bitget, wallet, candidate)
+        except ValueError as error:
+            if (str(error) != "requote_required:below_target_minimum"
+                    or native_available is None or not extra_gas
+                    or _reserve_attempt >= 2 or amount >= spendable):
+                raise
+            return _refresh_route_step(
+                entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
+                jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
+                now_fn=now_fn, _spend_amount=spendable,
+                _reserve_attempt=_reserve_attempt + 1,
+            )
     fresh_step = {
         **step,
         "route": _route_data(live),

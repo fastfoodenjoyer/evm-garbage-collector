@@ -523,7 +523,7 @@ def test_automatic_search_stops_after_first_prepared_route_in_policy(tmp_path, f
 
 
 @pytest.mark.parametrize("provider_gas", [10**12, 2 * 10**16])
-@pytest.mark.parametrize("fee_multipliers", [(1,), (1, 2, 1)])
+@pytest.mark.parametrize("fee_multipliers", [(10,), (10, 20, 10), (10, 11, 12)])
 @pytest.mark.parametrize("deposit_minimum", [1, 19_000_000])
 def test_native_search_requotes_spendable_amount_with_gas_reserve(
     tmp_path, provider_gas, fee_multipliers, deposit_minimum
@@ -557,19 +557,20 @@ def test_native_search_requotes_spendable_amount_with_gas_reserve(
         )
     )
 
+    calls = []
+
     class ExactGas(PlannerGasEstimator):
         def __call__(self, **kwargs):
-            index = min(self.calls, len(fee_multipliers) - 1)
-            self.calls += 1
+            index = min(len(calls), len(fee_multipliers) - 1)
+            calls.append(kwargs["route"].route_id)
             return (
                 FeeQuote(
-                    gas * fee_multipliers[index],
+                    gas * fee_multipliers[index] // 10,
                     QuotePrice(AssetIdentity(10, "native", 18), "2000", NOW),
                 ),
             )
 
     estimator = ExactGas(None, {10: "rpc"}, quotes)
-    estimator.calls = 0
 
     plan = create_live_plan(
         _balance_rows(
@@ -593,8 +594,16 @@ def test_native_search_requotes_spendable_amount_with_gas_reserve(
         now_ms=lambda: int(NOW.timestamp() * 1000),
         gas_estimator=estimator,
     )
-    assert balance - gas * 6 <= int(quotes.requests[-1].from_amount) <= balance - gas * 3
+    assert balance - gas * 8 <= int(quotes.requests[-1].from_amount) <= balance - gas * 3
     assert plan["entries"][0]["status"] == "route_ready"
+    if fee_multipliers == (10, 11, 12):
+        assert len(calls) == 2
+
+
+def test_native_plan_padding_does_not_create_false_deposit_minimum_rejection(tmp_path):
+    test_native_search_requotes_spendable_amount_with_gas_reserve(
+        tmp_path, 10**12, (10,), 19_893_500,
+    )
 
 
 def test_native_reserve_uses_rpc_fee_cap_when_provider_understates_gas(tmp_path):
@@ -957,13 +966,13 @@ def test_automatic_requote_accepts_new_quote_id_after_identity_and_fee_validatio
 
 
 @pytest.mark.parametrize("provider_hint", [1, 100, 10_000])
-@pytest.mark.parametrize("native_balance,fee_values", [
-    (2000, (10,)), (2000, (10, 11, 10)), (2000, (10, 11, 12)),
-    (2000, (20, 21, 22)), (100, (30,)),
+@pytest.mark.parametrize("native_balance,fee_values,minimum", [
+    (2000, (10,), 1), (2000, (10, 11, 10), 1), (2000, (10, 11, 12), 1),
+    (2000, (20, 21, 22), 1), (100, (30,), 1), (100, (10,), 68),
 ])
 @pytest.mark.parametrize("saved_cap", [None, 10])
 def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
-    provider_hint, fee_values, saved_cap, native_balance,
+    provider_hint, fee_values, saved_cap, native_balance, minimum,
 ):
     from types import SimpleNamespace
 
@@ -986,6 +995,7 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
     )
     step = {"kind": "bridge", "route": _route_data(old)}
     e = {**_entry("native", status="route_ready", steps=[step]), "automatic_requote": True}
+    e["target"]["minimum_raw"] = str(minimum)
     if saved_cap is not None:
         e["reservations"] = {"source_native_gas_cap_raw": str(saved_cap)}
     gas = SimpleNamespace(
@@ -1003,7 +1013,8 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
     def routes(request):
         amounts.append(int(request.from_amount))
         return (
-            _quoted_route(request, route_id="fresh", output_amount=900, gas_amount=provider_hint),
+            _quoted_route(request, route_id="fresh", gas_amount=provider_hint,
+                          output_amount=int(request.from_amount) if minimum > 1 else 900),
         )
 
     client = SimpleNamespace(
@@ -1012,7 +1023,7 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
     )
     bitget = SimpleNamespace(
         revalidate_deposit_target=lambda *_a, **_kw: BitgetDepositTarget(
-            "USDC", 8453, destination, 1, "Base", 6
+            "USDC", 8453, destination, minimum, "Base", 6
         )
     )
     candidate, fresh = _refresh_route_step(
@@ -1028,9 +1039,12 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
     expected = native_balance - (fee_values[0] * 3 * 12 + 9) // 10
     if expected <= 0:
         expected = native_balance - fee_values[0] * 3
+    if minimum > 1:
+        expected = native_balance - fee_values[0] * 3
     assert int(fresh["route"]["from_amount"]) == expected
     assert amounts[-1] == expected
-    assert len(amounts) == (2 if saved_cap is None or fee_values[0] > saved_cap else 1)
+    expected_requests = 2 if saved_cap is None or fee_values[0] > saved_cap else 1
+    assert len(amounts) == expected_requests + (minimum > 1)
 
 
 @pytest.mark.parametrize(

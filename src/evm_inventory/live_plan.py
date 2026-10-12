@@ -936,16 +936,22 @@ def _route_choices(
                              if fee.price is not None and fee.price.asset == item.asset)
             reserve = source_fee * GAS_RESERVE_MULTIPLIER
             remaining = balance - route.evidence.input_amount
-            if remaining == reserve or (attempt == 2 and remaining >= reserve):
+            fits_reserve = remaining >= reserve and (attempt > 0 or remaining == reserve)
+            if fits_reserve:
                 if candidate.destination_amount < choice.target.minimum_raw:
-                    return choice, _with_reason(candidate, "below_target_minimum")
-                result = choice, candidate
-                native_prepared[initial_key] = result
-                native_prepared[(route.evidence.payload_sha256, item.deposit_address)] = result
-                return choice, candidate
-            amount = balance - reserve
-            if amount <= 0:
+                    if remaining == reserve or attempt == 2:
+                        return choice, _with_reason(candidate, "below_target_minimum")
+                else:
+                    result = choice, candidate
+                    native_prepared[initial_key] = result
+                    native_prepared[(route.evidence.payload_sha256, item.deposit_address)] = result
+                    return choice, candidate
+            spendable = balance - reserve
+            if spendable <= 0:
                 return choice, _with_reason(candidate, "insufficient_source_gas")
+            padded_spendable = balance - (reserve * 12 + 9) // 10
+            amount = (padded_spendable if padded_spendable > 0 and not fits_reserve
+                      else spendable)
             alternatives = [
                 _route_choice(
                     replacement, item, choice.target, client, now, gas_estimator,
