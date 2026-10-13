@@ -52,15 +52,17 @@ def redact_data(value: Any) -> Any:
 
 
 def exception_diagnostic(exc: BaseException) -> dict[str, Any]:
-    """Retain the exception chain, traceback, and provider context."""
+    """Retain explicit cause/context links, traceback, and provider context."""
 
     exceptions = []
     seen: set[int] = set()
     current: BaseException | None = exc
+    chain_link = "root"
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         item: dict[str, Any] = {
             "type": type(current).__name__, "message": redact_text(str(current)),
+            "chain_link": chain_link,
         }
         code = getattr(current, "code", None)
         if code is not None:
@@ -84,9 +86,11 @@ def exception_diagnostic(exc: BaseException) -> dict[str, Any]:
             except ValueError:
                 item["http_response_body"] = redact_text(current.response.text)
         exceptions.append(item)
-        current = current.__cause__ or (
-            None if current.__suppress_context__ else current.__context__
-        )
+        if current.__cause__ is not None:
+            current, chain_link = current.__cause__, "cause"
+        else:
+            current = None if current.__suppress_context__ else current.__context__
+            chain_link = "context"
     return {
         "exceptions": exceptions,
         "traceback": redact_text("".join(traceback.format_exception(exc))),

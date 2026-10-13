@@ -23,7 +23,8 @@ def is_route_preparation_rejected(error: Exception) -> bool:
 
 
 def is_route_preparation_retry_reason(reason: str | None) -> bool:
-    return reason in {"route_preparation_rejected", _LEGACY_PREPARATION_REJECTION}
+    return reason in {"route_preparation_rejected", _LEGACY_PREPARATION_REJECTION,
+                      "requote_required:missing_gas_estimate"}
 
 
 def is_fee_cap_changed(error: Exception) -> bool:

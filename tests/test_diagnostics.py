@@ -101,3 +101,24 @@ def test_provider_only_is_not_counted_as_failed(tmp_path):
         coverage = _coverage(store, [r for r in assets if r['kind'] == 'mandatory'], assets)
         assert coverage[0]['discovered_verification_failures'] == 0
         assert coverage[0]['discovered_provider_only'] == 1
+
+
+def test_exception_diagnostic_distinguishes_explicit_causes_from_handled_context():
+    try:
+        try:
+            raise RpcError("rpc_error", diagnostic={"method": "eth_estimateGas"})
+        except RpcError as estimate:
+            raise ValueError("estimate wrapper") from estimate
+    except ValueError:
+        try:
+            raise RpcError("rpc_error", diagnostic={"method": "eth_call"})
+        except RpcError as metadata:
+            diagnostic = exception_diagnostic(metadata)
+    assert [item["chain_link"] for item in diagnostic["exceptions"]] == ["root", "context", "cause"]
+    assert [item["type"] for item in diagnostic["exceptions"]] == [
+        "RpcError",
+        "ValueError",
+        "RpcError",
+    ]
+    assert diagnostic["exceptions"][0]["provider"]["method"] == "eth_call"
+    assert diagnostic["exceptions"][2]["provider"]["method"] == "eth_estimateGas"

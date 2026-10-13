@@ -450,6 +450,7 @@ class Journal:
                 "SELECT id,position_key,state,reason FROM route_positions WHERE group_id=?",
                 (group_id,),
             ).fetchall()
+            unfinished = [r for r in rows if r["state"] != "completed"]
             retry_reason = reason in {
                 "requote_required:stale_price", "native_gas_reserve_unstable",
                 "requote_required:fee_cap_changed",
@@ -460,29 +461,53 @@ class Journal:
                                 and proof.get("reason") == "requote_required:fee_cap_changed")
             if (group["state"] != "manual_review_group_halted" or not retry_reason
                     or not rows or {r["position_key"] for r in rows} != position_keys
+                    or not unfinished
+                    or any(not self._completed_route_credit_verified(r["id"])
+                           for r in rows if r["state"] == "completed")
                     or any(r["state"] not in {"manual_review", "manual_review_group_halted"}
                            or r["reason"] != reason or self.connection.execute(
                                "SELECT 1 FROM route_steps WHERE position_id=? "
                                "AND step_key NOT LIKE 'approval:%' LIMIT 1", (r["id"],),
                            ).fetchone() is not None
-                           for r in rows)):
+                           for r in unfinished)):
                 return False
-            for row in rows:
+            for row in unfinished:
                 self.connection.execute(
                     "INSERT INTO route_checkpoints VALUES (?, 'automatic_retry', ?) "
                     "ON CONFLICT(position_id,checkpoint_key) DO UPDATE SET "
                     "payload_json=excluded.payload_json",
                     (row["id"], json.dumps({"reason": reason, "recovered_from": group["state"]})),
                 )
-            self.connection.execute(
-                "UPDATE route_positions SET state='planned',reason=NULL,"
-                "updated_at=CURRENT_TIMESTAMP WHERE group_id=?", (group_id,),
-            )
+                self.connection.execute(
+                    "UPDATE route_positions SET state='planned',reason=NULL,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],),
+                )
             self.connection.execute(
                 "UPDATE route_groups SET state='active',reason=NULL,"
                 "updated_at=CURRENT_TIMESTAMP WHERE id=?", (group_id,),
             )
         return True
+
+    def _completed_route_credit_verified(self, position_id: int) -> bool:
+        """Bind a terminal sibling's exchange credit to its saved route deposit."""
+        context = self.checkpoint(position_id, "route_deposit") or {}
+        credit = self.checkpoint(position_id, "bitget_credit") or {}
+        target = context.get("target")
+        if not isinstance(target, dict) or credit.get("status") != "success":
+            return False
+        for field in ("tx_hash", "recipient"):
+            expected = context.get(field)
+            if (not isinstance(expected, str) or not expected
+                    or str(credit.get(field, "")).lower() != expected.lower()):
+                return False
+        if any(not target.get(field) or credit.get(field) != target[field]
+               for field in ("coin", "chain")):
+            return False
+        step_key, source_hash = context.get("step_key"), context.get("source_hash")
+        if not isinstance(step_key, str) or not isinstance(source_hash, str) or not source_hash:
+            return False
+        saved = self.latest_step(position_id=position_id, step_key=step_key)
+        return bool(saved and str(saved["tx_hash"] or "").lower() == source_hash.lower())
 
     def record_group_projection(
         self, group_id: int, *, projected_loss_usd: str, projected_loss_pct: str
@@ -938,6 +963,13 @@ class Journal:
             ).fetchone()
             is not None
         )
+
+    def has_asset_intent(self, position_id: int) -> bool:
+        """Every durable asset intent freezes preparation, even before a hash exists."""
+        return self.connection.execute(
+            "SELECT 1 FROM route_steps WHERE position_id=? "
+            "AND step_key NOT LIKE 'approval:%' LIMIT 1", (position_id,)
+        ).fetchone() is not None
 
     def has_asset_broadcast(self, position_id: int) -> bool:
         """Approvals do not spend the source asset or freeze its route identity."""

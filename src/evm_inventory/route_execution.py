@@ -77,6 +77,11 @@ from .stages import (
     deadline_scope,
 )
 from .transport import Transport, is_transient_error
+from .unsigned_route_options import (
+    InvalidUnsignedRouteCandidate,
+    UnsignedRoutePreparationExhausted,
+    prepare_unsigned_route_options,
+)
 from .valuation import FeeQuote, QuotePrice, raw_to_decimal
 from .wallet_lifi import WalletLifiClients
 from .weth import (
@@ -756,16 +761,24 @@ def execute_group_entries(
                     return counts
         try:
             saved_preflight = journal.checkpoint(position_id, "prepared")
-            frozen = (journal.has_asset_broadcast(position_id) if entry.get("automatic_requote")
-                      else journal.has_broadcast(position_id))
-            if saved_preflight is not None and frozen:
+            asset_intent = journal.has_asset_intent(position_id)
+            frozen = (asset_intent if entry.get("automatic_requote")
+                      else journal.has_broadcast(position_id) or asset_intent)
+            if frozen:
+                if saved_preflight is None:
+                    raise ValueError("requote_required:durable_intent_preparation_missing")
                 fresh = saved_preflight
             else:
                 fresh = preflight(entry)
             if not isinstance(fresh, dict):
                 raise ValueError("route preflight returned no fresh plan")
             current_loss = _entry_loss(fresh)
-            future_loss = _exact_sum(_entry_loss(item) for item in entries[index + 1 :])
+            future_positions = [journal.position(p["id"]) for p in positions[index + 1:]]
+            future_loss = _exact_sum(
+                max(Decimal(0), _entry_loss(item) - Decimal(position["accounted_loss_usd"] or "0"))
+                for item, position in zip(entries[index + 1:], future_positions, strict=True)
+                if position["state"] != "completed"
+            )
         except EthereumGasDeferred as exc:
             remember_error(position_id, "preflight", exc)
             journal.record_position_state(position_id, "gas_deferred", reason=exc.reason)
@@ -1548,10 +1561,15 @@ def _execute_live_groups(
                     position = journal.get_or_create_position(
                         position_key=_position_key(entry), wallet=entry["wallet"]
                     )
+                    if journal.has_asset_intent(position["id"]):
+                        saved = journal.checkpoint(position["id"], "prepared")
+                        if saved is None:
+                            raise ValueError("requote_required:durable_intent_preparation_missing")
+                        return saved
                     if entry.get("automatic_requote"):
                         require_provider_retry_due(journal, position["id"], now_seconds=time.time())
                     approval_hashes = []
-                    if entry.get("automatic_requote") and not journal.has_asset_broadcast(
+                    if entry.get("automatic_requote") and not journal.has_asset_intent(
                         position["id"]
                     ):
                         for approval in journal.connection.execute(
@@ -1874,6 +1892,7 @@ def _refresh_route_step(
     actual_asset_id: str | None = None,
     _spend_amount: int | None = None,
     _reserve_attempt: int = 0,
+    retry_unsigned_preparation: bool = False,
 ) -> tuple[object, dict]:
     route_data = step.get("route")
     if not isinstance(route_data, dict) or not isinstance(route_data.get("evidence"), dict):
@@ -1953,16 +1972,17 @@ def _refresh_route_step(
             raise ValueError("insufficient_source_gas")
         if amount != planned.evidence.input_amount:
             live = None
+    request = LifiRouteRequest(
+        from_chain_id=source.chain_id,
+        to_chain_id=destination.chain_id,
+        from_token_address=_lifi_token(source),
+        to_token_address=_lifi_token(destination),
+        from_amount=str(amount),
+        from_address=wallet.public_address,
+        to_address=recipient,
+    )
+    routes = None
     if not isinstance(live, LifiRoute):
-        request = LifiRouteRequest(
-            from_chain_id=source.chain_id,
-            to_chain_id=destination.chain_id,
-            from_token_address=_lifi_token(source),
-            to_token_address=_lifi_token(destination),
-            from_amount=str(amount),
-            from_address=wallet.public_address,
-            to_address=recipient,
-        )
         routes = jumper.routes(request)
         live = next(
             (route for route in routes if route.route_id == route_data.get("id")),
@@ -2021,70 +2041,100 @@ def _refresh_route_step(
                 jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
                 now_fn=now_fn, _spend_amount=probe, _reserve_attempt=_reserve_attempt,
             )
-    prepared_requests = tuple(jumper.step_transaction(raw_step) for raw_step in live.raw_steps)
-    extra_gas = gas_estimator.estimate_prepared_route(
-        route=live,
-        wallet=wallet.public_address,
-        prepared_transactions=prepared_requests,
-    )
-    if native_available is not None and extra_gas:
-        fee_cap = sum(f.raw_amount for f in extra_gas if f.price and f.price.asset == source)
-        spendable = native_available - GAS_RESERVE_MULTIPLIER * fee_cap
-        if amount > spendable or (not prepared_cap and _reserve_attempt == 0
-                                  and amount < spendable):
-            if spendable <= 0:
-                raise ValueError("insufficient_source_gas")
-            if _reserve_attempt >= 2:
-                raise ValueError("native_gas_reserve_unstable")
-            padded_spendable = native_available - (
-                fee_cap * GAS_RESERVE_MULTIPLIER * 12 + 9) // 10
-            return _refresh_route_step(
-                entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
-                jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
-                now_fn=now_fn,
-                _spend_amount=padded_spendable if padded_spendable > 0 else spendable,
-                _reserve_attempt=_reserve_attempt + 1,
-            )
-    prepared_requests = getattr(gas_estimator, "prepared_fee_caps", {}).get(
-        live.route_id, prepared_requests
-    )
-    candidate = candidate_from_route(
-        live,
-        expected_source=source,
-        expected_destination=destination,
-        expected_input_amount=amount,
-        recipient=recipient,
-        gas_estimate_complete=extra_gas is not None,
-        now=now_fn() if now_fn is not None else now,
-        max_price_age=_MAX_PRICE_AGE,
-        wallet_paid_gas=extra_gas or (),
-        replace_route_gas=bool(extra_gas),
-    )
-    _require_valid_candidate(candidate, gas_estimator=gas_estimator)
-    if step.get("kind") not in {"swap_to_native", "unwrap_to_native"}:
+
+    def prepare_option(live):
+        prepared_requests = tuple(jumper.step_transaction(raw_step) for raw_step in live.raw_steps)
+        extra_gas = gas_estimator.estimate_prepared_route(
+            route=live,
+            wallet=wallet.public_address,
+            prepared_transactions=prepared_requests,
+        )
+        if native_available is not None and extra_gas:
+            fee_cap = sum(f.raw_amount for f in extra_gas if f.price and f.price.asset == source)
+            spendable = native_available - GAS_RESERVE_MULTIPLIER * fee_cap
+            if amount > spendable or (not prepared_cap and _reserve_attempt == 0
+                                      and amount < spendable):
+                if spendable <= 0:
+                    raise ValueError("insufficient_source_gas")
+                if _reserve_attempt >= 2:
+                    raise ValueError("native_gas_reserve_unstable")
+                padded_spendable = native_available - (
+                    fee_cap * GAS_RESERVE_MULTIPLIER * 12 + 9) // 10
+                return _refresh_route_step(
+                    entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
+                    jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
+                    now_fn=now_fn,
+                    _spend_amount=padded_spendable if padded_spendable > 0 else spendable,
+                    _reserve_attempt=_reserve_attempt + 1,
+                )
+        prepared_requests = getattr(gas_estimator, "prepared_fee_caps", {}).get(
+            live.route_id, prepared_requests
+        )
+        candidate = candidate_from_route(
+            live,
+            expected_source=source,
+            expected_destination=destination,
+            expected_input_amount=amount,
+            recipient=recipient,
+            gas_estimate_complete=extra_gas is not None,
+            now=now_fn() if now_fn is not None else now,
+            max_price_age=_MAX_PRICE_AGE,
+            wallet_paid_gas=extra_gas or (),
+            replace_route_gas=bool(extra_gas),
+        )
         try:
-            _require_target_minimum(entry, bitget, wallet, candidate)
+            _require_valid_candidate(candidate, gas_estimator=gas_estimator)
         except ValueError as error:
-            if (str(error) != "requote_required:below_target_minimum"
-                    or native_available is None or not extra_gas
-                    or _reserve_attempt >= 2 or amount >= spendable):
+            if candidate.reason == "missing_gas_estimate":
                 raise
-            return _refresh_route_step(
-                entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
-                jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
-                now_fn=now_fn, _spend_amount=spendable,
-                _reserve_attempt=_reserve_attempt + 1,
-            )
-    fresh_step = {
-        **step,
-        "route": _route_data(live),
-        "_live_route": live,
-        "_prepared_requests": prepared_requests,
-        "_approval_fee_caps": dict(getattr(gas_estimator, "approval_fee_caps", {})),
-    }
-    if len(prepared_requests) == 1:
-        fresh_step["_prepared_request"] = prepared_requests[0]
-    return candidate, fresh_step
+            raise InvalidUnsignedRouteCandidate(str(error)) from error
+        if step.get("kind") not in {"swap_to_native", "unwrap_to_native"}:
+            try:
+                _require_target_minimum(entry, bitget, wallet, candidate)
+            except ValueError as error:
+                if (str(error) != "requote_required:below_target_minimum"
+                        or native_available is None or not extra_gas
+                        or _reserve_attempt >= 2 or amount >= spendable):
+                    if str(error) in {
+                        "requote_required:below_target_minimum",
+                        "requote_required:target_identity_mismatch",
+                    }:
+                        raise InvalidUnsignedRouteCandidate(str(error)) from error
+                    raise
+                return _refresh_route_step(
+                    entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
+                    jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
+                    now_fn=now_fn, _spend_amount=spendable,
+                    _reserve_attempt=_reserve_attempt + 1,
+                )
+        fresh_step = {
+            **step,
+            "route": _route_data(live),
+            "_live_route": live,
+            "_prepared_requests": prepared_requests,
+            "_approval_fee_caps": dict(getattr(gas_estimator, "approval_fee_caps", {})),
+        }
+        if len(prepared_requests) == 1:
+            fresh_step["_prepared_request"] = prepared_requests[0]
+        return candidate, fresh_step
+
+    if not allow_replacement and not retry_unsigned_preparation:
+        return prepare_option(live)
+
+    def same_request_routes():
+        return routes if routes is not None else jumper.routes(request)
+
+    diagnostics = getattr(gas_estimator, "diagnostics", None)
+    if diagnostics is None:
+        diagnostics = gas_estimator.diagnostics = []
+    return prepare_unsigned_route_options(
+        live, alternatives=same_request_routes if allow_replacement else (lambda: ()),
+        prepare=prepare_option,
+        validate=lambda option: validate_bridge_route(
+            option, expected_source=source, expected_destination=destination,
+            input_amount=amount, recipient=recipient),
+        diagnostics=diagnostics, now=now_fn or (lambda: now),
+    )
 
 
 def _requote_from_intermediate(
@@ -3181,7 +3231,9 @@ def _submit_live_step(
             confirmed_hashes=confirmed_hashes,
         )
         journal.save_checkpoint(position_id, progress_key, progress)
-        if not known_broadcast and current_deadline() is not None:
+        retry_unsigned = (bool(entry.get("automatic_requote"))
+                          and not journal.has_asset_intent(position_id))
+        if known_step is None and current_deadline() is not None:
             # Saved routes authorize observation only. A new signature gets
             # exact evidence, fee, current price age and deposit checks again.
             candidate, refreshed = _refresh_route_step(
@@ -3197,6 +3249,7 @@ def _submit_live_step(
                 now_fn=lambda: datetime.fromtimestamp(now_ms() / 1000, UTC),
                 bitget=bitget,
                 source_amount=int(route_data["evidence"]["input_amount"]),
+                retry_unsigned_preparation=retry_unsigned,
             )
             if step.get("kind") == "unwrap_to_native":
                 local_fresh = _preflight_live_entry(
@@ -3226,17 +3279,28 @@ def _submit_live_step(
                 )
             prepared_request = refreshed["_prepared_requests"][index]
             step.update(refreshed)
-        tx_hash = _execute_entry(
-            entry=route_entry,
-            wallet=wallet,
-            rpc=rpc,
-            jumper=jumper,
-            rpc_urls=rpc_urls,
-            now_ms=now_ms,
-            journal=journal,
-            position_id=position_id,
-            prepared_request=prepared_request,
-        )
+
+        def execute_prepared(_route):
+            return _execute_entry(
+                entry=route_entry,
+                wallet=wallet,
+                rpc=rpc,
+                jumper=jumper,
+                rpc_urls=rpc_urls,
+                now_ms=now_ms,
+                journal=journal,
+                position_id=position_id,
+                prepared_request=prepared_request,
+            )
+
+        if retry_unsigned:
+            tx_hash = prepare_unsigned_route_options(
+                live_route, alternatives=lambda: (), validate=lambda _: None,
+                prepare=execute_prepared, diagnostics=[],
+                now=lambda: datetime.fromtimestamp(now_ms() / 1000, UTC),
+            )
+        else:
+            tx_hash = execute_prepared(live_route)
         tx_hash_text = str(tx_hash)
         approval_hash = getattr(tx_hash, "approval_tx_hash", None)
         if approval_hash:
@@ -3471,6 +3535,11 @@ def _execute_entry(
 ) -> str:
     chain_id = int(entry["chain_id"])
     url = rpc_urls[chain_id]
+    step_key = str(entry.get("_journal_step_key", entry["status"]))
+    saved = (journal.latest_step(position_id=position_id, step_key=step_key)
+             if journal is not None and position_id is not None else None)
+    if saved is not None and not saved["tx_hash"]:
+        raise ValueError("durable_asset_intent_hash_missing")
     if prepared_request is not None:
         request = prepared_request
     elif entry["status"] == "route_ready":
@@ -3480,9 +3549,7 @@ def _execute_entry(
         request = _direct_request(entry, wallet=wallet, rpc=rpc, url=url)
     if request.chain_id != chain_id:
         raise ValueError("route transaction chain does not match source balance")
-    step_key = str(entry.get("_journal_step_key", entry["status"]))
     if journal is not None and position_id is not None:
-        saved = journal.latest_step(position_id=position_id, step_key=step_key)
         signing = journal.checkpoint(position_id, f"canonical_signing:{step_key}")
         if saved and saved["tx_hash"] and signing and entry.get("canonical_continuation"):
             signed_entry = {**signing["entry"],
@@ -3695,7 +3762,8 @@ def _execution_reason(exc: Exception) -> str:
 
 
 def _retryable_provider_error(error):
-    if is_route_preparation_rejected(error) or is_fee_cap_changed(error):
+    if (is_route_preparation_rejected(error) or is_fee_cap_changed(error)
+            or isinstance(error, UnsignedRoutePreparationExhausted)):
         return True
     if isinstance(error, (LifiRequestLimit, JobInProgress)):
         return True
