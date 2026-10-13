@@ -154,7 +154,10 @@ def test_short_reserve_rejects_missing_or_foreign_proofs(change):
         withdrawal_reserve(entry, request, wallet)
 
 
-def test_intermediate_canonical_fallback_prepares_native_target_without_route_api(monkeypatch):
+@pytest.mark.parametrize("source_bootstrap", [False, True])
+def test_intermediate_canonical_fallback_prepares_native_target_without_route_api(
+    monkeypatch, source_bootstrap,
+):
     from datetime import UTC, datetime
 
     from evm_inventory.bitget_catalog import BitgetDepositTarget
@@ -167,6 +170,8 @@ def test_intermediate_canonical_fallback_prepares_native_target_without_route_ap
                minimum_raw="1", chain="BASE", decimals=6)
     entry = dict(target=old, automatic_requote=True, _journal_position_id=58,
                  _actual_asset_id="native", _actual_balance_raw="123", group={"key": "g"})
+    if source_bootstrap:
+        entry["canonical_source_bootstrap"] = {"chain_id": 10, "target": old}
     wallet = SimpleNamespace(public_address=WALLET, bitget_deposit_address=DEPOSIT)
     bitget = SimpleNamespace(native_deposit_target=lambda chain: target,
         revalidate_deposit_target=lambda data, **kw: BitgetDepositTarget(
@@ -178,6 +183,7 @@ def test_intermediate_canonical_fallback_prepares_native_target_without_route_ap
     prepared = []
 
     def preflight(dynamic, **kwargs):
+        assert not dynamic.get("canonical_source_bootstrap")
         prepared.append(dynamic)
         return dynamic
 

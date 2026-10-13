@@ -295,6 +295,37 @@ def execution_positions(entries, db_path):
     return result
 
 
+def _migrate_canonical_sources(entries, db_path, *, wallet, rpc_urls, rpc=None):
+    """Migrate the exact original source halt inside the shared operational journal."""
+    from .canonical_source_bootstrap import eligible_source, migrate_source_bootstraps
+    from .models import AssetIdentity
+    from .route_execution import _asset_balance
+
+    transport = None
+    with Journal(db_path) as journal:
+        # A noncandidate path performs no network calls. Committed markers can be
+        # restored from the same database before a collection plan is saved.
+        needs_rpc = any(eligible_source(journal, e, wallet) is not None for e in entries)
+        if needs_rpc and rpc is None:
+            transport = Transport(interval=0)
+            rpc = ExecutionRpc(transport)
+
+        def balance(entry):
+            chain = entry["chain_id"]
+            if (chain not in rpc_urls
+                    or quantity(rpc.call(rpc_urls[chain], "eth_chainId", [])) != chain):
+                return None
+            return _asset_balance(rpc, url=rpc_urls[chain], wallet=wallet.public_address,
+                asset=AssetIdentity(chain, entry["asset_id"], entry["decimals"]))
+
+        try:
+            return migrate_source_bootstraps(
+                entries, journal=journal, wallet=wallet, balance=balance)
+        finally:
+            if transport is not None:
+                transport.close()
+
+
 def _resume_unsigned_retry_groups(entries, db_path, *, rpc_urls=None):
     groups = {}
     for entry in entries:
@@ -450,14 +481,15 @@ def drive_execution(
             if p["state"] != "completed" and not p["state"].startswith("manual_review")
         }
         failure = any(p["state"].startswith("manual_review") for p in positions)
+        unresolved = any(_unresolved(e) for e in plan["entries"])
         if not pending or clock() >= until:
             return {
-                "status": "incomplete" if pending or failure else "completed",
+                "status": "incomplete" if pending or failure or unresolved else "completed",
                 "reason": "collection_deadline_exceeded"
                 if pending
                 else "execution_failed"
                 if failure
-                else None,
+                else "planning_incomplete" if unresolved else None,
                 "completed": completed,
                 "rounds": rounds,
                 "positions": positions,
@@ -804,6 +836,18 @@ def collect_wallets(
                     seconds=max(0.1, planning_until - clock()),
                 )
             if execute:
+                for entry in plan["entries"]:
+                    entry["automatic_requote"] = True
+                migrated = _migrate_canonical_sources(plan["entries"], db_path,
+                    wallet=row, rpc_urls=rpc_urls)
+                from .relay_revalidation import revalidate_legacy_gas
+
+                migrated += revalidate_legacy_gas(plan["entries"], db_path=db_path, wallet=row,
+                    rpc_urls=rpc_urls, target_policy=target_policy, loss_limit=loss_limit,
+                    quote_floor=quote_floor)
+                if migrated:
+                    _save_run(store, run_id, status="executing", plan=plan)
+                    (wallet_output / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
                 _resume_unsigned_retry_groups(plan["entries"], db_path, rpc_urls=rpc_urls)
             locked_chains = set()
             frozen_keys = set()

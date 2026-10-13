@@ -1390,7 +1390,7 @@ def test_automatic_native_preflight_reduces_input_after_sibling_gas_spending(
 
 
 @pytest.mark.parametrize(
-    "fee_values,expected", [((20,), [970, 940]), ((20, 21, 22, 21), [970, 940, 937, 934])]
+    "fee_values,expected", [((20,), [1000, 976]), ((20, 21, 22, 21), [1000, 976])]
 )
 def test_automatic_relay_requotes_live_spendable_balance_after_token_gas(
     monkeypatch, fee_values, expected
@@ -1410,6 +1410,7 @@ def test_automatic_relay_requotes_live_spendable_balance_after_token_gas(
         "decimals": 18,
         "deposit_address": wallet.bitget_deposit_address,
         "automatic_requote": True,
+        "raw_balance": "2000",
         "relay_selected": {"request": {"amount": "1800"}, "source_gas_raw": "10"},
     }
     amounts = []
@@ -1444,4 +1445,5 @@ def test_automatic_relay_requotes_live_spendable_balance_after_token_gas(
     fresh, tx = execution._prepare(entry, wallet, client, rpc, "rpc", target, Decimal("15"))
     assert amounts == expected
     assert tx.value == int(fresh["amount"]) == expected[-1]
-    assert tx.value + 3 * tx.max_total_fee_wei <= 1000
+    assert tx.value + tx.max_total_fee_wei <= 1000
+    assert 1000 - tx.value == 24  # Saved reserve absorbs the one-wei change.

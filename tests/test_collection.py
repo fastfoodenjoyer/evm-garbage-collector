@@ -230,7 +230,9 @@ def test_final_execution_holds_native_for_unresolved_token_but_observes_known_ha
     result = drive_execution({"entries": [native, token]}, path, execute_round=execute,
         until=1010, clock=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0]+s))
     assert len(calls) == int(broadcast)
-    assert result["status"] == ("completed" if broadcast else "incomplete")
+    assert result["status"] == "incomplete"
+    if broadcast:
+        assert result["reason"] == "planning_incomplete"
 
 
 def test_pending_relay_diagnostics_remain_retryable_without_unhashable_dict_error():

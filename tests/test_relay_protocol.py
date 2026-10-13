@@ -68,6 +68,12 @@ def _clock(monkeypatch):
     monkeypatch.setattr("evm_inventory.relay_protocol.time.time", lambda: NOW)
 
 
+def _gas_estimator():
+    from test_relay_planner_gas import estimator
+
+    return estimator()
+
+
 def test_relay_accepts_refunds_to_exact_source_and_approved_deposit_target():
     quote = _quote()
     tx = verified_transaction(quote, CHAINS)
@@ -118,6 +124,7 @@ def test_relay_planner_advances_quote_with_approved_destination_refund():
          "symbol": "ETH", "raw_balance": str(10**15)}, client,
         [BitgetDepositTarget("USDC", 8453, USDC, 10000, "BASE")],
         loss_limit=Decimal("15"), quote_floor=Decimal("0.01"), deposit_address=RECIPIENT,
+        gas_estimator=_gas_estimator(),
     )
     assert entry["status"] == "route_ready", entry.get("diagnostic")
     assert entry["execution_supported"] is True
@@ -149,6 +156,7 @@ def test_live_plan_uses_verified_relay_fallback_while_lifi_waits(tmp_path):
         allowlist_path=_allowlist(tmp_path, [(1868, "native", "swap")]), client=quotes,
         targets=(BitgetDepositTarget("USDC", 8453, USDC, 10000, "BASE"),),
         now_ms=lambda: NOW * 1000, allow_partial_search=True,
+        gas_estimator=_gas_estimator(),
     )
     entry = plan["entries"][0]
     assert entry["status"] == "route_ready", entry
@@ -177,11 +185,12 @@ def test_failed_relay_fallback_preserves_specific_provider_reason(failure):
     entries = [entry]
     _apply_relay_fallback(entries, WALLET, SimpleNamespace(relay_for_wallet=lambda _: client),
         [BitgetDepositTarget("USDC", 8453, USDC, 10000, "BASE")],
-        Decimal("1" if failure == "loss" else "15"), Decimal("0.01"), RECIPIENT)
+        Decimal("1" if failure == "loss" else "15"), Decimal("0.01"), RECIPIENT,
+        _gas_estimator())
     assert entries[0]["reason"] == "quota_wait"
     fallback = entries[0]["relay_fallback"]
     expected = {"unsupported": "unsupported_by_relay", "loss": "max_route_loss_exceeded",
-                "refund": "relay_quote_failed"}[failure]
+                "refund": "relay_route_search_incomplete"}[failure]
     assert fallback["reason"] == expected
     if failure == "refund":
         assert "authorized source or destination" in fallback["diagnostic"]["exceptions"][0][

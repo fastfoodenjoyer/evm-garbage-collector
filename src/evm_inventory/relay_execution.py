@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import math
 import re
 import time
 from datetime import datetime
@@ -12,7 +13,6 @@ from eth_utils import keccak
 
 from .diagnostics import exception_diagnostic
 from .executor import (
-    GAS_RESERVE_MULTIPLIER,
     ExecutionRpc,
     broadcast_durable_transaction,
     pending_nonce,
@@ -21,6 +21,7 @@ from .executor import (
 )
 from .fee_planner import FeePlanner
 from .journal import Journal
+from .relay import _RelayGasReserveChanged, _search_error
 from .relay_protocol import verified_transaction
 from .rpc import quantity, uint256
 from .stages import (
@@ -41,6 +42,18 @@ class RelayTerminalFailure(ValueError):
     """A refund or failed settlement requires human review, never another deposit."""
 
 
+def _require_unsigned_retry_due(journal, position_id, *, now_seconds):
+    if journal.has_asset_intent(position_id):
+        if not journal.has_broadcast(position_id):
+            raise ValueError("durable_asset_intent_hash_missing")
+        return
+    retry = journal.checkpoint(position_id, "relay_retry") or {}
+    retry_at = retry.get("retry_at")
+    if (isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool)
+            and math.isfinite(retry_at) and now_seconds < retry_at):
+        raise StageDeadlineExceeded("provider_retry_scheduled")
+
+
 def _confirmed(rpc, url, receipt):
     latest = rpc.call(url, "eth_getBlockByNumber", ["latest", False])
     return quantity(latest["number"]) >= quantity(receipt["blockNumber"]) + 1
@@ -59,41 +72,56 @@ def _prepare(entry, wallet, client, rpc, url, target, limit):
     if entry.get("deposit_address", "").lower() != wallet.bitget_deposit_address.lower():
         raise ValueError("Relay recipient differs from the trusted workbook address")
     balance = quantity(rpc.call(url, "eth_getBalance", [wallet.public_address, "latest"]))
+    balance = min(balance, int(entry["raw_balance"]))
     amount = int(entry["relay_selected"]["request"]["amount"])
     automatic = bool(entry.get("automatic_requote"))
     if automatic:
-        hint = int(entry["relay_selected"].get("source_gas_raw", 0))
-        available = balance - hint * GAS_RESERVE_MULTIPLIER
-        amount = min(amount, available if 0 < available < balance else max(1, balance // 2))
-    if not 0 < amount < balance:
+        amount = min(amount, balance)
+    if not 0 < amount <= balance or (not automatic and amount == balance):
         raise ValueError("Relay planned amount exceeds live native balance or leaves no gas")
     client.supported_chain_ids()
-    for attempt in range(4):
+    reserve, buffer = balance - amount, None
+    for adjustment in range(3):
+        check_deadline()
         quote = client.quote(entry, target, amount,
                              recipient=wallet.bitget_deposit_address, fresh=True)
         tx = FeePlanner(rpc).plan(
             url, verified_transaction(quote, client.chain_catalog), sender=wallet.public_address
         )
         fee = tx.max_total_fee_wei
+        if fee <= 0:
+            raise ValueError("Relay exact gas fee must be positive")
         if not automatic:
             break
-        available = balance - fee * GAS_RESERVE_MULTIPLIER
-        if available <= 0:
-            raise ValueError("insufficient_source_gas")
-        if available == amount or (attempt == 3 and amount < available):
+        if fee >= balance:
+            raise ValueError(
+                f"insufficient_source_gas:balance_raw={balance};required_fee_raw={fee};"
+                f"shortfall_raw={max(0, fee - balance)}"
+            )
+        if fee <= reserve:
             break
-        amount = available
-    else:
-        raise ValueError("Relay native gas reserve did not stabilize")
+        if adjustment == 2:
+            raise _RelayGasReserveChanged(balance=balance, amount=amount, fee=fee, reserve=reserve)
+        if buffer is None:
+            buffer = (fee * 2 + 9) // 10
+        reserve = fee + buffer
+        if reserve >= balance:
+            reserve, buffer = fee, 0
+        amount = min(amount, balance - reserve)
     if balance < amount + fee:
         raise ValueError("Relay live balance cannot cover input and maximum RPC gas fee")
     if int(quote["to_amount_min"]) < target.minimum_raw:
         raise ValueError("Relay minimum output is below the current Bitget deposit minimum")
-    # Input plus the maximum transaction fee is the amount at risk; retained ETH is excluded.
     input_usd = Decimal(quote["source_usd"])
+    if not input_usd.is_finite() or input_usd <= 0:
+        raise ValueError("Relay source valuation must be finite and positive")
     unit = input_usd / amount
-    cost_usd = input_usd + Decimal(fee) * unit
-    loss = (cost_usd - Decimal(quote["minimum_output_usd"])) / cost_usd * 100
+    original_usd = Decimal(entry.get("source_balance_usd", str(unit * balance)))
+    if not original_usd.is_finite() or original_usd <= 0:
+        raise ValueError("Relay original source valuation must be finite and positive")
+    remaining_usd = Decimal(balance - amount - fee) * unit
+    loss = ((original_usd - Decimal(quote["minimum_output_usd"]) - remaining_usd)
+            / original_usd * 100)
     if not loss.is_finite() or loss > limit:
         raise ValueError(f"Relay loss {loss:.2f}% exceeds {limit}% before signing")
     if time.time() - datetime.fromisoformat(quote["observed_at"]).timestamp() > 60:
@@ -258,6 +286,8 @@ def execute_relay_entries(
                         summary["skipped"] += 1
                         continue
                     try:
+                        _require_unsigned_retry_due(journal, position["id"],
+                                                    now_seconds=time.time())
                         seconds = stage_seconds
                         if entry.get("automatic_requote") and current_deadline() is not None:
                             check_deadline()
@@ -371,6 +401,14 @@ def execute_relay_entries(
                             "pending" if journal.has_broadcast(position["id"]) else "deferred"
                         ] += 1
                     except Exception as error:
+                        retry = _search_error(error)
+                        if (not journal.has_asset_intent(position["id"])
+                                and retry["retry_at"] is not None):
+                            journal.save_checkpoint(position["id"], "relay_retry", retry)
+                            journal.record_position_state(position["id"], position["state"],
+                                                          reason=retry["reason"])
+                            summary["deferred"] += 1
+                            continue
                         summary["relay_diagnostics"].append(
                             {
                                 "wallet": entry["wallet"],

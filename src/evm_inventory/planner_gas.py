@@ -18,6 +18,7 @@ from .lifi import LifiClient, LifiRoute, TransactionRequest
 from .lifi_quota import LifiRequestLimit
 from .models import AssetIdentity
 from .quote_jobs import JobInProgress
+from .relay_protocol import verified_transaction
 from .rpc import RpcReader, quantity
 from .stages import StageDeadlineExceeded
 from .transport import is_transient_error
@@ -89,6 +90,34 @@ class PlannerGasEstimator:
                     "diagnostic": exception_diagnostic(error),
                 }
             )
+
+    def relay_fee_available(self, chain_id: int) -> bool:
+        """Whether exact Relay transaction preparation has an RPC capability."""
+        url = self.rpc_urls.get(chain_id)
+        return isinstance(url, str) and bool(url) and callable(getattr(self.rpc, "call", None))
+
+    def prepare_relay_fee(
+        self, *, quote: dict, chain_catalog: list[dict], wallet: str, source_chain_id: int,
+    ) -> TransactionRequest:
+        """Validate and price the entire unsigned native order on its own RPC chain."""
+        try:
+            request = quote["request"]
+            if request["user"].lower() != wallet.lower():
+                raise ValueError("Relay fee preparation wallet differs from source wallet")
+            if request["originChainId"] != source_chain_id:
+                raise ValueError("Relay fee preparation chain differs from source chain")
+            transaction = verified_transaction(quote, chain_catalog)
+            url = self._url(source_chain_id)
+            actual_chain = quantity(self.rpc.call(url, "eth_chainId", []))
+            if actual_chain != source_chain_id:
+                raise ValueError(
+                    f"relay_rpc_chain_mismatch:expected={source_chain_id};actual={actual_chain}"
+                )
+            planned = FeePlanner(self.rpc).plan(url, transaction, sender=wallet)
+            return replace(planned, max_total_fee_cap_wei=planned.max_total_fee_wei)
+        except Exception as error:
+            self._failure(None, "relay_prepare_transaction", error)
+            raise
 
     def __call__(
         self,

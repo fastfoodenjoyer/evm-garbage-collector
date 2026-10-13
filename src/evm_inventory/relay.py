@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, Decimal
+from decimal import Decimal
 from threading import Lock
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from .diagnostics import exception_diagnostic
 from .lifi_quota import LifiQuotaStore, LifiRequestLimit
 from .quote_jobs import JobInProgress, QuoteJobs, quote_job_key
 from .relay_protocol import verified_transaction
+from .transport import is_transient_error
 
 BASE_URL = "https://api.relay.link/"
 ZERO_ADDRESS = "0x" + "0" * 40
@@ -188,8 +190,164 @@ class RelayClient:
         }
 
 
-def quote_relay_entry(base, client, targets, *, loss_limit, quote_floor, deposit_address=None):
-    """Compare all configured destinations, preserving failures and native gas reserve."""
+class _RelayGasReserveChanged(ValueError):
+    reason = "relay_gas_reserve_changed"
+
+    def __init__(self, *, balance, amount, fee, reserve):
+        self.retry_at = time.time() + 5
+        self.diagnostic = {
+            "balance_raw": str(balance), "input_raw": str(amount),
+            "required_fee_raw": str(fee), "reserve_raw": str(reserve),
+        }
+        super().__init__(self.reason)
+
+
+def _search_error(error, target=None):
+    retry_at = getattr(error, "retry_at", None)
+    reason = getattr(error, "reason", "relay_quote_failed")
+    cause = error
+    seen = set()
+    while retry_at is None and cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        retry_at = getattr(cause, "retry_at", None)
+        if retry_at is not None:
+            reason = getattr(cause, "reason", reason)
+        cause = cause.__cause__
+    if retry_at is None and is_transient_error(error):
+        retry_at = time.time() + 5
+    result = {"reason": reason, "diagnostic": exception_diagnostic(error), "retry_at": retry_at}
+    if target is not None:
+        result["destination_chain_id"] = target.chain_id
+    return result
+
+
+def _fee_budget(planned, *, balance, amount, reserve, buffer, reserve_method):
+    fee = planned.max_total_fee_wei
+    return {
+        "balance_raw": str(balance), "input_raw": str(amount), "required_fee_raw": str(fee),
+        "required_total_raw": str(amount + fee),
+        "shortfall_raw": str(max(0, amount + fee - balance)),
+        "reserve_raw": str(reserve), "reserve_buffer_raw": str(buffer),
+        "reserve_multiplier": "1" if reserve_method == "exact_cap" else "1.2",
+        "reserve_method": reserve_method, "gas_limit": planned.gas_limit,
+        "gas_estimate": planned.gas_estimate,
+        "gas_price_wei": planned.gas_price_wei,
+        "max_fee_per_gas_wei": planned.max_fee_per_gas_wei,
+        "max_priority_fee_per_gas_wei": planned.max_priority_fee_per_gas_wei,
+        "additional_fee_raw": str(planned.additional_fee_wei),
+        "fee_quote_method": planned.fee_quote_method,
+        "fee_quote_block_number": planned.fee_quote_block_number,
+    }
+
+
+def _native_quote(base, client, target, first, gas_estimator, recipient):
+    prepare = getattr(gas_estimator, "prepare_relay_fee", None)
+    available = getattr(gas_estimator, "relay_fee_available", None)
+    if not callable(prepare) or (callable(available) and not available(base["chain_id"])):
+        return {**first, "source_gas_estimate_verified": False,
+                "source_gas_provider_estimate_raw": first["source_gas_raw"],
+                "gas_reserve_sufficient": False, "reason": "relay_source_gas_unverified"}
+
+    balance = int(base["raw_balance"])
+    quote, amount = first, balance
+    reserve, buffer, method = 0, 0, "rpc_cap_plus_fixed_buffer"
+    # One adjustment derives the spendable amount. If its fee exceeds the
+    # padded reserve, allow one expansion; continued movement is a timed retry.
+    for adjustment in range(3):
+        planned = prepare(quote=quote, chain_catalog=client.chain_catalog,
+                          wallet=base["wallet"], source_chain_id=base["chain_id"])
+        fee = planned.max_total_fee_wei
+        if fee <= 0:
+            raise ValueError("Relay exact gas fee must be positive")
+        if adjustment == 0:
+            buffer = (fee * 2 + 9) // 10
+        if fee >= balance:
+            # No positive input can fit. Record a fee-only shortfall; the
+            # full-balance probe itself is not an affordable transaction.
+            quote = {**quote, "gas_reserve_sufficient": False,
+                     "reason": "insufficient_source_gas"}
+            budget = _fee_budget(planned, balance=balance, amount=0, reserve=fee,
+                                 buffer=buffer, reserve_method=method)
+            break
+        if adjustment > 0 and fee <= reserve:
+            quote = {**quote, "gas_reserve_sufficient": True}
+            budget = _fee_budget(planned, balance=balance, amount=amount, reserve=reserve,
+                                 buffer=buffer, reserve_method=method)
+            break
+        if adjustment == 2:
+            raise _RelayGasReserveChanged(balance=balance, amount=amount, fee=fee, reserve=reserve)
+        reserve = fee + buffer
+        if reserve >= balance:
+            # The RPC cap already includes FeePlanner's gas and chain fee
+            # bounds. Preserve it when the additional reserve cannot fit.
+            reserve, method, buffer = fee, "exact_cap", 0
+        amount = balance - reserve
+        quote = client.quote(base, target, amount, recipient=recipient)
+    return {
+        **quote, "source_gas_provider_estimate_raw": quote["source_gas_raw"],
+        "source_gas_raw": str(fee), "source_gas_estimate_verified": True,
+        "source_gas_reserve_raw": budget["reserve_raw"], "gas_budget": budget,
+    }
+
+
+def _evaluate_candidate(base, target, quote, original_usd, current_usd, loss_limit):
+    quote["target"] = {
+        "coin": target.coin, "chain": target.chain, "chain_id": target.chain_id,
+        "asset_id": target.asset_id, "decimals": target.decimals,
+        "minimum_raw": str(target.minimum_raw),
+    }
+    quote["source_balance_usd"] = str(original_usd)
+    quote["current_source_balance_usd"] = str(current_usd)
+    quote["deposit_minimum_raw"] = str(target.minimum_raw)
+    quote["max_route_loss_pct"] = str(loss_limit)
+    quote["deposit_minimum_met"] = int(quote["to_amount_min"]) >= target.minimum_raw
+    if quote.get("source_gas_estimate_verified"):
+        balance, amount = int(base["raw_balance"]), int(quote["request"]["amount"])
+        unit_price = current_usd / balance
+        remaining = max(0, balance - amount - int(quote["source_gas_raw"]))
+        remaining_usd = remaining * unit_price
+        quote["source_gas_usd"] = str(int(quote["source_gas_raw"]) * unit_price)
+        quote["unspent_source_reserve_usd"] = str(remaining_usd)
+        quote["loss_pct"] = str(
+            (original_usd - _decimal(quote["minimum_output_usd"]) - remaining_usd)
+            / original_usd * 100
+        )
+    loss = Decimal(quote["loss_pct"])
+    if not loss.is_finite():
+        raise ValueError("Relay route loss must be finite")
+    quote["within_loss_limit"] = loss <= loss_limit
+    if "reason" not in quote:
+        quote["reason"] = (
+            "bitget_deposit_minimum_not_met" if not quote["deposit_minimum_met"]
+            else "max_route_loss_exceeded" if not quote["within_loss_limit"]
+            else "relay_route_ready"
+        )
+    return quote
+
+
+def relay_gas_revalidation_needed(entry):
+    """Identify old provider-hint gas refusals; the caller must also exclude source intents."""
+    if (entry.get("routing_provider") != "relay" or entry.get("status") != "manual_review"
+            or entry.get("reason") != "insufficient_source_gas"
+            or entry.get("asset_id") != "native" or entry.get("decimals") != 18):
+        return False
+    evidence = [entry, entry.get("relay_selected"), entry.get("relay_probe"),
+                *entry.get("relay_candidates", [])]
+    for candidate in evidence:
+        if not isinstance(candidate, dict):
+            continue
+        budget = candidate.get("gas_budget", {})
+        if candidate.get("source_gas_estimate_verified") is True or (
+            isinstance(budget, dict) and budget.get("required_fee_raw") is not None
+            and budget.get("gas_limit") is not None and budget.get("fee_quote_method")
+        ):
+            return False
+    return True
+
+
+def quote_relay_entry(base, client, targets, *, loss_limit, quote_floor, deposit_address=None,
+                       gas_estimator=None, original_source_usd=None):
+    """Compare every destination using verified RPC fees and the original balance budget."""
     entry = {
         **base,
         "status": "manual_review",
@@ -201,113 +359,62 @@ def quote_relay_entry(base, client, targets, *, loss_limit, quote_floor, deposit
         "search": {"complete": False, "errors": [], "pending": []},
     }
     try:
+        if original_source_usd is not None:
+            original_usd = _decimal(original_source_usd)
+            if original_usd <= 0:
+                raise ValueError("Relay original source valuation must be positive")
+            entry["source_balance_usd"] = str(original_usd)
         if base["chain_id"] not in client.supported_chain_ids():
             entry["reason"] = "unsupported_by_relay"
             return entry
         if not targets:
             raise ValueError("No configured destination enabled for Bitget deposits")
-        amount = int(base["raw_balance"])
-        first = None
-        probe_errors = []
-        probe_target = None
-        for target in targets:
-            try:
-                first = client.quote(base, target, amount, recipient=deposit_address)
-                probe_target = target
-                break
-            except Exception as error:
-                probe_errors.append(
-                    {
-                        "destination_chain_id": target.chain_id,
-                        "diagnostic": exception_diagnostic(error),
-                        "retry_at": getattr(error, "retry_at", None),
-                    }
-                )
-        if first is None:
-            entry["search"]["errors"] = probe_errors
-            entry["search"]["pending"] = [e for e in probe_errors if e["retry_at"] is not None]
-            entry["reason"] = "relay_route_search_incomplete"
-            return entry
-        entry["relay_probe_errors"] = probe_errors
-        entry["source_balance_usd"] = first["source_usd"]
-        if _decimal(first["source_usd"]) < quote_floor:
-            entry.update(status="below_quote_floor", reason="below_quote_floor")
-            return entry
-        if base["asset_id"] == "native":
-            reserve = int(
-                (Decimal(first["source_gas_raw"]) * Decimal("1.2")).to_integral_value(
-                    rounding=ROUND_CEILING
-                )
-            )
-            entry["source_gas_reserve_raw"] = str(reserve)
-            amount -= reserve
-            if amount <= 0:
-                entry.update(reason="insufficient_source_gas", relay_probe=first)
-                return entry
         quotes = []
         for target in targets:
             try:
-                quote = (
-                    first
-                    if amount == int(base["raw_balance"]) and target == probe_target
-                    else client.quote(base, target, amount, recipient=deposit_address)
-                )
-                quote["target"] = {
-                    "coin": target.coin,
-                    "chain": target.chain,
-                    "chain_id": target.chain_id,
-                    "asset_id": target.asset_id,
-                    "decimals": target.decimals,
-                    "minimum_raw": str(target.minimum_raw),
-                }
-                quote["deposit_minimum_met"] = int(quote["to_amount_min"]) >= target.minimum_raw
-                quote["gas_reserve_sufficient"] = base["asset_id"] != "native" or int(
-                    quote["source_gas_raw"]
-                ) <= int(entry["source_gas_reserve_raw"])
-                if base["asset_id"] == "native":
-                    # Gas comes from the original balance; unspent reserve is retained.
-                    remaining_raw = max(
-                        0, int(entry["source_gas_reserve_raw"]) - int(quote["source_gas_raw"])
-                    )
-                    unit_price = _decimal(quote["source_usd"]) / Decimal(amount)
-                    remaining_usd = Decimal(remaining_raw) * unit_price
-                    source_usd = _decimal(entry["source_balance_usd"])
-                    quote["unspent_source_reserve_usd"] = str(remaining_usd)
-                    quote["loss_pct"] = str(
-                        (source_usd - _decimal(quote["minimum_output_usd"]) - remaining_usd)
-                        / source_usd
-                        * 100
-                    )
-                quote["within_loss_limit"] = Decimal(quote["loss_pct"]) <= loss_limit
-                quotes.append(quote)
+                first = client.quote(base, target, int(base["raw_balance"]),
+                                     recipient=deposit_address)
+                original_usd = _decimal(first["source_usd"])
+                if original_usd <= 0:
+                    raise ValueError("Relay source valuation is zero")
+                entry.setdefault("source_balance_usd", str(original_usd))
+                entry.setdefault("current_source_balance_usd", str(original_usd))
+                original_usd = _decimal(entry["source_balance_usd"])
+                current_usd = _decimal(entry["current_source_balance_usd"])
+                quote = _native_quote(base, client, target, first, gas_estimator, deposit_address)
+                quotes.append(_evaluate_candidate(base, target, quote, original_usd, current_usd,
+                                                  loss_limit))
             except Exception as error:
-                entry["search"]["errors"].append(
-                    {
-                        "destination_chain_id": target.chain_id,
-                        "diagnostic": exception_diagnostic(error),
-                    }
-                )
-                retry_at = getattr(error, "retry_at", None)
-                if retry_at is not None:
-                    entry["search"]["pending"].append(
-                        {
-                            "reason": getattr(error, "reason", "relay_quote_failed"),
-                            "retry_at": retry_at,
-                            "diagnostic": exception_diagnostic(error),
-                        }
-                    )
+                detail = _search_error(error, target)
+                entry.setdefault("diagnostic", detail["diagnostic"])
+                entry["search"]["errors"].append(detail)
+                if detail["retry_at"] is not None:
+                    entry["search"]["pending"].append(detail)
         entry["relay_candidates"] = quotes
         entry["search"]["complete"] = len(quotes) == len(targets)
+        if quotes:
+            entry["quote_status"] = "available"
         if not entry["search"]["complete"]:
             entry["reason"] = "relay_route_search_incomplete"
             return entry
-        entry["quote_status"] = "available"
+        if quotes and all(_decimal(q["source_balance_usd"]) < quote_floor for q in quotes):
+            entry.update(status="below_quote_floor", reason="below_quote_floor")
+            return entry
+        if any(not q["source_gas_estimate_verified"] for q in quotes):
+            entry["reason"] = "relay_source_gas_unverified"
+            return entry
         feasible = [q for q in quotes if q["deposit_minimum_met"] and q["gas_reserve_sufficient"]]
         if not feasible:
-            entry["reason"] = "relay_deposit_minimum_or_gas_reserve"
+            entry["reason"] = (
+                "insufficient_source_gas"
+                if quotes and all(q["reason"] == "insufficient_source_gas" for q in quotes)
+                else "relay_deposit_minimum_or_gas_reserve"
+            )
             return entry
         best = min(feasible, key=lambda q: Decimal(q["loss_pct"]))
         entry["relay_selected"] = best
+        entry["source_balance_usd"] = best["source_balance_usd"]
+        entry["source_gas_reserve_raw"] = best["source_gas_reserve_raw"]
         entry["reason"] = "max_route_loss_exceeded"
         if best["within_loss_limit"]:
             if not deposit_address:
@@ -325,6 +432,9 @@ def quote_relay_entry(base, client, targets, *, loss_limit, quote_floor, deposit
         return entry
     except Exception as error:
         entry["diagnostic"] = exception_diagnostic(error)
-        entry["search"]["errors"].append(entry["diagnostic"])
+        detail = _search_error(error)
+        entry["search"]["errors"].append(detail)
+        if detail["retry_at"] is not None:
+            entry["search"]["pending"].append(detail)
         entry["reason"] = getattr(error, "reason", "relay_quote_failed")
         return entry

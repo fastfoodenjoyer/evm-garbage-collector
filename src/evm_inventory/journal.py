@@ -591,9 +591,105 @@ class Journal:
         )
         self.connection.commit()
 
+    def checkpoint_source_conversion(self, position_id: int, result: dict) -> str:
+        """Atomically persist confirmed output and its cumulatively accounted source cost."""
+        from .route_checkpoints import encode
+
+        loss = _decimal_text(result["realized_loss_usd"], "source conversion loss")
+        if (result.get("state") not in {"confirmed", "completed"}
+                or result.get("actual_asset_id") != "native"
+                or int(result["actual_balance_raw"]) <= 0):
+            raise ValueError("invalid confirmed source conversion")
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            existing = self.checkpoint(position_id, "swap_result")
+            provenance = self.checkpoint(position_id, "source_cost_provenance")
+            if existing is not None and provenance is None:
+                self._adopt_legacy_source_cost(position_id, existing)
+            if existing is not None and existing != result:
+                raise ValueError("source conversion result cannot change")
+            self.connection.execute(
+                "INSERT INTO route_checkpoints VALUES (?,'swap_result',?) "
+                "ON CONFLICT(position_id,checkpoint_key) DO NOTHING",
+                (position_id, json.dumps(encode(result), sort_keys=True)),
+            )
+            total = self._account_cumulative_position_loss(position_id, loss)
+            if existing is None:
+                self._write_source_provenance(position_id, dict(
+                    version=2, origin="atomic_conversion",
+                    source_loss_usd=loss, cumulative_loss_usd=loss, group_loss_after_usd=total))
+            self.connection.execute(
+                "UPDATE route_positions SET state='source_asset_converted_bridge_pending',"
+                "actual_asset_id=?,actual_balance_raw=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (result["actual_asset_id"], str(result["actual_balance_raw"]), position_id),
+            )
+        return total
+
+    def _write_source_provenance(self, position_id, payload):
+        self.connection.execute(
+            "INSERT INTO route_checkpoints VALUES (?,'source_cost_provenance',?) "
+            "ON CONFLICT(position_id,checkpoint_key) DO UPDATE SET "
+            "payload_json=excluded.payload_json",
+            (position_id, json.dumps(payload, sort_keys=True)),
+        )
+
+    def _adopt_legacy_source_cost(self, position_id, result):
+        from .source_cost_provenance import legacy_baseline
+
+        proof = legacy_baseline(self, position_id, result)
+        position = self.position(position_id)
+        self.connection.execute("UPDATE route_positions SET accounted_loss_usd=? WHERE id=?",
+                                (proof["cumulative_loss_usd"], position_id))
+        self.connection.execute("UPDATE route_groups SET realized_loss_usd=? WHERE id=?",
+                                (proof["group_loss_after_usd"], position["group_id"]))
+        context = self.checkpoint(position_id, "route_deposit")
+        if context is not None:
+            from .route_checkpoints import encode
+
+            with localcontext() as arithmetic:
+                arithmetic.prec = 80
+                cumulative = (Decimal(context["realized_loss_usd"])
+                              + Decimal(proof["source_loss_usd"]))
+            context = {**context, "realized_loss_usd": format(cumulative, "f"),
+                       "loss_accounting_version": 2}
+            self.connection.execute(
+                "UPDATE route_checkpoints SET payload_json=? WHERE position_id=? "
+                "AND checkpoint_key='route_deposit'",
+                (json.dumps(encode(context), sort_keys=True), position_id),
+            )
+        self._write_source_provenance(position_id, proof)
+        return proof
+
+    def _account_cumulative_position_loss(self, position_id: int, loss: str) -> str:
+        position = self.position(position_id)
+        group = self.group(position["group_id"])
+        with localcontext() as context:
+            context.prec = 80
+            previous = Decimal(position["accounted_loss_usd"] or "0")
+            current = max(previous, Decimal(loss))
+            total = Decimal(group["realized_loss_usd"]) + current - previous
+        self.connection.execute("UPDATE route_positions SET accounted_loss_usd=? WHERE id=?",
+                                (format(current, "f"), position_id))
+        self.connection.execute(
+            "UPDATE route_groups SET realized_loss_usd=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (format(total, "f"), group["id"]),
+        )
+        return format(total, "f")
+
     def account_position_loss(self, position_id: int, *, loss_usd: str) -> str:
         """Count a broadcast position's loss once, including across restarts."""
         loss = _decimal_text(loss_usd, "position realised loss")
+        if self.checkpoint(position_id, "swap_result") is not None:
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                if self.checkpoint(position_id, "source_cost_provenance") is None:
+                    proof = self._adopt_legacy_source_cost(
+                        position_id, self.checkpoint(position_id, "swap_result"))
+                    if proof["legacy_remaining_loss_usd"] == loss:
+                        with localcontext() as arithmetic:
+                            arithmetic.prec = 80
+                            loss = format(Decimal(loss) + Decimal(proof["source_loss_usd"]), "f")
+                return self._account_cumulative_position_loss(position_id, loss)
         position = self.position(position_id)
         group_id = position["group_id"]
         if group_id is None:

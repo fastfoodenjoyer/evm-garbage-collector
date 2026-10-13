@@ -20,6 +20,13 @@ import httpx
 
 from .bitget import BitgetClient
 from .bitget_catalog import BitgetDepositTarget
+from .canonical_source_bootstrap import (
+    confirmed_unsigned_source_bridge,
+    require_source_bridge_retry_due,
+    require_source_receipt,
+    source_output,
+    source_withdrawal_reserve,
+)
 from .celo import CELO_CHAIN_ID, CELO_TOKEN_ADDRESS
 from .consolidation import (
     candidate_from_route,
@@ -65,7 +72,6 @@ from .quote_jobs import JobInProgress
 from .route_preparation import (
     is_fee_cap_changed,
     is_route_preparation_rejected,
-    require_provider_retry_due,
 )
 from .rpc import quantity
 from .stages import (
@@ -764,7 +770,7 @@ def execute_group_entries(
             asset_intent = journal.has_asset_intent(position_id)
             frozen = (asset_intent if entry.get("automatic_requote")
                       else journal.has_broadcast(position_id) or asset_intent)
-            if frozen:
+            if frozen or journal.checkpoint(position_id, "swap_result") is not None:
                 if saved_preflight is None:
                     raise ValueError("requote_required:durable_intent_preparation_missing")
                 fresh = saved_preflight
@@ -859,19 +865,13 @@ def execute_group_entries(
                     raise ValueError("source swap did not confirm")
                 actual_asset = str(swap_result["actual_asset_id"])
                 actual_balance = _raw_amount(swap_result["actual_balance_raw"])
-                if saved_swap is None:
-                    realized = _add_realized(realized, swap_result.get("realized_loss_usd", "0"))
-                    journal.save_checkpoint(position_id, "swap_result", swap_result)
-                journal.record_group_realized_loss(
-                    group["id"], realized_loss_usd=_decimal_string(realized)
-                )
-                if saved_swap is None:
-                    journal.record_position_state(
-                        position_id,
-                        "source_asset_converted_bridge_pending",
-                        actual_asset_id=actual_asset,
-                        actual_balance_raw=actual_balance,
-                    )
+                realized = Decimal(journal.checkpoint_source_conversion(position_id, swap_result))
+                accounted = Decimal(journal.position(position_id)["accounted_loss_usd"] or "0")
+                if fresh.get("canonical_source_bootstrap"):
+                    fresh = {**fresh, "canonical_source_bootstrap": {
+                        **fresh["canonical_source_bootstrap"],
+                        "protected_native_raw": swap_result["protected_native_raw"],
+                    }}
             except StageDeadlineExceeded as exc:
                 return yield_stage(position_id, exc)
             except Exception as exc:
@@ -892,6 +892,8 @@ def execute_group_entries(
                     )
                 return counts
 
+            fresh = {**fresh, "_realized_loss_before_current_usd":
+                     str(swap_result["realized_loss_usd"])}
             original_bridge = next(
                 (step for step in steps[1:] if step.get("kind") == "bridge"), None
             )
@@ -922,9 +924,16 @@ def execute_group_entries(
                     "_journal_position_id": position_id,
                     "_actual_asset_id": actual_asset,
                     "_actual_balance_raw": str(actual_balance),
+                    "_realized_loss_before_current_usd": str(swap_result["realized_loss_usd"]),
                 }
                 saved_bridge = journal.checkpoint(position_id, "bridge_prepared")
-                if saved_bridge is not None and journal.has_broadcast(position_id):
+                bridge_intent = journal.connection.execute(
+                    "SELECT 1 FROM route_steps WHERE position_id=? AND step_key LIKE 'bridge:%'",
+                    (position_id,),
+                ).fetchone()
+                frozen_bridge = (bool(bridge_intent) if entry.get("canonical_source_bootstrap")
+                                 else journal.has_broadcast(position_id))
+                if saved_bridge is not None and frozen_bridge:
                     fresh = saved_bridge
                 else:
                     fresh = preflight(fresh)
@@ -932,7 +941,7 @@ def execute_group_entries(
                 journal.save_checkpoint(position_id, "bridge_prepared", fresh)
                 replacement = fresh["steps"][-1]
                 current_loss = _entry_loss(fresh)
-                projected = _exact_sum((realized, current_loss, future_loss))
+                projected = _exact_sum((realized - accounted, current_loss, future_loss))
                 projected_pct = _exact_percentage(projected, source_usd)
                 journal.record_group_projection(
                     group["id"],
@@ -961,13 +970,16 @@ def execute_group_entries(
                     replacement,
                 )
                 if bridge_result.get("state") == "deposit_pending":
-                    return yield_stage(position_id, StageDeadlineExceeded("deposit_pending"))
+                    realized = Decimal(journal.account_position_loss(position_id,
+                        loss_usd=str(bridge_result.get("realized_loss_usd", current_loss))))
+                    journal.record_position_state(position_id, "deposit_pending",
+                                                  reason=bridge_result.get("reason"))
+                    counts["deposit_pending"] += 1
+                    return counts
                 if bridge_result.get("state") not in {"confirmed", "completed"}:
                     raise ValueError("replacement bridge did not confirm")
-                realized = _add_realized(realized, bridge_result.get("realized_loss_usd", "0"))
-                journal.record_group_realized_loss(
-                    group["id"], realized_loss_usd=_decimal_string(realized)
-                )
+                realized = Decimal(journal.account_position_loss(position_id,
+                    loss_usd=str(bridge_result.get("realized_loss_usd", current_loss))))
             except GroupLossLimitExceeded as exc:
                 remember_error(position_id, "dependent_bridge", exc)
                 reason = _execution_reason(exc)
@@ -1561,13 +1573,24 @@ def _execute_live_groups(
                     position = journal.get_or_create_position(
                         position_key=_position_key(entry), wallet=entry["wallet"]
                     )
-                    if journal.has_asset_intent(position["id"]):
-                        saved = journal.checkpoint(position["id"], "prepared")
+                    source_converted = (entry.get("_actual_balance_raw") is not None
+                        and journal.checkpoint(position["id"], "swap_result") is not None)
+                    bridge_intent = journal.connection.execute(
+                        "SELECT 1 FROM route_steps WHERE position_id=? "
+                        "AND step_key LIKE 'bridge:%'",
+                        (position["id"],),
+                    ).fetchone()
+                    if (journal.has_asset_intent(position["id"])
+                            and (not source_converted or bridge_intent)):
+                        saved = (journal.checkpoint(position["id"], "bridge_prepared")
+                                 if source_converted else
+                                 journal.checkpoint(position["id"], "prepared"))
                         if saved is None:
                             raise ValueError("requote_required:durable_intent_preparation_missing")
                         return saved
                     if entry.get("automatic_requote"):
-                        require_provider_retry_due(journal, position["id"], now_seconds=time.time())
+                        require_source_bridge_retry_due(journal, position["id"], entry,
+                                                        now_seconds=time.time())
                     approval_hashes = []
                     if entry.get("automatic_requote") and not journal.has_asset_intent(
                         position["id"]
@@ -1580,6 +1603,23 @@ def _execute_live_groups(
                             wait_for_receipt(rpc, url=_rpc_url(rpc_urls, entry["chain_id"]),
                                              tx_hash=approval[0])
                             approval_hashes.append((entry["chain_id"], approval[0]))
+                    if entry.get("canonical_source_bootstrap") and not source_converted:
+                        cached = journal.checkpoint(position["id"], "source_bootstrap_preflight")
+                        if cached is not None:
+                            from .canonical_source_bootstrap import _identity, validate_marker
+
+                            validate_marker(cached, wallet)
+                            original = journal.checkpoint(
+                                position["id"], "canonical_source_bootstrap")
+                            if (_identity(cached) != _identity(entry)
+                                    or original is None or any(
+                                        cached["canonical_source_bootstrap"].get(k) != v
+                                        for k, v in original.items())):
+                                raise ValueError(
+                                    "canonical_source_bootstrap_cache_identity_changed")
+                            entry = {**cached, **{k: v for k, v in entry.items() if callable(v)}}
+                    entry = {**entry, "_unsigned_source_bridge": confirmed_unsigned_source_bridge(
+                        journal, position["id"], entry)}
                     diagnostic_start = len(getattr(gas_estimator, "diagnostics", []))
                     try:
                         fresh = _preflight_live_entry(
@@ -1597,6 +1637,8 @@ def _execute_live_groups(
                         journal.save_checkpoint(position["id"], "preflight_gas_diagnostics",
                                                 redact_data(failures))
                         raise
+                    if entry.get("canonical_source_bootstrap") and not source_converted:
+                        journal.save_checkpoint(position["id"], "source_bootstrap_preflight", fresh)
                     if approval_hashes:
                         expense = _actual_gas_paid_usd(
                             approval_hashes, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper,
@@ -1652,6 +1694,11 @@ def _execute_live_groups(
                     return result
 
                 def requote(entry: dict, amount: int) -> dict:
+                    if entry.get("canonical_source_bootstrap") and entry.get("automatic_requote"):
+                        position = journal.get_or_create_position(
+                            position_key=_position_key(entry), wallet=entry["wallet"])
+                        require_source_bridge_retry_due(journal, position["id"], entry,
+                                                        now_seconds=time.time())
                     return _requote_bridge_after_swap(
                         entry,
                         amount,
@@ -1698,6 +1745,11 @@ def _preflight_live_entry(
     gas_estimator: PlannerGasEstimator,
     now_ms: Callable[[], int],
 ) -> dict:
+    if entry.get("canonical_source_bootstrap") and entry.get("_actual_balance_raw") is None:
+        from .canonical_source_bootstrap import preflight_source_bootstrap
+
+        return preflight_source_bootstrap(entry, wallet=wallet, rpc=rpc, rpc_urls=rpc_urls,
+            jumper=jumper, bitget=bitget, now_ms=now_ms)
     target = _require_live_target(entry, wallet=wallet, bitget=bitget)
     if entry.get("local_unwrap") and entry["status"] != "direct_deposit":
         steps = entry.get("steps", [])
@@ -1793,11 +1845,15 @@ def _preflight_live_entry(
             bitget=bitget,
             source_amount=int(actual_balance_raw),
             actual_asset_id=str(actual_asset_id),
+            retry_unsigned_preparation=bool(entry.get("_unsigned_source_bridge")),
         )
         fresh = {**entry, "steps": [steps[0], bridge_step]}
         fresh["_candidate"] = bridge_candidate
         fresh["_step_candidates"] = {bridge_step["route"]["id"]: bridge_candidate}
         fresh["valuation"] = _candidate_valuation(bridge_candidate)
+        fresh["valuation"]["loss_usd"] = _decimal_string(_exact_sum((
+            bridge_candidate.loss_usd, Decimal(entry.get("_realized_loss_before_current_usd", "0")),
+        )))
         return fresh
 
     candidates = []
@@ -1931,12 +1987,15 @@ def _refresh_route_step(
         ):
             raise ValueError("requote_required:local_unwrap_identity_invalid")
     live = step.get("_live_route")
-    if step.get("kind") == "unwrap_to_native" and entry.get("automatic_requote"):
+    canonical_source = (entry.get("canonical_source_bootstrap")
+                        and step.get("kind") == "swap_to_native")
+    if ((step.get("kind") == "unwrap_to_native" or canonical_source)
+            and entry.get("automatic_requote")):
         planned = live = _canonical_unwrap_route(
             jumper, source, amount, wallet, now_fn or (lambda: now))
     allow_replacement = bool(entry.get("automatic_requote")) and (
         source_amount is None and not entry.get("_journal_position_id")
-        and step.get("kind") != "unwrap_to_native"
+        and step.get("kind") != "unwrap_to_native" and not canonical_source
     )
     native_available = None
     prepared_cap = 0
@@ -2167,7 +2226,8 @@ def _requote_from_intermediate(
             route = _canonical_unwrap_route(jumper, asset, amount, wallet,
                 lambda: datetime.fromtimestamp(now_ms() / 1000, UTC))
             dynamic = {key: value for key, value in entry.items()
-                       if key not in {"_actual_asset_id", "_actual_balance_raw"}}
+                       if key not in {"_actual_asset_id", "_actual_balance_raw",
+                                      "canonical_source_bootstrap"}}
             dynamic.update(status="route_ready", local_unwrap=True, chain_id=asset.chain_id,
                 asset_id=asset.contract_address, decimals=18, raw_balance=str(amount),
                 target=native_target_data, quoted_at=now_ms(),
@@ -2296,6 +2356,7 @@ def _requote_bridge_after_swap(
     bitget: BitgetClient,
     gas_estimator: PlannerGasEstimator,
     now_ms: Callable[[], int],
+    remaining_loss_usd: Decimal | None = None,
 ) -> dict:
     planned_bridge = next((step for step in entry["steps"] if step.get("kind") == "bridge"), None)
     if planned_bridge is None:
@@ -2303,9 +2364,28 @@ def _requote_bridge_after_swap(
     route_data = planned_bridge["route"]
     target_identity = _asset_from_data(route_data["evidence"]["destination"])
     source = native_asset_identity(int(entry["chain_id"]))
+    marker = entry.get("canonical_source_bootstrap")
+    if marker and marker.get("protected_native_raw") is not None:
+        available = _native_balance(gas_estimator.rpc,
+            url=_rpc_url(gas_estimator.rpc_urls, source.chain_id), wallet=wallet.public_address)
+        amount = min(amount, max(0, available - int(marker["protected_native_raw"])))
     if amount <= 0:
         raise ValueError("requote_required:empty_swap_output")
     live_target = _require_live_target(entry, wallet=wallet, bitget=bitget)
+    stable_spend = None
+    if marker and marker.get("protected_native_raw") is not None:
+        stable_spend = (int(marker.get("future_balance_raw", "0"))
+                        - int(marker.get("future_source_fee_reserve_raw", "0")))
+        if not 0 < stable_spend < amount:
+            stable_spend = None
+        if remaining_loss_usd is None:
+            with localcontext() as context:
+                context.prec = 80
+                remaining_loss_usd = (Decimal(marker["source_usd"])
+                    * Decimal(marker["loss_budget_pct"]) / 100
+                    - Decimal(marker["paid_loss_usd"])
+                    - Decimal(entry.get("_realized_loss_before_current_usd", "0"))
+                    + Decimal(marker["accounted_loss_usd"]))
     candidates = []
     stale_price = False
     initial_request = LifiRouteRequest(
@@ -2313,7 +2393,7 @@ def _requote_bridge_after_swap(
         to_chain_id=target_identity.chain_id,
         from_token_address=_lifi_token(source),
         to_token_address=_lifi_token(target_identity),
-        from_amount=str(amount),
+        from_amount=str(stable_spend or amount),
         from_address=wallet.public_address,
         to_address=wallet.bitget_deposit_address,
     )
@@ -2333,7 +2413,9 @@ def _requote_bridge_after_swap(
             for quote in initial_gas
             if quote.price is not None and quote.price.asset == source
         )
-        spendable = amount - source_gas * GAS_RESERVE_MULTIPLIER
+        spendable = (stable_spend if stable_spend is not None and
+                     amount - stable_spend >= source_gas * GAS_RESERVE_MULTIPLIER
+                     else amount - source_gas * GAS_RESERVE_MULTIPLIER)
         if source_gas <= 0 or spendable <= 0:
             continue
         reserved = amount - spendable
@@ -2381,8 +2463,15 @@ def _requote_bridge_after_swap(
                 candidate.is_valid
                 and candidate.destination_amount is not None
                 and candidate.destination_amount >= live_target.minimum_raw
+                and (remaining_loss_usd is None or candidate.loss_usd <= remaining_loss_usd)
             ):
+                prepared_requests = gas_estimator.prepared_fee_caps.get(
+                    route.route_id, prepared_requests)
                 candidates.append((route, candidate, prepared_requests))
+                if entry.get("canonical_source_bootstrap"):
+                    break
+        if candidates and entry.get("canonical_source_bootstrap"):
+            break
     if not candidates:
         if stale_price:
             raise ValueError("requote_required:stale_price")
@@ -2400,6 +2489,7 @@ def _requote_bridge_after_swap(
         "route": _route_data(route),
         "_live_route": route,
         "valuation": _candidate_valuation(candidate),
+        "_prepared_requests": prepared_requests,
     }
     if len(prepared_requests) == 1:
         result["_prepared_request"] = prepared_requests[0]
@@ -3057,6 +3147,8 @@ def _submit_live_step(
             "realized_loss_usd": loss_usd,
         }
 
+    if step.get("pending_source_conversion"):
+        raise ValueError("pending_source_conversion_cannot_execute")
     route_data = step.get("route")
     if not isinstance(route_data, dict):
         raise ValueError("requote_required:route_transaction_missing")
@@ -3232,7 +3324,9 @@ def _submit_live_step(
         )
         journal.save_checkpoint(position_id, progress_key, progress)
         retry_unsigned = (bool(entry.get("automatic_requote"))
-                          and not journal.has_asset_intent(position_id))
+                          and (not journal.has_asset_intent(position_id)
+                               or (step.get("kind") == "bridge" and
+                                   confirmed_unsigned_source_bridge(journal, position_id, entry))))
         if known_step is None and current_deadline() is not None:
             # Saved routes authorize observation only. A new signature gets
             # exact evidence, fee, current price age and deposit checks again.
@@ -3278,6 +3372,16 @@ def _submit_live_step(
                     _exact_sum((realized_before, _exact_money(candidate.loss_usd, "route loss")))
                 )
             prepared_request = refreshed["_prepared_requests"][index]
+            if entry.get("canonical_source_bootstrap") and step.get("kind") == "swap_to_native":
+                source_cap = int(entry["canonical_source_bootstrap"]["source_fee_cap_raw"])
+                if prepared_request.max_total_fee_wei > source_cap:
+                    raise StageDeadlineExceeded("canonical_source_bootstrap_fee_cap_changed")
+                prepared_request = replace(prepared_request, max_total_fee_cap_wei=source_cap)
+                refreshed["_prepared_requests"] = (prepared_request,)
+                refreshed["_prepared_request"] = prepared_request
+                route_entry["steps"] = [refreshed, entry["steps"][1]]
+                refreshed_entry = {**entry, "steps": route_entry["steps"]}
+                journal.save_checkpoint(position_id, "prepared", refreshed_entry)
             step.update(refreshed)
 
         def execute_prepared(_route):
@@ -3494,6 +3598,16 @@ def _submit_live_step(
         )
         net_output = final_native - int(initial_native)
         generated_output = net_output + paid_native_gas
+        if entry.get("canonical_source_bootstrap") and step.get("kind") == "swap_to_native":
+            result["source_receipt_proof"] = require_source_receipt(
+                entry, tx_hash=confirmed_hashes[-1][1], rpc=rpc,
+                url=_rpc_url(rpc_urls, destination.chain_id), wallet=wallet)
+            net_output = source_output(amount=int(evidence.input_amount), paid_gas=paid_native_gas,
+                initial_native=int(initial_native), current_native=final_native)
+            result["protected_native_raw"] = str(initial_native)
+            result["realized_loss_usd"] = _decimal_string(_exact_sum((realized_before,
+                _actual_gas_paid_usd(confirmed_hashes, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper))))
+            generated_output = net_output + paid_native_gas
         if step.get("kind") == "unwrap_to_native":
             net_output = min(net_output, int(evidence.input_amount) - paid_native_gas)
             generated_output = net_output + paid_native_gas
@@ -3533,6 +3647,8 @@ def _execute_entry(
     position_id: int | None = None,
     prepared_request: TransactionRequest | None = None,
 ) -> str:
+    if entry.get("pending_source_conversion"):
+        raise ValueError("pending_source_conversion_cannot_execute")
     chain_id = int(entry["chain_id"])
     url = rpc_urls[chain_id]
     step_key = str(entry.get("_journal_step_key", entry["status"]))
@@ -3547,14 +3663,21 @@ def _execute_entry(
         request = jumper.step_transaction(step)
     else:
         request = _direct_request(entry, wallet=wallet, rpc=rpc, url=url)
+    if request.fee_quote_fallback_reason == "pending_source_conversion":
+        raise ValueError("pending_source_conversion_cannot_execute")
     if request.chain_id != chain_id:
         raise ValueError("route transaction chain does not match source balance")
     if journal is not None and position_id is not None:
         signing = journal.checkpoint(position_id, f"canonical_signing:{step_key}")
-        if saved and saved["tx_hash"] and signing and entry.get("canonical_continuation"):
+        if saved and saved["tx_hash"] and signing and (entry.get("canonical_continuation")
+                or (entry.get("canonical_source_bootstrap")
+                    and step_key.startswith("swap_to_native:"))):
             signed_entry = {**signing["entry"],
                 **{key: value for key, value in entry.items() if callable(value)}}
-            withdrawal_reserve(signed_entry, signing["request"], wallet)
+            if signed_entry.get("canonical_source_bootstrap"):
+                source_withdrawal_reserve(signed_entry, signing["request"], wallet)
+            else:
+                withdrawal_reserve(signed_entry, signing["request"], wallet)
             _replay_missing_direct(entry={**signed_entry,
                 "_direct_transaction": signing["request"]}, saved=saved, wallet=wallet,
                 rpc=rpc, rpc_urls=rpc_urls, journal=journal)
@@ -3583,6 +3706,10 @@ def _execute_entry(
     )
     if generated_native_cap is not None:
         cap = _raw_amount(generated_native_cap)
+        marker = entry.get("canonical_source_bootstrap")
+        if (marker and request.chain_id == marker["chain_id"]
+                and marker.get("protected_native_raw") is not None):
+            cap = min(cap, max(0, balance - int(marker["protected_native_raw"])))
         if request.value > cap or balance < request.value:
             raise ValueError("requote_required:insufficient_generated_native_balance")
         reserve_balance = min(cap, balance) - request.value
@@ -3591,11 +3718,15 @@ def _execute_entry(
                          and request.to.lower() == CELO_TOKEN_ADDRESS
                          and request.data.startswith("0xa9059cbb") else 0)
         reserve_balance = balance - request.value - shared_amount
-    canonical_reserve = withdrawal_reserve(entry, request, wallet)
+    canonical_reserve = source_withdrawal_reserve(entry, request, wallet)
+    if canonical_reserve is None:
+        canonical_reserve = withdrawal_reserve(entry, request, wallet)
     require_native_reserve(balance=reserve_balance,
         gas_cost=(canonical_reserve if canonical_reserve is not None
                   else request.max_total_fee_wei),
         multiplier=(1 if canonical_reserve is not None else GAS_RESERVE_MULTIPLIER))
+    if canonical_reserve is not None and entry.get("canonical_source_bootstrap"):
+        entry["_check_group_loss"](_entry_loss(entry))
     asset_id = str(entry["asset_id"])
     approval_tx_hash = None
     before_sign = entry.get("_before_sign")
@@ -3650,7 +3781,8 @@ def _execute_entry(
         if entry["status"] == "direct_deposit":
             journal.save_checkpoint(position_id, "direct_prepared",
                                     {**entry, "_direct_transaction": request})
-        elif entry.get("canonical_continuation"):
+        elif (entry.get("canonical_continuation") or (entry.get("canonical_source_bootstrap")
+                and step_key.startswith("swap_to_native:"))):
             journal.save_checkpoint(position_id, f"canonical_signing:{step_key}",
                                     {"entry": entry, "request": request})
         tx_hash = broadcast_durable_transaction(

@@ -333,7 +333,8 @@ def create_live_plan(
                     )
                     if allow_partial_search:
                         _apply_relay_fallback(entries, wallet, quote_client, resolution.enabled,
-                                              limit, floor, addresses.get(wallet))
+                                              limit, floor, addresses.get(wallet),
+                                              wallet_gas_estimator)
                     continue
                 supported_groups = []
                 for key, items in wallet_groups:
@@ -354,6 +355,7 @@ def create_live_plan(
                                     item.base, relay_client, resolution.enabled,
                                     loss_limit=limit, quote_floor=floor,
                                     deposit_address=item.deposit_address,
+                                    gas_estimator=wallet_gas_estimator,
                                 )
                                 for item in items
                             )
@@ -444,7 +446,7 @@ def create_live_plan(
         if allow_partial_search:
             with deadline_scope(deadline):
                 _apply_relay_fallback(entries, wallet, quote_client, resolution.enabled,
-                                      limit, floor, addresses.get(wallet))
+                                      limit, floor, addresses.get(wallet), wallet_gas_estimator)
         timing.update(elapsed_seconds=deadline.elapsed, budget_exceeded=deadline.budget_exceeded)
 
     for entry in entries:
@@ -490,7 +492,8 @@ def create_live_plan(
     }
 
 
-def _apply_relay_fallback(entries, wallet, clients, targets, limit, floor, recipient):
+def _apply_relay_fallback(entries, wallet, clients, targets, limit, floor, recipient,
+                          gas_estimator=None):
     factory = getattr(clients, "relay_for_wallet", None)
     if factory is None:
         return
@@ -502,7 +505,7 @@ def _apply_relay_fallback(entries, wallet, clients, targets, limit, floor, recip
             continue
         alternative = quote_relay_entry(_base(entry), factory(wallet), targets, loss_limit=limit,
                                          quote_floor=floor,
-                                         deposit_address=recipient)
+                                         deposit_address=recipient, gas_estimator=gas_estimator)
         if alternative.get("status") == "route_ready" or alternative.get("reason") == (
             "insufficient_source_gas"
         ):
@@ -520,6 +523,10 @@ def _apply_relay_fallback(entries, wallet, clients, targets, limit, floor, recip
                     {key: candidate[key] for key in (
                         "target", "loss_pct", "deposit_minimum_met",
                         "gas_reserve_sufficient", "within_loss_limit",
+                        "reason", "source_balance_usd", "source_gas_raw",
+                        "source_gas_provider_estimate_raw", "source_gas_estimate_verified",
+                        "source_gas_reserve_raw", "gas_budget", "deposit_minimum_raw",
+                        "to_amount_min", "max_route_loss_pct",
                     ) if key in candidate}
                     for candidate in alternative.get("relay_candidates", [])
                 ],
