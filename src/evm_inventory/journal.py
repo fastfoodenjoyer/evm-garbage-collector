@@ -8,6 +8,8 @@ import sqlite3
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
+from .route_preparation import is_route_preparation_retry_reason
+
 _GROUP_STATES = {
     "planned",
     "active",
@@ -439,7 +441,7 @@ class Journal:
         return True
 
     def reactivate_unsigned_retry_group(self, group_id: int, position_keys: set[str]) -> bool:
-        """Retry exact unsigned members after temporary valuation/fee preparation failures."""
+        """Retry exact unsigned members after temporary valuation or preparation failures."""
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
             group = self.group(group_id)
@@ -448,11 +450,16 @@ class Journal:
                 "SELECT id,position_key,state,reason FROM route_positions WHERE group_id=?",
                 (group_id,),
             ).fetchall()
-            if (group["state"] != "manual_review_group_halted" or reason not in {
-                    "requote_required:stale_price", "native_gas_reserve_unstable"}
+            retry_reason = reason in {
+                "requote_required:stale_price", "native_gas_reserve_unstable",
+            } or is_route_preparation_retry_reason(reason)
+            if (group["state"] != "manual_review_group_halted" or not retry_reason
                     or not rows or {r["position_key"] for r in rows} != position_keys
                     or any(r["state"] not in {"manual_review", "manual_review_group_halted"}
-                           or r["reason"] != reason or self.has_asset_broadcast(r["id"])
+                           or r["reason"] != reason or self.connection.execute(
+                               "SELECT 1 FROM route_steps WHERE position_id=? "
+                               "AND step_key NOT LIKE 'approval:%' LIMIT 1", (r["id"],),
+                           ).fetchone() is not None
                            for r in rows)):
                 return False
             for row in rows:

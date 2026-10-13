@@ -62,6 +62,7 @@ from .models import AssetIdentity
 from .network_policy import uses_excluded_network
 from .planner_gas import PlannerGasEstimator
 from .quote_jobs import JobInProgress
+from .route_preparation import is_route_preparation_rejected, require_provider_retry_due
 from .rpc import quantity
 from .stages import (
     Deadline,
@@ -753,7 +754,8 @@ def execute_group_entries(
         except Exception as exc:
             if entry.get("automatic_requote") and _retryable_provider_error(exc):
                 journal.save_checkpoint(position_id, "automatic_retry", {
-                    "reason": _execution_reason(exc), "retry_at": getattr(exc, "retry_at", None)
+                    "reason": _execution_reason(exc), "retry_at": getattr(exc, "retry_at", None),
+                    "diagnostic": exception_diagnostic(exc),
                 })
                 return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
             if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
@@ -1519,6 +1521,8 @@ def _execute_live_groups(
                     position = journal.get_or_create_position(
                         position_key=_position_key(entry), wallet=entry["wallet"]
                     )
+                    if entry.get("automatic_requote"):
+                        require_provider_retry_due(journal, position["id"], now_seconds=time.time())
                     approval_hashes = []
                     if entry.get("automatic_requote") and not journal.has_asset_broadcast(
                         position["id"]
@@ -1808,6 +1812,14 @@ def _preflight_live_entry(
         fresh["quoted_at"] = now_ms()
         if len(fresh_steps) == 1:
             fresh["route"] = fresh_steps[0]["route"]
+        source_native = native_asset_identity(int(entry["chain_id"]))
+        source_fees = [fee for fee in candidate.gas_estimates
+                       if fee.price and fee.price.asset == source_native]
+        if source_fees:
+            fresh["reservations"] = {
+                **entry.get("reservations", {}),
+                "source_native_gas_cap_raw": str(sum(fee.raw_amount for fee in source_fees)),
+            }
     fresh["_candidate"] = candidate
     fresh["_step_candidates"] = step_candidates
     fresh["valuation"] = _candidate_valuation(candidate)
@@ -1875,7 +1887,15 @@ def _refresh_route_step(
     )
     native_available = None
     prepared_cap = 0
+    stale_native_quote = False
     if allow_replacement and source.is_native:
+        quote_time = datetime.fromisoformat(planned.evidence.quote_timestamp.replace("Z", "+00:00"))
+        quoted_at = entry.get("quoted_at")
+        if isinstance(quoted_at, int) and not isinstance(quoted_at, bool):
+            quote_time = min(quote_time, datetime.fromtimestamp(quoted_at / 1000, UTC))
+        stale_native_quote = (now_fn() if now_fn is not None else now) - quote_time > timedelta(
+            minutes=15,
+        )
         native_available = _asset_balance(
             gas_estimator.rpc, url=_rpc_url(gas_estimator.rpc_urls, source.chain_id),
             asset=source, wallet=wallet.public_address,
@@ -1883,6 +1903,8 @@ def _refresh_route_step(
         hint = sum(cost.amount for cost in planned.gas_costs if cost.token == source)
         saved_cap = entry.get("reservations", {}).get("source_native_gas_cap_raw")
         prepared_cap = _raw_amount(saved_cap) if saved_cap is not None else 0
+        if stale_native_quote:
+            prepared_cap = 0
         if _spend_amount is not None:
             amount = _spend_amount
         else:
@@ -1953,6 +1975,18 @@ def _refresh_route_step(
         available = amount
     if available < amount:
         raise ValueError("requote_required:insufficient_spendable_balance")
+    if native_available is not None and stale_native_quote and _spend_amount is None:
+        hint = sum(cost.amount for cost in live.gas_costs if cost.token == source)
+        hinted_spendable = native_available - hint * GAS_RESERVE_MULTIPLIER * 2
+        probe = hinted_spendable if hinted_spendable > 0 else max(1, native_available // 2)
+        if probe < amount:
+            # This one unsigned probe leaves both RPC-priced retries available. Every
+            # subsequent explicit spend amount comes from this probe or actual fee caps.
+            return _refresh_route_step(
+                entry, {k: v for k, v in step.items() if k != "_live_route"}, wallet=wallet,
+                jumper=jumper, gas_estimator=gas_estimator, now=now, bitget=bitget,
+                now_fn=now_fn, _spend_amount=probe, _reserve_attempt=_reserve_attempt,
+            )
     prepared_requests = tuple(jumper.step_transaction(raw_step) for raw_step in live.raw_steps)
     extra_gas = gas_estimator.estimate_prepared_route(
         route=live,
@@ -3616,6 +3650,8 @@ def _raw_amount(value: object) -> int:
 
 
 def _execution_reason(exc: Exception) -> str:
+    if is_route_preparation_rejected(exc):
+        return "route_preparation_rejected"
     message = str(exc).strip()
     if message and len(message) <= 200:
         return message
@@ -3623,6 +3659,8 @@ def _execution_reason(exc: Exception) -> str:
 
 
 def _retryable_provider_error(error):
+    if is_route_preparation_rejected(error):
+        return True
     if isinstance(error, (LifiRequestLimit, JobInProgress)):
         return True
     if isinstance(error, ValueError) and str(error) in {

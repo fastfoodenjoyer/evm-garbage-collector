@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import traceback
@@ -13,13 +14,13 @@ _URL = re.compile(r"(?i)(?:https?|socks5h?)://[^\s<>\"']+")
 _PRIVATE_HEX = re.compile(r"(?i)(?<![0-9a-f])(?:0x)?[0-9a-f]{64}(?![0-9a-f])")
 _BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _ASSIGNMENT = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|password|secret|private[_-]?key)"
+    r"(?i)\b(api[_-]?key|access[_-]?token|password|passphrase|secret|private[_-]?key)"
     r"\s*[:=]\s*[^\s,;]+"
 )
 _SECRET_FIELD = re.compile(
-    r"(?i)(authorization|cookie|password|secret|private.?key|api.?key|token|proxy)"
+    r"(?i)(authorization|cookie|password|passphrase|secret|private.?key|api.?key|token|proxy)"
 )
-_SECRET_ENV = re.compile(r"(?i)(API_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|PROXY)")
+_SECRET_ENV = re.compile(r"(?i)(API_KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|PRIVATE_KEY|PROXY)")
 
 
 def redact_text(value: str) -> str:
@@ -78,7 +79,10 @@ def exception_diagnostic(exc: BaseException) -> dict[str, Any]:
         if isinstance(current, httpx.HTTPStatusError):
             item["http_status"] = current.response.status_code
             item["http_response_headers"] = redact_data(dict(current.response.headers))
-            item["http_response_body"] = redact_text(current.response.text)
+            try:
+                item["http_response_body"] = json.dumps(redact_data(current.response.json()))
+            except ValueError:
+                item["http_response_body"] = redact_text(current.response.text)
         exceptions.append(item)
         current = current.__cause__ or (
             None if current.__suppress_context__ else current.__context__

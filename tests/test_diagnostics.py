@@ -2,6 +2,33 @@ from evm_inventory.diagnostics import exception_diagnostic
 from evm_inventory.rpc import RpcError
 
 
+def test_http_json_diagnostic_masks_quoted_nested_secret_fields():
+    import json
+
+    import httpx
+
+    request = httpx.Request("POST", "https://li.quest/v1/advanced/stepTransaction")
+    response = httpx.Response(422, request=request, json={
+        "code": "ROUTE_REJECTED", "message": "could not prepare",
+        "secret": "plain-secret", "nested": {"apiKey": "plain-key",
+        "passphrase": "plain-passphrase", "privateKey": "plain-private-key"},
+    })
+    error = httpx.HTTPStatusError("rejected", request=request, response=response)
+    diagnostic = exception_diagnostic(error)
+    body = json.loads(diagnostic["exceptions"][0]["http_response_body"])
+    assert body["code"] == "ROUTE_REJECTED"
+    assert body["message"] == "could not prepare"
+    assert body["secret"] == "[REDACTED_SECRET]"
+    assert all(value == "[REDACTED_SECRET]" for value in body["nested"].values())
+
+
+def test_passphrase_environment_value_is_masked_in_plain_diagnostics(monkeypatch):
+    from evm_inventory.diagnostics import redact_text
+
+    monkeypatch.setenv("BITGET_PASSPHRASE", "plain-private-passphrase")
+    assert "plain-private-passphrase" not in redact_text("failed: plain-private-passphrase")
+
+
 def test_provider_diagnostic_preserves_cause_and_masks_credentials():
     proxy = "socks5://alice:password@proxy.example:1080"
     private_key = "0x" + "a" * 64
