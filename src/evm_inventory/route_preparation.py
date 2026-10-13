@@ -26,6 +26,12 @@ def is_route_preparation_retry_reason(reason: str | None) -> bool:
     return reason in {"route_preparation_rejected", _LEGACY_PREPARATION_REJECTION}
 
 
+def is_fee_cap_changed(error: Exception) -> bool:
+    """Reprice an unsigned request instead of raising its immutable monetary cap."""
+    return isinstance(error, ValueError) and str(error).startswith(
+        "estimated DeFi transaction exceeds gas cap:")
+
+
 def require_provider_retry_due(journal, position_id: int, *, now_seconds: float) -> None:
     """A known provider window must not trigger fresh unsigned quote requests."""
     if journal.connection.execute(

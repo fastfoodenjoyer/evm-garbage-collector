@@ -391,6 +391,29 @@ def test_group_keeps_native_gas_hold_before_any_preparation_or_signature(tmp_pat
         assert not journal.has_broadcast(position["id"])
 
 
+def test_failed_token_source_hold_returns_without_empty_runtime_loop(tmp_path):
+    from evm_inventory.collection import drive_execution
+
+    native = {**entry(81457), "status": "route_ready", "routing_provider": "relay"}
+    token = {**entry(81457), "status": "route_ready", "asset_id": "0xabc",
+             "group": {**entry(81457)["group"], "key": "token-group"}}
+    path = tmp_path / "inventory.sqlite"
+    with Journal(path) as journal:
+        p = journal.get_or_create_position(position_key=_position_key(token),
+                                           wallet=token["wallet"])
+        journal.record_position_state(p["id"], "manual_review", reason="route_simulation_failed")
+    clock, sleeps = [1000.0], []
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+    result = drive_execution({"entries": [native, token]}, path,
+        execute_round=lambda _: pytest.fail("held native cannot send"), until=1010,
+        clock=lambda: clock[0], sleep=sleep)
+    assert result["rounds"] == 1
+    assert result["reason"] == "source_gas_for_unsettled_tokens"
+    assert not sleeps
+
+
 @pytest.mark.parametrize("conflict", (False, True))
 def test_celo_retry_selects_native_alias_and_retains_conflicting_views(tmp_path, conflict):
     import csv

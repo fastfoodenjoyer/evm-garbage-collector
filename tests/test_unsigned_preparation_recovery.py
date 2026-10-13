@@ -135,7 +135,7 @@ def test_preparation_recovery_requires_exact_unsigned_members_and_preserves_appr
 
 
 @pytest.mark.parametrize("reason", [
-    "execution_error:HTTPStatusError", "insufficient_source_gas",
+    "execution_error:HTTPStatusError", "execution_error:ValueError", "insufficient_source_gas",
     LEGACY_REASON.replace("li.quest", "wrong.example"),
     LEGACY_REASON.replace("stepTransaction", "routes"),
     LEGACY_REASON.replace("422 Unprocessable Entity", "403 Forbidden"),
@@ -364,3 +364,154 @@ def test_live_preflight_waits_before_provider_and_rpc_calls(tmp_path, monkeypatc
         rpc_urls={10: "rpc"}, journal_path=path, max_route_loss_pct=Decimal("15"),
         now_ms=lambda: 0, delay_min_seconds=0, delay_max_seconds=0, sleep=lambda _: None, rng=None)
     assert len(calls) == (0 if automatic and now_seconds < 2000 else 1)
+
+
+@pytest.mark.parametrize("phase", ["preflight", "submit"])
+def test_unsigned_fee_cap_change_yields_with_full_diagnostic(tmp_path, phase):
+    reason = "estimated DeFi transaction exceeds gas cap:" + "fee_fields=" + "1" * 240
+    entry = {**_entry(ASSET_A, status="route_ready"), "automatic_requote": True}
+    def changed(*_):
+        raise ValueError(reason)
+    def prepared(e):
+        return {**e, "valuation": {"loss_usd": "1"}, "steps": [{"kind": "bridge"}]}
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        result = execute_group_entries([entry], journal=journal,
+            max_route_loss_pct=Decimal("15"),
+            preflight=changed if phase == "preflight" else prepared,
+            submit_step=changed if phase == "submit" else
+            lambda *_: pytest.fail("must not sign after a changed fee cap"))
+        assert result["deferred"] == 1 and result["manual_review"] == 0
+        p = journal.connection.execute("SELECT id FROM route_positions").fetchone()
+        retry = journal.checkpoint(p["id"], "automatic_retry")
+        assert retry["reason"] == "requote_required:fee_cap_changed"
+        assert "estimated DeFi transaction exceeds gas cap:" in str(retry["diagnostic"])
+
+
+def test_permanent_preflight_failure_keeps_full_sanitized_diagnostic(tmp_path):
+    entry = {**_entry(ASSET_A, status="route_ready"), "automatic_requote": True}
+    def invalid(_):
+        raise ValueError("invalid candidate details:" + "a" * 210)
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        result = execute_group_entries([entry], journal=journal,
+            max_route_loss_pct=Decimal("15"), preflight=invalid,
+            submit_step=lambda *_: pytest.fail("must not sign invalid data"))
+        assert result["manual_review"] == 1
+        p = journal.connection.execute("SELECT id FROM route_positions").fetchone()
+        failure = journal.checkpoint(p["id"], "execution_failure")
+        assert failure["phase"] == "preflight"
+        assert "invalid candidate details:" in str(failure["diagnostic"])
+
+
+def test_live_preflight_persists_underlying_simulation_diagnostics(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    import evm_inventory.route_execution as module
+
+    e = {**_entry(ASSET_A, status="route_ready"), "automatic_requote": True}
+    path = tmp_path / "inventory.sqlite"
+    estimator = SimpleNamespace(diagnostics=[{"detail": "older route"}])
+    monkeypatch.setattr(module, "PlannerGasEstimator", lambda *_, **kw: estimator)
+    monkeypatch.setattr(module, "Transport", lambda **_: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(module, "ExecutionRpc", lambda _: object())
+    monkeypatch.setattr(module, "WalletLifiClients", lambda *_, **kw: SimpleNamespace(
+        for_wallet=lambda _: object(), close=lambda: None))
+    monkeypatch.setattr(module, "_bitget_client", lambda: object())
+    monkeypatch.setattr(module, "_DepositBackground", lambda **_: nullcontext(
+        SimpleNamespace(raise_if_failed=lambda: None, finish=lambda: 0)))
+
+    def invalid(*_, **kw):
+        kw["gas_estimator"].diagnostics.append({
+            "phase": "simulate", "detail": "execution reverted", "secret": "secretvalue"})
+        raise ValueError("requote_required:missing_gas_estimate")
+
+    monkeypatch.setattr(module, "_preflight_live_entry", invalid)
+    module._execute_live_groups([e], wallets={WALLET: SimpleNamespace(public_address=WALLET)},
+        rpc_urls={10: "rpc"}, journal_path=path, max_route_loss_pct=Decimal("15"),
+        now_ms=lambda: 0, delay_min_seconds=0, delay_max_seconds=0, sleep=lambda _: None, rng=None)
+    with Journal(path, readonly=True) as journal:
+        p = journal.connection.execute("SELECT id FROM route_positions").fetchone()
+        evidence = journal.checkpoint(p["id"], "preflight_gas_diagnostics")
+        assert evidence == [{"phase": "simulate", "detail": "execution reverted",
+                             "secret": "[REDACTED_SECRET]"}]
+
+
+@pytest.mark.parametrize("case", ["fee_changed", "unchanged", "other_error", "intent",
+                                 "wrong_chain", "token", "partial_group"])
+def test_legacy_fee_cap_recovery_requires_specific_rpc_proof_and_no_intent(
+    tmp_path, monkeypatch, case,
+):
+    import evm_inventory.unsigned_recovery as module
+
+    e = {**_entry("native", status="route_ready"), "automatic_requote": True}
+    calls = []
+    monkeypatch.setattr(module, "Transport", lambda **_: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(module, "ExecutionRpc", lambda _: SimpleNamespace(
+        call=lambda *_: "0xb" if case == "wrong_chain" else "0xa"))
+
+    def reprice(*_, **kw):
+        calls.append(kw)
+        if case == "other_error":
+            raise ValueError("invalid gas estimate")
+        if case != "unchanged":
+            raise ValueError("estimated DeFi transaction exceeds gas cap:cap=21000;fee=22000")
+
+    monkeypatch.setattr(module, "FeePlanner", lambda _: SimpleNamespace(plan=reprice))
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        reason = "execution_error:ValueError"
+        group = journal.get_or_create_group(group_key=e["group"]["key"], wallet=WALLET,
+            source_chain_id=10, source_usd="100", loss_budget_pct="15")
+        p = journal.get_or_create_position(position_key=_position_key(e), wallet=WALLET,
+            group_id=group["id"], source_asset_id="native", source_amount_raw=e["raw_balance"])
+        journal.record_position_state(p["id"], "manual_review", reason=reason)
+        journal.record_group_state(group["id"], "manual_review_group_halted", reason=reason)
+        journal.save_checkpoint(p["id"], "prepared", {**e, "steps": [{
+            "_prepared_request": TransactionRequest(10, DEPOSIT, "0x", 1, 21000, 1,
+                max_total_fee_cap_wei=21000)}]})
+        if case == "intent":
+            journal.record_step_intent(position_id=p["id"], step_key="bridge:0", nonce=1,
+                calldata_digest="a" * 64, signed_payload_digest="b" * 64, tx_hash=None)
+        if case == "token":
+            e = {**e, "asset_id": ASSET_A}
+        if case == "partial_group":
+            journal.get_or_create_position(position_key="sibling", wallet=WALLET,
+                                          group_id=group["id"])
+        module.diagnose_legacy_fee_cap(journal, group["id"], [e], {10: "rpc"})
+        recovered = journal.reactivate_unsigned_retry_group(group["id"], {_position_key(e)})
+        assert recovered is (case == "fee_changed")
+        assert len(calls) == (1 if case in {"fee_changed", "unchanged", "other_error"} else 0)
+        assert journal.group(group["id"])["source_usd"] == "100"
+        assert journal.group(group["id"])["loss_budget_pct"] == "15"
+
+
+def test_refresh_carries_underlying_simulation_diagnostic_to_submit_caller():
+    entry, step, _, kwargs, _, _ = _native_case(age_ms=0)
+    estimator = kwargs["gas_estimator"]
+    estimator.diagnostics = [{"phase": "estimate", "detail": "actual RPC revert"}]
+    estimator.estimate_prepared_route = lambda **_: None
+    with pytest.raises(ValueError, match="missing_gas_estimate") as failure:
+        _refresh_route_step(entry, step, now=NOW, **kwargs)
+    assert failure.value.diagnostic["gas_failures"][0]["detail"] == "actual RPC revert"
+
+
+@pytest.mark.parametrize("error_type", ["settlement", "deposit", "loss", "gas"])
+def test_typed_submit_failures_keep_diagnostics(tmp_path, error_type):
+    from evm_inventory.executor import EthereumGasDeferred
+    from evm_inventory.route_execution import (
+        DepositNotSeen,
+        DepositSettlementFailed,
+        GroupLossLimitExceeded,
+    )
+
+    types = {"settlement": DepositSettlementFailed, "deposit": DepositNotSeen,
+             "loss": GroupLossLimitExceeded, "gas": EthereumGasDeferred}
+    error = types[error_type]("diagnostic details:" + "a" * 210)
+    entry = {**_entry(ASSET_A, status="route_ready"), "automatic_requote": True}
+    def submit(*_):
+        raise error
+    with Journal(tmp_path / "inventory.sqlite") as journal:
+        execute_group_entries([entry], journal=journal, max_route_loss_pct=Decimal("15"),
+            preflight=lambda e: {**e, "steps": [{"kind": "bridge"}]}, submit_step=submit)
+        p = journal.connection.execute("SELECT id FROM route_positions").fetchone()
+        failure = journal.checkpoint(p["id"], "execution_failure")
+        assert failure["phase"] == "submit"
+        assert "diagnostic details:" in str(failure["diagnostic"])

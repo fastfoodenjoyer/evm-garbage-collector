@@ -452,7 +452,12 @@ class Journal:
             ).fetchall()
             retry_reason = reason in {
                 "requote_required:stale_price", "native_gas_reserve_unstable",
+                "requote_required:fee_cap_changed",
             } or is_route_preparation_retry_reason(reason)
+            if reason == "execution_error:ValueError" and len(rows) == 1:
+                proof = self.checkpoint(rows[0]["id"], "execution_failure") or {}
+                retry_reason = (proof.get("phase") == "legacy_fee_cap_revalidation"
+                                and proof.get("reason") == "requote_required:fee_cap_changed")
             if (group["state"] != "manual_review_group_halted" or not retry_reason
                     or not rows or {r["position_key"] for r in rows} != position_keys
                     or any(r["state"] not in {"manual_review", "manual_review_group_halted"}

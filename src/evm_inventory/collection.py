@@ -25,6 +25,7 @@ from .scanner import scan
 from .stages import Deadline, StageDeadlineExceeded, deadline_scope
 from .store import Store
 from .transport import Transport
+from .unsigned_recovery import diagnose_legacy_fee_cap
 from .wallet_lifi import WalletLifiClients
 
 _READY = {"direct_deposit", "route_ready"}
@@ -294,7 +295,7 @@ def execution_positions(entries, db_path):
     return result
 
 
-def _resume_unsigned_retry_groups(entries, db_path):
+def _resume_unsigned_retry_groups(entries, db_path, *, rpc_urls=None):
     groups = {}
     for entry in entries:
         if entry.get("status") in _READY and entry.get("group"):
@@ -307,6 +308,8 @@ def _resume_unsigned_retry_groups(entries, db_path):
                 "SELECT id FROM route_groups WHERE group_key=?", (key,),
             ).fetchone()
             if group:
+                if rpc_urls is not None:
+                    diagnose_legacy_fee_cap(journal, group["id"], members, rpc_urls)
                 journal.reactivate_unsigned_retry_group(group["id"],
                                                        {_position_key(e) for e in members})
                 journal.reactivate_unsigned_weth_continuation(group["id"],
@@ -506,7 +509,9 @@ def drive_execution(
             and _position_key(e) not in observed_keys
             and bool(destination_gas.get(_asset_key(e)[:2], set()) - {_position_key(e)}))}
             for e in active]
-        held_only = any(e.get("_destination_gas_held") for e in active) and all(
+        source_held = any(e.get("_source_gas_held") for e in active)
+        destination_held = any(e.get("_destination_gas_held") for e in active)
+        held_only = (source_held or destination_held) and all(
             e.get("_source_gas_held") or e.get("_destination_gas_held")
             for e in active if _position_key(e) in pending
         )
@@ -552,7 +557,9 @@ def drive_execution(
                 member["position_key"] in held_cycle_keys for member in cycle["members"])]
             return {
                 "status": "incomplete", "reason": (
-                    "native_gas_dependency_cycle" if blocked_cycles else "planning_incomplete"),
+                    "native_gas_dependency_cycle" if blocked_cycles else
+                    "planning_incomplete" if destination_held else
+                    "source_gas_for_unsettled_tokens"),
                 "completed": completed, "rounds": rounds,
                 "positions": execution_positions(plan["entries"], db_path),
                 "last_round": last_result,
@@ -797,7 +804,7 @@ def collect_wallets(
                     seconds=max(0.1, planning_until - clock()),
                 )
             if execute:
-                _resume_unsigned_retry_groups(plan["entries"], db_path)
+                _resume_unsigned_retry_groups(plan["entries"], db_path, rpc_urls=rpc_urls)
             locked_chains = set()
             frozen_keys = set()
             if not previous:

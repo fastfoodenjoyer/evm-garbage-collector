@@ -26,7 +26,7 @@ from .consolidation import (
     candidate_from_values,
     combine_candidates,
 )
-from .diagnostics import exception_diagnostic
+from .diagnostics import exception_diagnostic, redact_data
 from .executor import (
     GAS_RESERVE_MULTIPLIER,
     AmbiguousBroadcast,
@@ -62,7 +62,11 @@ from .models import AssetIdentity
 from .network_policy import uses_excluded_network
 from .planner_gas import PlannerGasEstimator
 from .quote_jobs import JobInProgress
-from .route_preparation import is_route_preparation_rejected, require_provider_retry_due
+from .route_preparation import (
+    is_fee_cap_changed,
+    is_route_preparation_rejected,
+    require_provider_retry_due,
+)
 from .rpc import quantity
 from .stages import (
     Deadline,
@@ -282,10 +286,14 @@ def _candidate_valuation(candidate) -> dict:
     return _valuation_data(candidate)
 
 
-def _require_valid_candidate(candidate) -> None:
+def _require_valid_candidate(candidate, *, gas_estimator=None) -> None:
     if not candidate.is_valid:
         reason = candidate.reason or "invalid_candidate"
-        raise ValueError(f"requote_required:{reason}")
+        error = ValueError(f"requote_required:{reason}")
+        if gas_estimator is not None and reason == "missing_gas_estimate":
+            error.diagnostic = {"gas_failures": redact_data(
+                getattr(gas_estimator, "diagnostics", []))}
+        raise error
 
 
 def _require_live_target(
@@ -640,6 +648,18 @@ def execute_group_entries(
         journal.record_group_state(group["id"], "active", reason=str(exc))
         return counts
 
+    def remember_error(position_id: int, phase: str, exc: Exception) -> None:
+        diagnostic = exception_diagnostic(exc)
+        reason = _execution_reason(exc)
+        journal.save_checkpoint(position_id, "execution_failure", {
+            "phase": phase, "reason": reason, "diagnostic": diagnostic,
+        })
+        if _retryable_provider_error(exc):
+            journal.save_checkpoint(position_id, "automatic_retry", {
+                "reason": reason, "retry_at": getattr(exc, "retry_at", None),
+                "diagnostic": diagnostic,
+            })
+
     for index, entry in enumerate(entries):
         if current_deadline() is not None and current_deadline().expired:
             return yield_stage(
@@ -714,6 +734,7 @@ def execute_group_entries(
                     counts["completed"] += 1
                     continue
                 except (DepositNotSeen, DepositSettlementFailed, GroupLossLimitExceeded) as exc:
+                    remember_error(position_id, "deposit_observation", exc)
                     reason = _execution_reason(exc)
                     journal.record_position_state(position_id, "manual_review", reason=reason)
                     counts["manual_review"] += 1
@@ -722,6 +743,7 @@ def execute_group_entries(
                 except StageDeadlineExceeded as exc:
                     return yield_stage(position_id, exc)
                 except Exception as exc:
+                    remember_error(position_id, "deposit_observation", exc)
                     if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
                         return yield_stage(
                             position_id, StageDeadlineExceeded(f"broadcast_pending:{exc.tx_hash}")
@@ -745,6 +767,7 @@ def execute_group_entries(
             current_loss = _entry_loss(fresh)
             future_loss = _exact_sum(_entry_loss(item) for item in entries[index + 1 :])
         except EthereumGasDeferred as exc:
+            remember_error(position_id, "preflight", exc)
             journal.record_position_state(position_id, "gas_deferred", reason=exc.reason)
             journal.record_group_state(group["id"], "gas_deferred", reason=exc.reason)
             counts["gas_deferred"] += 1
@@ -752,11 +775,8 @@ def execute_group_entries(
         except StageDeadlineExceeded as exc:
             return yield_stage(position_id, exc)
         except Exception as exc:
+            remember_error(position_id, "preflight", exc)
             if entry.get("automatic_requote") and _retryable_provider_error(exc):
-                journal.save_checkpoint(position_id, "automatic_retry", {
-                    "reason": _execution_reason(exc), "retry_at": getattr(exc, "retry_at", None),
-                    "diagnostic": exception_diagnostic(exc),
-                })
                 return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
             if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
                 return yield_stage(
@@ -842,6 +862,7 @@ def execute_group_entries(
             except StageDeadlineExceeded as exc:
                 return yield_stage(position_id, exc)
             except Exception as exc:
+                remember_error(position_id, "source_swap", exc)
                 if entry.get("automatic_requote") and _retryable_provider_error(exc):
                     return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
                 if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
@@ -935,6 +956,7 @@ def execute_group_entries(
                     group["id"], realized_loss_usd=_decimal_string(realized)
                 )
             except GroupLossLimitExceeded as exc:
+                remember_error(position_id, "dependent_bridge", exc)
                 reason = _execution_reason(exc)
                 halt_remaining(
                     index,
@@ -945,6 +967,7 @@ def execute_group_entries(
             except StageDeadlineExceeded as exc:
                 return yield_stage(position_id, exc)
             except Exception as exc:
+                remember_error(position_id, "dependent_bridge", exc)
                 if entry.get("automatic_requote") and _retryable_provider_error(exc):
                     return yield_stage(position_id, StageDeadlineExceeded(_execution_reason(exc)))
                 if isinstance(exc, AmbiguousBroadcast) and current_deadline() is not None:
@@ -1015,6 +1038,7 @@ def execute_group_entries(
                             group["id"], realized_loss_usd=_decimal_string(realized)
                         )
                 except GroupLossLimitExceeded as exc:
+                    remember_error(position_id, "submit", exc)
                     reason = _execution_reason(exc)
                     halt_remaining(
                         index,
@@ -1023,6 +1047,7 @@ def execute_group_entries(
                     )
                     return counts
                 except EthereumGasDeferred as exc:
+                    remember_error(position_id, "submit", exc)
                     if step.get("kind") != "direct_deposit":
                         reason = _execution_reason(exc)
                         journal.record_position_state(position_id, "manual_review", reason=reason)
@@ -1038,6 +1063,7 @@ def execute_group_entries(
                     counts["gas_deferred"] += 1
                     return counts
                 except (DepositNotSeen, DepositSettlementFailed) as exc:
+                    remember_error(position_id, "submit", exc)
                     reason = _execution_reason(exc)
                     journal.record_position_state(position_id, "manual_review", reason=reason)
                     counts["manual_review"] += 1
@@ -1046,6 +1072,7 @@ def execute_group_entries(
                 except StageDeadlineExceeded as exc:
                     return yield_stage(position_id, exc)
                 except Exception as exc:
+                    remember_error(position_id, "submit", exc)
                     if entry.get("automatic_requote") and _retryable_provider_error(exc):
                         return yield_stage(
                             position_id, StageDeadlineExceeded(_execution_reason(exc))
@@ -1535,16 +1562,23 @@ def _execute_live_groups(
                             wait_for_receipt(rpc, url=_rpc_url(rpc_urls, entry["chain_id"]),
                                              tx_hash=approval[0])
                             approval_hashes.append((entry["chain_id"], approval[0]))
-                    fresh = _preflight_live_entry(
-                        entry,
-                        wallet=wallet,
-                        rpc=rpc,
-                        rpc_urls=rpc_urls,
-                        jumper=jumper,
-                        bitget=bitget,
-                        gas_estimator=gas_estimator,
-                        now_ms=now_ms,
-                    )
+                    diagnostic_start = len(getattr(gas_estimator, "diagnostics", []))
+                    try:
+                        fresh = _preflight_live_entry(
+                            entry,
+                            wallet=wallet,
+                            rpc=rpc,
+                            rpc_urls=rpc_urls,
+                            jumper=jumper,
+                            bitget=bitget,
+                            gas_estimator=gas_estimator,
+                            now_ms=now_ms,
+                        )
+                    except Exception:
+                        failures = getattr(gas_estimator, "diagnostics", [])[diagnostic_start:]
+                        journal.save_checkpoint(position["id"], "preflight_gas_diagnostics",
+                                                redact_data(failures))
+                        raise
                     if approval_hashes:
                         expense = _actual_gas_paid_usd(
                             approval_hashes, rpc=rpc, rpc_urls=rpc_urls, jumper=jumper,
@@ -1793,7 +1827,7 @@ def _preflight_live_entry(
             now=datetime.fromtimestamp(now_ms() / 1000, UTC),
             max_price_age=_MAX_PRICE_AGE,
         )
-        _require_valid_candidate(direct_candidate)
+        _require_valid_candidate(direct_candidate, gas_estimator=gas_estimator)
         candidate = combine_candidates(candidate, direct_candidate)
         gas_cap = sum(fee.raw_amount for fee in candidates[0].gas_estimates)
         direct_cap = sum(fee.raw_amount for fee in direct_gas)
@@ -1806,7 +1840,7 @@ def _preflight_live_entry(
             **entry.get("reservations", {}),
             "final_deposit_native_gas_cap_raw": str(direct_cap),
         }}
-    _require_valid_candidate(candidate)
+    _require_valid_candidate(candidate, gas_estimator=gas_estimator)
     fresh = {**entry, "steps": fresh_steps}
     if entry.get("automatic_requote"):
         fresh["quoted_at"] = now_ms()
@@ -2026,7 +2060,7 @@ def _refresh_route_step(
         wallet_paid_gas=extra_gas or (),
         replace_route_gas=bool(extra_gas),
     )
-    _require_valid_candidate(candidate)
+    _require_valid_candidate(candidate, gas_estimator=gas_estimator)
     if step.get("kind") not in {"swap_to_native", "unwrap_to_native"}:
         try:
             _require_target_minimum(entry, bitget, wallet, candidate)
@@ -2167,7 +2201,7 @@ def _requote_from_intermediate(
                 wallet_paid_gas=extra_gas or (),
                 replace_route_gas=bool(extra_gas),
             )
-            _require_valid_candidate(candidate)
+            _require_valid_candidate(candidate, gas_estimator=gas_estimator)
             _require_target_minimum(dynamic, bitget, wallet, candidate)
         except (ValueError, LifiError) as exc:
             stale_price |= str(exc) == "requote_required:stale_price"
@@ -3652,6 +3686,8 @@ def _raw_amount(value: object) -> int:
 def _execution_reason(exc: Exception) -> str:
     if is_route_preparation_rejected(exc):
         return "route_preparation_rejected"
+    if is_fee_cap_changed(exc):
+        return "requote_required:fee_cap_changed"
     message = str(exc).strip()
     if message and len(message) <= 200:
         return message
@@ -3659,7 +3695,7 @@ def _execution_reason(exc: Exception) -> str:
 
 
 def _retryable_provider_error(error):
-    if is_route_preparation_rejected(error):
+    if is_route_preparation_rejected(error) or is_fee_cap_changed(error):
         return True
     if isinstance(error, (LifiRequestLimit, JobInProgress)):
         return True
