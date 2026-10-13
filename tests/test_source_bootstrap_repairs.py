@@ -161,6 +161,59 @@ def test_forecast_cache_checks_endpoint_timestamp_even_with_young_quote(monkeypa
     assert len(calls) == 2
 
 
+def test_young_forecast_reprices_fresh_gas_and_leaves_withdrawal_unsigned(tmp_path, monkeypatch):
+    import evm_inventory.route_execution as execution
+    from evm_inventory.valuation import FeeQuote
+
+    e, _, _, preflight = preflight_fixture(monkeypatch)
+    first = preflight(e)
+    previous = first["steps"][1]["valuation"].copy()
+    price = PlannerGasEstimator._price_planned
+
+    def expensive_fee(self, request):
+        fee = price(self, request)
+        return FeeQuote(fee.raw_amount, replace(fee.price, usd_per_token="80000000000000"))
+
+    monkeypatch.setattr(PlannerGasEstimator, "_price_planned", expensive_fee)
+    attempts = []
+
+    def no_affordable_route(*a, **kw):
+        attempts.append(kw["remaining_loss_usd"])
+        raise ValueError("requote_required:no_eligible_route_after_swap")
+
+    monkeypatch.setattr(execution, "_requote_bridge_after_swap", no_affordable_route)
+    with Journal(tmp_path / "fake.sqlite") as journal:
+        result = execution.execute_group_entries([first], journal=journal,
+            max_route_loss_pct=Decimal("15"), preflight=preflight,
+            submit_step=lambda *a: pytest.fail("withdrawal must remain unsigned"),
+            requote_after_swap=lambda *a: pytest.fail("source conversion did not occur"))
+        assert result["manual_review"] == 1
+        assert list(journal.connection.execute("SELECT * FROM route_steps")) == []
+    assert len(attempts) == 1
+    assert first["steps"][1]["valuation"] == previous
+
+
+@pytest.mark.parametrize("live_minimum,expected", [(2, 2), (0, 1)])
+def test_automatic_target_minimum_keeps_stricter_live_or_original_floor(live_minimum, expected):
+    from evm_inventory.route_execution import _require_live_target
+
+    e, _, wallet = bootstrap_entry()
+    original = e["target"].copy()
+    live = BitgetDepositTarget("USDC", 8453, original["asset_id"], live_minimum, "BASE", 6)
+    target = _require_live_target(e, wallet=wallet,
+        bitget=SimpleNamespace(revalidate_deposit_target=lambda *a, **kw: live))
+    assert target.minimum_raw == expected
+    assert e["target"] == original
+
+
+def test_changed_live_minimum_blocks_forecast_before_source_signature(monkeypatch):
+    e, _, _, preflight = preflight_fixture(monkeypatch)
+    e["target"]["minimum_raw"] = "1000000"
+    e["canonical_source_bootstrap"]["target"]["minimum_raw"] = "1000000"
+    with pytest.raises(ValueError, match="below_target_minimum"):
+        preflight(e)
+
+
 def confirmed_source(journal):
     e, request, wallet = bootstrap_entry()
     e["canonical_source_bootstrap"].update(paid_loss_usd="0", accounted_loss_usd="0")
@@ -328,6 +381,86 @@ def test_structured_actual_simulation_after_source_gets_240_second_retry_not_man
                 )
         assert failure.value.retry_at >= now.timestamp() + 240
         assert len(journal.connection.execute("SELECT * FROM route_steps").fetchall()) == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["initial", "adjusted"])
+def test_first_actual_bridge_requote_defers_structured_reverts_after_source(
+    tmp_path, monkeypatch, failure_stage,
+):
+    import evm_inventory.route_execution as execution
+
+    path = tmp_path / "fake.sqlite"
+    with Journal(path) as journal:
+        e, _, wallet, pid = confirmed_source(journal)
+    now = datetime.now(UTC)
+    clock = [now.timestamp()]
+    quotes = []
+    estimates = []
+
+    class Rpc:
+        def call(self, url, method, params):
+            if method == "eth_getBalance":
+                return hex(AMOUNT + 1500)
+            if method == "eth_estimateGas":
+                estimates.append(params)
+                if failure_stage == "initial" or len(estimates) > 1:
+                    raise RpcError("rpc_error", diagnostic=dict(method=method,
+                        provider_error={"code": -32000, "message": "execution reverted"}))
+                return "0x10"
+            raise AssertionError(method)
+
+    def routes(request):
+        quotes.append(request)
+        raw = json.loads(_quoted_route(request, output_amount=260000,
+            route_id=f"actual-{len(quotes)}").evidence.canonical_payload_json)
+        raw["priceTimestamp"] = now.isoformat()
+        for token in ("fromToken", "toToken"):
+            raw["steps"][0]["action"][token]["priceTimestamp"] = now.isoformat()
+        raw["steps"][0]["action"]["fromAddress"] = WALLET
+        return (_route_from_dict(raw, quote_timestamp=now.isoformat()),)
+
+    jumper = SimpleNamespace(routes=routes,
+        step_transaction=lambda raw: TransactionRequest(10, DEPOSIT, "0x1234",
+            int(raw["action"]["fromAmount"]), 10, 100),
+        token_price=lambda asset: LifiPriceEvidence(asset, "2500", now.isoformat()))
+    rpc = Rpc()
+
+    def fee(self, url, request, *, sender, **kw):
+        self.rpc.call(url, "eth_estimateGas", [{"from": sender, "to": request.to,
+                      "data": request.data, "value": hex(request.value)}, "latest"])
+        return replace(request, max_total_fee_cap_wei=1000)
+
+    monkeypatch.setattr("evm_inventory.fee_planner.FeePlanner.plan", fee)
+    monkeypatch.setattr(execution.time, "time", lambda: clock[0])
+    monkeypatch.setattr(execution, "ExecutionRpc", lambda _: rpc)
+    monkeypatch.setattr(execution, "WalletLifiClients",
+        lambda *a, **kw: SimpleNamespace(for_wallet=lambda _: jumper, close=lambda: None))
+    target = BitgetDepositTarget("USDC", 8453, e["target"]["asset_id"], 1, "BASE", 6)
+    monkeypatch.setattr(execution, "_bitget_client", lambda: SimpleNamespace(
+        revalidate_deposit_target=lambda *a, **kw: target))
+    monkeypatch.setattr(execution, "sign_transaction",
+                        lambda *a, **kw: pytest.fail("no repeated withdrawal or bridge signing"))
+
+    def run():
+        return _execute_live_groups([e], wallets={WALLET: wallet}, rpc_urls={10: "rpc"},
+            journal_path=path, max_route_loss_pct=Decimal("15"),
+            now_ms=lambda: int(clock[0] * 1000), delay_min_seconds=0, delay_max_seconds=0,
+            sleep=lambda _: None, rng=None)
+
+    assert run()["pending"] == 1
+    expected = 1 if failure_stage == "initial" else 2
+    assert len(quotes) == expected
+    assert len(estimates) == expected
+    with Journal(path) as journal:
+        assert journal.position(pid)["state"] == "source_asset_converted_bridge_pending"
+        retry = journal.checkpoint(pid, "automatic_retry")
+        assert retry["retry_at"] >= now.timestamp() + 240
+        assert "execution reverted" in json.dumps(
+            journal.checkpoint(pid, "execution_failure"))
+        assert len(journal.connection.execute("SELECT * FROM route_steps").fetchall()) == 1
+    clock[0] += 1
+    assert run()["pending"] == 1
+    assert len(quotes) == len(estimates) == expected
 
 
 @pytest.mark.parametrize("damage", ["hash", "owner", "amount", "pending", "null_hash",

@@ -89,7 +89,8 @@ def test_unsigned_preparation_retry_requires_actual_exact_lifi_post_422(method, 
     assert not _retryable_provider_error(ValueError(LEGACY_REASON))
 
 
-@pytest.mark.parametrize("reason", ["route_preparation_rejected", LEGACY_REASON])
+@pytest.mark.parametrize("reason", ["route_preparation_rejected", LEGACY_REASON,
+                                   "requote_required:target_minimum_changed"])
 @pytest.mark.parametrize("intent,tx_hash", [
     (None, None), ("approval:router", None), ("approval:router", "0x" + "c" * 64),
     ("bridge:0", None), ("bridge:0", "0x" + "c" * 64),

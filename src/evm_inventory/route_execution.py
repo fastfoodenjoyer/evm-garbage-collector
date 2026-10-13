@@ -334,14 +334,15 @@ def _require_live_target(
     except Exception as exc:
         raise ValueError("requote_required:live_target_validation_failed") from exc
     if (
-        live.chain_id != planned.chain_id
+        live.coin.upper() != planned.coin.upper()
+        or live.chain_id != planned.chain_id
         or live.asset_id.lower() != planned.asset_id
         or live.decimals != planned.decimals
     ):
         raise ValueError("requote_required:target_identity_changed")
-    if live.minimum_raw > planned.minimum_raw:
+    if live.minimum_raw > planned.minimum_raw and not entry.get("automatic_requote"):
         raise ValueError("requote_required:target_minimum_changed")
-    return replace(live, minimum_raw=planned.minimum_raw)
+    return replace(live, minimum_raw=max(live.minimum_raw, planned.minimum_raw))
 
 
 def _require_target_minimum(
@@ -1694,11 +1695,14 @@ def _execute_live_groups(
                     return result
 
                 def requote(entry: dict, amount: int) -> dict:
+                    unsigned_source_bridge = False
                     if entry.get("canonical_source_bootstrap") and entry.get("automatic_requote"):
                         position = journal.get_or_create_position(
                             position_key=_position_key(entry), wallet=entry["wallet"])
                         require_source_bridge_retry_due(journal, position["id"], entry,
                                                         now_seconds=time.time())
+                        unsigned_source_bridge = confirmed_unsigned_source_bridge(
+                            journal, position["id"], entry)
                     return _requote_bridge_after_swap(
                         entry,
                         amount,
@@ -1707,6 +1711,7 @@ def _execute_live_groups(
                         bitget=bitget,
                         gas_estimator=gas_estimator,
                         now_ms=now_ms,
+                        retry_unsigned_preparation=unsigned_source_bridge,
                     )
 
                 wallet_deadline = deadlines.setdefault(
@@ -2357,6 +2362,7 @@ def _requote_bridge_after_swap(
     gas_estimator: PlannerGasEstimator,
     now_ms: Callable[[], int],
     remaining_loss_usd: Decimal | None = None,
+    retry_unsigned_preparation: bool = False,
 ) -> dict:
     planned_bridge = next((step for step in entry["steps"] if step.get("kind") == "bridge"), None)
     if planned_bridge is None:
@@ -2388,6 +2394,36 @@ def _requote_bridge_after_swap(
                     + Decimal(marker["accounted_loss_usd"]))
     candidates = []
     stale_price = False
+    failures = []
+    attempted = []
+
+    def prepare(route):
+        from .unsigned_route_options import _deterministic_failure
+
+        diagnostics = getattr(gas_estimator, "diagnostics", [])
+        start = len(diagnostics)
+        attempted.append(route)
+        try:
+            transactions = tuple(jumper.step_transaction(raw) for raw in route.raw_steps)
+            gas = gas_estimator.estimate_prepared_route(route=route,
+                wallet=wallet.public_address, prepared_transactions=transactions)
+            if gas:
+                return transactions, gas
+            error = ValueError("requote_required:missing_gas_estimate")
+        except Exception as caught:
+            error = caught
+        current = [d for d in diagnostics[start:] if d.get("route_id") == route.route_id]
+        if retry_unsigned_preparation and _deterministic_failure(error, current):
+            failures.append(dict(route_id=route.route_id, phase="post_conversion_requote",
+                diagnostic=exception_diagnostic(error), gas_failures=redact_data(current)))
+            return None, None
+        if str(error) == "requote_required:missing_gas_estimate":
+            error.diagnostic = {"gas_failures": redact_data(current)}
+            if retry_unsigned_preparation:
+                raise error
+            return None, None
+        raise error
+
     initial_request = LifiRouteRequest(
         from_chain_id=source.chain_id,
         to_chain_id=target_identity.chain_id,
@@ -2398,14 +2434,7 @@ def _requote_bridge_after_swap(
         to_address=wallet.bitget_deposit_address,
     )
     for initial_route in jumper.routes(initial_request):
-        initial_transactions = tuple(
-            jumper.step_transaction(raw_step) for raw_step in initial_route.raw_steps
-        )
-        initial_gas = gas_estimator.estimate_prepared_route(
-            route=initial_route,
-            wallet=wallet.public_address,
-            prepared_transactions=initial_transactions,
-        )
+        _, initial_gas = prepare(initial_route)
         if not initial_gas:
             continue
         source_gas = sum(
@@ -2429,14 +2458,7 @@ def _requote_bridge_after_swap(
             to_address=wallet.bitget_deposit_address,
         )
         for route in jumper.routes(adjusted_request):
-            prepared_requests = tuple(
-                jumper.step_transaction(raw_step) for raw_step in route.raw_steps
-            )
-            extra_gas = gas_estimator.estimate_prepared_route(
-                route=route,
-                wallet=wallet.public_address,
-                prepared_transactions=prepared_requests,
-            )
+            prepared_requests, extra_gas = prepare(route)
             if not extra_gas:
                 continue
             final_source_gas = sum(
@@ -2475,7 +2497,15 @@ def _requote_bridge_after_swap(
     if not candidates:
         if stale_price:
             raise ValueError("requote_required:stale_price")
-        raise ValueError("no eligible bridge route")
+        if failures:
+            retry_at = now_ms() / 1000 + 240
+            for failed in attempted:
+                retry_at = max(retry_at, datetime.fromisoformat(
+                    failed.evidence.quote_timestamp.replace("Z", "+00:00")).timestamp() + 240)
+            raise UnsignedRoutePreparationExhausted(retry_at=retry_at, failures=failures)
+        error = ValueError("no eligible bridge route")
+        error.diagnostic = {"gas_failures": redact_data(getattr(gas_estimator, "diagnostics", []))}
+        raise error
     route, candidate, prepared_requests = min(
         candidates,
         key=lambda pair: (

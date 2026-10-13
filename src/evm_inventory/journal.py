@@ -454,6 +454,7 @@ class Journal:
             retry_reason = reason in {
                 "requote_required:stale_price", "native_gas_reserve_unstable",
                 "requote_required:fee_cap_changed",
+                "requote_required:target_minimum_changed",
             } or is_route_preparation_retry_reason(reason)
             if reason == "execution_error:ValueError" and len(rows) == 1:
                 proof = self.checkpoint(rows[0]["id"], "execution_failure") or {}

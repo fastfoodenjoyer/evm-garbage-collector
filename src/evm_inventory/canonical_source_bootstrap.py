@@ -429,7 +429,7 @@ def preflight_source_bootstrap(entry, *, wallet, rpc, rpc_urls, jumper, bitget, 
     from .stages import StageDeadlineExceeded
 
     marker = dict(validate_marker(entry, wallet))
-    _require_live_target(entry, wallet=wallet, bitget=bitget)
+    live_target = _require_live_target(entry, wallet=wallet, bitget=bitget)
     chain, amount = entry["chain_id"], int(marker["amount_raw"])
     asset = AssetIdentity(chain, entry["asset_id"], 18)
     url = rpc_urls[chain]
@@ -594,6 +594,21 @@ def preflight_source_bootstrap(entry, *, wallet, rpc, rpc_urls, jumper, bitget, 
             if q.price and q.price.asset == native_asset_identity(chain)
         )
         cached = bool(quotes and current_cap > 0 and current_cap * 3 <= saved_cap)
+        if cached:
+            refreshed = candidate_from_route(
+                bridge["_live_route"], expected_source=native_asset_identity(chain),
+                expected_destination=AssetIdentity(entry["target"]["chain_id"],
+                    entry["target"]["asset_id"], entry["target"]["decimals"]),
+                expected_input_amount=bridge["_live_route"].evidence.input_amount,
+                recipient=marker["recipient"], gas_estimate_complete=True,
+                wallet_paid_gas=quotes, replace_route_gas=True, now=now(),
+                max_price_age=_MAX_PRICE_AGE,
+            )
+            cached = (refreshed.is_valid and refreshed.loss_usd <= remaining
+                      and refreshed.destination_amount >= live_target.minimum_raw)
+            if cached:
+                bridge = {**bridge, "_candidate": refreshed,
+                          "valuation": _valuation_data(refreshed)}
     if not cached:
         target = entry["target"]
         # Only destination evidence is read here; no fabricated actual balance is introduced.
@@ -623,9 +638,12 @@ def preflight_source_bootstrap(entry, *, wallet, rpc, rpc_urls, jumper, bitget, 
             gas_estimator=forecast_estimator,
             now_ms=now_ms,
             remaining_loss_usd=remaining,
+            retry_unsigned_preparation=True,
         )
     if not cached:
         marker["forecast_quoted_at_ms"] = now_ms()
+    if bridge["_live_route"].evidence.min_output_amount < live_target.minimum_raw:
+        raise ValueError("requote_required:below_target_minimum")
     loss = _exact_sum((source_candidate.loss_usd, Decimal(bridge["valuation"]["loss_usd"])))
     if paid + loss > budget:
         raise ValueError("canonical_source_bootstrap_loss_threshold_exceeded")
