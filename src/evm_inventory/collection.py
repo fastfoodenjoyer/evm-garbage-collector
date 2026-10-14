@@ -31,6 +31,7 @@ from .wallet_lifi import WalletLifiClients
 _READY = {"direct_deposit", "route_ready"}
 _SKIP_REASONS = {
     "insufficient_source_gas",
+    "source_native_fee_exceeds_balance",
     "below_quote_floor",
     "below_target_minimum",
     "max_route_loss_exceeded",
@@ -89,12 +90,18 @@ def verify_prior_defi_exit(journal, position_id, rpc_urls, *, rpc=None):
 
 
 def _unresolved(entry):
-    search = entry.get("search", {})
-    operational = {"quota_wait", "provider_cooldown", "route_search_incomplete", "stale_quote",
-                   "quote_timeout", "quote_request_failed"}
-    pending_alternatives = (bool(operational.intersection(_search_error_reasons(search))) or (
-        not search.get("complete") and bool(search.get("pending"))
-    ))
+    searches = (entry.get("search", {}), entry.get("relay_fallback", {}).get("search", {}))
+    operational = {
+        "quota_wait", "proxy_pool_exhausted", "provider_cooldown", "route_search_incomplete",
+        "stale_quote", "quote_timeout", "quote_request_failed",
+        "relay_quote_failed", "relay_source_gas_unverified", "relay_route_search_incomplete",
+    }
+    fallback_reason = entry.get("relay_fallback", {}).get("reason")
+    pending_alternatives = fallback_reason in operational or any(
+        operational.intersection(_search_error_reasons(search))
+        or (not search.get("complete") and bool(search.get("pending")))
+        for search in searches
+    )
     return (
         entry.get("status") not in _READY
         and entry.get("status") not in {"denied", "dust", "below_quote_floor"}
@@ -153,6 +160,7 @@ def recover_planning(
     locked_chains=(),
     frozen_keys=None,
     on_plan=None,
+    provider_retry_time=None,
 ):
     """Retry unfinished source groups in this invocation without requerying completed groups."""
     attempt = 0
@@ -174,12 +182,21 @@ def recover_planning(
         for entry in unresolved:
             search = entry.get("search", {})
             errors = _search_error_reasons(search)
-            times = [p["retry_at"] for p in search.get("pending", [])
-                     if isinstance(p.get("retry_at"), (int, float))]
+            times = []
+            for pending in search.get("pending", []):
+                retry_at = pending.get("retry_at")
+                if (provider_retry_time is not None
+                        and entry.get("routing_provider") != "relay"):
+                    refreshed = provider_retry_time(pending)
+                    if refreshed is not None:
+                        retry_at = refreshed
+                if isinstance(retry_at, (int, float)):
+                    times.append(retry_at)
             # A provider cooldown gates only provider work. Local RPC/fee failures
             # on another network can be retried while its route quota is waiting.
-            wait = (max(backoff, min(times) - wall_clock()) if times and
-                    errors <= {"quota_wait", "provider_cooldown"} else backoff)
+            quota_errors = {"quota_wait", "proxy_pool_exhausted", "provider_cooldown"}
+            wait = (max(backoff, min(times) - wall_clock())
+                    if times and errors <= quota_errors else backoff)
             key = _asset_key(entry)
             due[key] = min(due.get(key, math.inf), clock() + wait)
         delay = min(due.values()) - clock()
@@ -906,29 +923,40 @@ def collect_wallets(
                             frozen_keys.add(_asset_key(e))
 
             if balances_path.exists():
-                plan = recover_planning(
-                    plan,
-                    balances_path,
-                    lambda path: quote_fn(
-                        path,
-                        row,
-                        db_path=db_path,
-                        catalog=catalog,
-                        rpc_urls=rpc_urls,
-                        allowlist=allowlist,
-                        target_policy=target_policy,
-                        loss_limit=loss_limit,
-                        quote_floor=quote_floor,
-                        seconds=max(0.1, planning_until - clock()),
-                    ),
-                    until=planning_until,
-                    clock=clock,
-                    sleep=sleep,
-                    progress=progress,
-                    locked_chains=locked_chains,
-                    frozen_keys=frozen_keys,
-                    on_plan=advance_ready_groups if execute else None,
-                )
+                retry_clients = None
+                retry_time = None
+                try:
+                    if len(getattr(row, "proxy_pool", ())) > 1:
+                        retry_clients = WalletLifiClients((row,), db_path=db_path)
+                        retry_time = (retry_clients.for_wallet(row.public_address)
+                                      .http_client.retry_at_for_pending)
+                    plan = recover_planning(
+                        plan,
+                        balances_path,
+                        lambda path: quote_fn(
+                            path,
+                            row,
+                            db_path=db_path,
+                            catalog=catalog,
+                            rpc_urls=rpc_urls,
+                            allowlist=allowlist,
+                            target_policy=target_policy,
+                            loss_limit=loss_limit,
+                            quote_floor=quote_floor,
+                            seconds=max(0.1, planning_until - clock()),
+                        ),
+                        until=planning_until,
+                        clock=clock,
+                        sleep=sleep,
+                        progress=progress,
+                        locked_chains=locked_chains,
+                        frozen_keys=frozen_keys,
+                        on_plan=advance_ready_groups if execute else None,
+                        provider_retry_time=retry_time,
+                    )
+                finally:
+                    if retry_clients is not None:
+                        retry_clients.close()
             _assign_collection_identities(plan, run_id, locked_chains=locked_chains,
                                           frozen_keys=frozen_keys)
             for entry in plan["entries"]:

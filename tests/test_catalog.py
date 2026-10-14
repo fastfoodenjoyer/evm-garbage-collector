@@ -201,3 +201,19 @@ def test_no_arbitrary_native_eth_for_custom_gas():
     }
     got = build_candidate([row], "a" * 40, "2026-09-19", {})
     assert next(n for n in got["networks"] if n["chain_id"] == 55)["native_symbol"] == "UNKNOWN"
+
+
+def test_superseed_uses_working_rpc_without_unsupported_discovery(monkeypatch):
+    from evm_inventory.cli import _execution_rpc_urls
+    from evm_inventory.scanner import _rpc_urls
+
+    monkeypatch.setenv('ALCHEMY_RPC_API_KEY', 'test-key')
+    catalog = load_catalog()
+    network = next(n for n in catalog.networks if n.chain_id == 5330)
+    assert 'https://mainnet.superseed.xyz' not in network.rpc_urls
+    assert network.alchemy_network is None
+    assert _execution_rpc_urls(catalog)[5330] == (
+        'https://superseed-mainnet.g.alchemy.com/v2/test-key')
+    assert _rpc_urls({'rpc_urls': network.rpc_urls, 'alchemy_network': None,
+                      'alchemy_rpc_network': network.alchemy_rpc_network}) == (
+        'https://superseed-mainnet.g.alchemy.com/v2/test-key',)

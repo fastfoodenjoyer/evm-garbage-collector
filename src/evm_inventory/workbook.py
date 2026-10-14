@@ -75,6 +75,7 @@ class WalletWorkbookRow:
     private_key: str = field(repr=False)
     bitget_deposit_address: str
     rabby_proxy: str = field(default="", repr=False)
+    proxy_pool: tuple[str, ...] = field(default=(), repr=False)
 
 
 def _rabby_proxy(value: object, *, row_number: int, required: bool) -> str:
@@ -82,7 +83,12 @@ def _rabby_proxy(value: object, *, row_number: int, required: bool) -> str:
         if required:
             raise ConfigError(f"row {row_number}: Rabby proxy is required")
         return ""
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or any(character in value for character in "\r\n\t")
+    ):
         raise ConfigError(f"row {row_number}: invalid Rabby proxy")
     proxy = value
     try:
@@ -175,6 +181,81 @@ def _required_string(value: object, *, row_number: int, field_name: str) -> str:
     return value.strip()
 
 
+def _proxy_only(values: tuple[object, ...]) -> bool:
+    return len(values) > 5 and bool(values[5]) and all(
+        value is None or value == "" for value in values[:5]
+    )
+
+
+def load_proxy_assignments(path: Path) -> dict[str, tuple[str, ...]]:
+    """Assign reserves in physical wallet order, independently of selected ranges.
+
+    Private keys are neither parsed nor validated. Other input cells are only
+    inspected for occupancy to distinguish wallet rows from reserve rows.
+    """
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except OSError as exc:
+        raise ConfigError("cannot read proxy assignment workbook") from exc
+    try:
+        if WORKSHEET_NAME not in workbook.sheetnames:
+            raise ConfigError(f"workbook must contain a {WORKSHEET_NAME!r} sheet")
+        sheet = workbook[WORKSHEET_NAME]
+        if tuple(cell.value for cell in sheet[1]) != WORKSHEET_HEADERS:
+            raise ConfigError("workbook headers do not match the wallet template")
+        wallets: list[tuple[int, str, str]] = []
+        reserves: list[tuple[int, str]] = []
+        ordinals: set[int] = set()
+        addresses: set[str] = set()
+        proxy_rows: dict[str, int] = {}
+        for row_number, values in enumerate(
+            sheet.iter_rows(min_row=2, values_only=True), start=2
+        ):
+            if all(value is None or value == "" for value in values):
+                continue
+            proxy = _rabby_proxy(values[5], row_number=row_number, required=True)
+            if proxy in proxy_rows:
+                raise ConfigError(
+                    f"row {row_number}: duplicate Rabby proxy (row {proxy_rows[proxy]})"
+                )
+            proxy_rows[proxy] = row_number
+            if _proxy_only(values):
+                if not wallets:
+                    raise ConfigError(f"row {row_number}: proxy-only row must follow all wallets")
+                reserves.append((row_number, proxy))
+                continue
+            if reserves:
+                raise ConfigError(
+                    f"row {reserves[0][0]}: proxy-only row must follow all wallets; "
+                    f"row {row_number}: unexpected wallet row"
+                )
+            ordinal = values[0]
+            if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal <= 0:
+                raise ConfigError(f"row {row_number}: # must be a positive integer")
+            if ordinal in ordinals:
+                raise ConfigError(f"row {row_number}: duplicate #")
+            address = _required_string(
+                values[1], row_number=row_number, field_name="public address"
+            ).lower()
+            if not _ADDRESS_RE.fullmatch(address):
+                raise ConfigError(f"row {row_number}: invalid public EVM address")
+            if address in addresses:
+                raise ConfigError(f"row {row_number}: duplicate public address")
+            ordinals.add(ordinal)
+            addresses.add(address)
+            wallets.append((row_number, address, proxy))
+        if not wallets:
+            raise ConfigError("workbook must contain at least one wallet")
+        if reserves and len(reserves) < len(wallets):
+            raise ConfigError(f"row {reserves[0][0]}: incomplete first reserve set")
+        pools = {address: [proxy] for _, address, proxy in wallets}
+        for index, (_, proxy) in enumerate(reserves):
+            pools[wallets[index % len(wallets)][1]].append(proxy)
+        return {address: tuple(pool) for address, pool in pools.items()}
+    finally:
+        workbook.close()
+
+
 def load_wallet_workbook(
     path: Path,
     *,
@@ -199,6 +280,13 @@ def load_wallet_workbook(
     ):
         raise ConfigError("workbook headers do not match the wallet template")
     has_proxy_column = headers == WORKSHEET_HEADERS
+    has_reserves = has_proxy_column and any(
+        _proxy_only(values)
+        for values in sheet.iter_rows(min_row=2, values_only=True)
+    )
+    proxy_assignments = (
+        load_proxy_assignments(path) if has_reserves or require_rabby_proxy else {}
+    )
     if check_deposit_uniqueness is True or (
         check_deposit_uniqueness is None and require_deposit_address
     ):
@@ -218,6 +306,8 @@ def load_wallet_workbook(
     issues: list[str] = []
     for row_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
         if all(value is None or value == "" for value in values):
+            continue
+        if has_reserves and _proxy_only(values):
             continue
         try:
             ordinal = values[0]
@@ -267,6 +357,7 @@ def load_wallet_workbook(
                     private_key=private_key,
                     bitget_deposit_address=deposit_address,
                     rabby_proxy=rabby_proxy,
+                    proxy_pool=proxy_assignments.get(public_address, ()),
                 )
             )
         except ConfigError as exc:

@@ -62,6 +62,8 @@ class LifiHttpClient:
         if api_key and provider == "lifi":
             quota_store = AuthenticatedLifiQuotaStore
         self.scope = sha256(scope_input.encode()).hexdigest()
+        self.request_scope = self.scope
+        self.transport_id = sha256(proxy.encode()).hexdigest()
         self.db_path = db_path
         self.purpose = purpose
         self.clock = clock or (lambda: time.time())
@@ -117,7 +119,7 @@ class LifiHttpClient:
         with self._db() as db:
             db.execute(
                 "INSERT OR REPLACE INTO lifi_search_progress VALUES (?, ?, ?, ?)",
-                (self.scope, key, self.clock(), json.dumps(data, sort_keys=True)),
+                (self.request_scope, key, self.clock(), json.dumps(data, sort_keys=True)),
             )
 
     def _db(self):
@@ -126,7 +128,9 @@ class LifiHttpClient:
     @contextmanager
     def _request_slot(self, key):
         with _REGISTRY_LOCK:
-            key_lock = _KEY_LOCKS.setdefault((*self._registry_key, key), Lock())
+            key_lock = _KEY_LOCKS.setdefault(
+                (str(Path(self.db_path).resolve()), self.request_scope, key), Lock()
+            )
 
         def acquire(lock):
             deadline = current_deadline()
@@ -194,17 +198,27 @@ class LifiHttpClient:
             check_deadline()
         raise RuntimeError("HTTP retry loop exhausted")
 
+    def cached_response(self, method, url, kwargs):
+        key = sha256(json.dumps([
+            method, url, kwargs.get("params"), kwargs.get("json"), kwargs.get("cache_namespace")
+        ], sort_keys=True).encode()).hexdigest()
+        with self._db() as db:
+            row = db.execute(
+                "SELECT body,observed_at FROM lifi_read_cache WHERE scope=? "
+                "AND cache_key=? AND expires_at>? AND observed_at IS NOT NULL",
+                (self.request_scope, key, self.clock()),
+            ).fetchone()
+        if row is None:
+            return None
+        self._increment("cache_hits")
+        return httpx.Response(200, json=json.loads(row[0]), request=httpx.Request(method, url),
+                              headers={"x-inventory-observed-at": str(row[1])})
+
     def _request_once(self, method, url, kwargs):
         cache_namespace = kwargs.pop("cache_namespace", None)
         if not url.startswith(self.base_url):
             return self.client.request(method, url, **kwargs)
-        bucket = (
-            "steps"
-            if url.endswith("/stepTransaction")
-            else "routes"
-            if url.endswith(("/routes", "/quote", "/quote/v2"))
-            else "public"
-        )
+        bucket = request_bucket(url)
         ttl = (
             240
             if bucket == "routes"
@@ -226,7 +240,7 @@ class LifiHttpClient:
                 cached = db.execute(
                     "SELECT body,observed_at FROM lifi_read_cache WHERE scope=? AND "
                     "cache_key=? AND expires_at>? AND observed_at IS NOT NULL",
-                    (self.scope, key, self.clock()),
+                    (self.request_scope, key, self.clock()),
                 ).fetchone()
             if cached:
                 self._increment("cache_hits")
@@ -284,7 +298,7 @@ class LifiHttpClient:
                                 "INSERT OR REPLACE INTO "
                                 "lifi_read_cache(scope,cache_key,expires_at,body,observed_at) "
                                 "VALUES (?,?,?,?,?)",
-                                (self.scope, key, finished + ttl, response.text, finished),
+                                (self.request_scope, key, finished + ttl, response.text, finished),
                             )
                     return response
             except LifiRequestLimit:
@@ -294,3 +308,11 @@ class LifiHttpClient:
 
     def close(self):
         self.client.close()
+
+
+def request_bucket(url: str) -> str:
+    if url.endswith("/stepTransaction"):
+        return "steps"
+    if url.endswith(("/routes", "/quote", "/quote/v2")):
+        return "routes"
+    return "public"

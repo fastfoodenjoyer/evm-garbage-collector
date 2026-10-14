@@ -12,6 +12,7 @@ import httpx
 from .lifi import LifiClient
 from .lifi_http import LifiHttpClient
 from .models import ConfigError
+from .proxy_pool import ProxyPoolHttpClient
 from .relay import BASE_URL as RELAY_BASE_URL
 from .relay import RelayClient, RelayQuotaStore
 from .workbook import WalletWorkbookRow, _rabby_proxy
@@ -32,11 +33,15 @@ class WalletLifiClients:
         self.db_path = db_path
         self.quota_wait_seconds = quota_wait_seconds
         self._proxies: dict[str, str] = {}
+        self._pools: dict[str, tuple[str, ...]] = {}
         for row in rows:
             if not row.rabby_proxy:
                 raise ConfigError(f"row {row.row_number}: LI.FI wallet proxy is required")
             self._proxies[row.public_address.lower()] = _rabby_proxy(
                 row.rabby_proxy, row_number=row.row_number, required=True
+            )
+            self._pools[row.public_address.lower()] = (
+                getattr(row, "proxy_pool", ()) or (row.rabby_proxy,)
             )
         self._clients: dict[str, LifiClient] = {}
         self._relay_clients: dict[str, RelayClient] = {}
@@ -48,17 +53,14 @@ class WalletLifiClients:
             if wallet not in self._proxies:
                 raise ConfigError("LI.FI wallet proxy is missing from workbook")
             if wallet not in self._clients:
-                self._clients[wallet] = LifiClient(
-                    LifiHttpClient(
-                        httpx.Client(timeout=30, proxy=self._proxies[wallet], trust_env=False),
-                        db_path=self.db_path,
-                        proxy=self._proxies[wallet],
-                        purpose=self.purpose,
-                        api_key=os.environ.get("LIFI_API_KEY", ""),
-                        quota_wait_seconds=self.quota_wait_seconds,
-                    ),
-                    policy_digest=self.policy_digest,
-                )
+                transports = [LifiHttpClient(
+                    httpx.Client(timeout=30, proxy=proxy, trust_env=False),
+                    db_path=self.db_path, proxy=proxy, purpose=self.purpose,
+                    api_key=os.environ.get("LIFI_API_KEY", ""),
+                    quota_wait_seconds=self.quota_wait_seconds,
+                ) for proxy in self._pools[wallet]]
+                transport = ProxyPoolHttpClient(transports, wallet=wallet)
+                self._clients[wallet] = LifiClient(transport, policy_digest=self.policy_digest)
             return self._clients[wallet]
 
     def relay_for_wallet(self, wallet: str) -> RelayClient:

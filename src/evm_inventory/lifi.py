@@ -89,6 +89,7 @@ class LifiFeeCost:
     amount_usd: str | None
     price_usd: str | None
     price_timestamp: str | None
+    included: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +368,7 @@ class LifiClient:
             "to_token_decimals": request.to_token_decimals,
             "catalog_digest": self.catalog_digest,
         }
+        jobs.wait_recheck = getattr(self.http_client, "recheck_wait", None)
         key = quote_job_key(jobs.scope, complete_request, self.policy_digest)
         lock_key = (str(Path(jobs.db_path).resolve()), jobs.scope, key)
         with _QUOTE_LOCKS_GUARD:
@@ -374,6 +376,22 @@ class LifiClient:
         with lock:
             self._job_state(key, "pending")
             row = jobs.read(key)
+            if row is None:
+                for legacy_scope in getattr(self.http_client, "legacy_scopes", ()):
+                    legacy = QuoteJobs(jobs.db_path, legacy_scope, clock=jobs.clock)
+                    legacy_key = quote_job_key(legacy_scope, complete_request, self.policy_digest)
+                    candidate = legacy.read(legacy_key, include_inflight=True)
+                    if (candidate and candidate["state"] == "inflight"
+                            and candidate["lease_until"] > jobs.clock()):
+                        raise JobInProgress(retry_at=candidate["lease_until"])
+                    if (candidate and candidate["state"] == "error"
+                            and (candidate.get("diagnostic_json") or {}).get("reason")
+                            == "bad_request"):
+                        raise JobInProgress(reason="bad_request",
+                                            diagnostic=candidate["diagnostic_json"])
+                    if candidate and candidate["state"] in ("complete", "no_route"):
+                        row = candidate
+                        break
             if row and row["state"] in ("complete", "no_route"):
                 return self._cached_job_routes(row, request)
             search_key = (
@@ -671,7 +689,8 @@ class LifiClient:
             "origin": "https://jumper.exchange",
             "x-lifi-integrator": "jumper.exchange",
         }
-        for attempt in range(3):
+        attempts = 1 if getattr(self.http_client, "manages_retries", False) else 3
+        for attempt in range(attempts):
             try:
                 internal = (
                     {"cache_namespace": cache_namespace}
@@ -700,7 +719,7 @@ class LifiClient:
                 return response
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status not in {500, 502, 503, 504} or attempt == 2:
+                if status not in {500, 502, 503, 504} or attempt + 1 == attempts:
                     raise
                 record_retry = getattr(self.http_client, "record_retry", None)
                 if record_retry is not None:
@@ -739,7 +758,8 @@ class LifiClient:
             "origin": "https://jumper.exchange",
             "x-lifi-integrator": "jumper.exchange",
         }
-        for attempt in range(3):
+        attempts = 1 if getattr(self.http_client, "manages_retries", False) else 3
+        for attempt in range(attempts):
             try:
                 response = http_request(
                     self.http_client,
@@ -756,7 +776,7 @@ class LifiClient:
                 return response
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status not in {500, 502, 503, 504} or attempt == 2:
+                if status not in {500, 502, 503, 504} or attempt + 1 == attempts:
                     raise
                 record_retry = getattr(self.http_client, "record_retry", None)
                 if record_retry is not None:
@@ -1083,6 +1103,9 @@ def _fee_costs(value: object) -> tuple[LifiFeeCost, ...]:
         token = cost.get("token")
         if not isinstance(token, dict):
             raise LifiError("LI.FI fee cost token identity is malformed")
+        included = cost.get("included")
+        if included is not None and not isinstance(included, bool):
+            raise LifiError("LI.FI fee included flag is malformed")
         costs.append(
             LifiFeeCost(
                 amount=_required_nonnegative_integer(cost["amount"], "fee amount"),
@@ -1090,6 +1113,7 @@ def _fee_costs(value: object) -> tuple[LifiFeeCost, ...]:
                 amount_usd=_optional_string(cost.get("amountUSD")),
                 price_usd=_optional_string(cost.get("priceUSD")),
                 price_timestamp=_price_timestamp(cost),
+                included=included,
             )
         )
     return tuple(costs)

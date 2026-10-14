@@ -54,6 +54,7 @@ REASON_CODES = frozenset(
         "conflicting_price_evidence",
         "zero_source_value",
         "insufficient_source_gas",
+        "source_native_fee_exceeds_balance",
         "native_reserve_requote_unavailable",
         "native_gas_reserve_unstable",
     }

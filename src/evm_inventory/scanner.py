@@ -80,7 +80,7 @@ def _rpc_urls(network):
     """Return the preferred endpoints for one network."""
     urls = list(network["rpc_urls"])
     key = os.environ.get("ALCHEMY_RPC_API_KEY") or os.environ.get("ALCHEMY_API_KEY")
-    alchemy_network = network.get("alchemy_network")
+    alchemy_network = network.get("alchemy_rpc_network") or network.get("alchemy_network")
     if key and alchemy_network:
         return (f"https://{alchemy_network}.g.alchemy.com/v2/{quote(key, safe='')}",)
     return tuple(dict.fromkeys(urls))

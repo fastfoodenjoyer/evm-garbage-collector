@@ -483,9 +483,8 @@
     {
       "chain_id": 5330,
       "name": "Superseed",
-      "rpc_urls": [
-        "https://mainnet.superseed.xyz"
-      ],
+      "rpc_urls": [],
+      "alchemy_rpc_network": "superseed-mainnet",
       "native_symbol": "ETH",
       "native_decimals": 18,
       "tokens": [],

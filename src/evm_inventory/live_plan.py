@@ -776,6 +776,11 @@ def _plan_group(
                       else admission.reason) or "no_eligible_candidate"
             if selected is None and item.base.get("insufficient_source_gas"):
                 reason = "insufficient_source_gas"
+            search = direct_by_id[id(item)]
+            if (selected is None and search.complete and search.failed
+                    and all(f.reason == "source_native_fee_exceeds_balance"
+                            for f in search.failed)):
+                reason = "source_native_fee_exceeds_balance"
             entry = {
                 **item.base,
                 "status": "manual_review",
@@ -792,6 +797,11 @@ def _plan_group(
                 entry["valuation"] = _valuation_data(candidate)
             else:
                 entry["candidate_reason"] = candidate.reason
+            if reason == "source_native_fee_exceeds_balance":
+                entry["reason_detail"] = {
+                    "balance_raw": item.base["raw_balance"],
+                    "rejected_routes": item.base.get("native_fee_rejections", []),
+                }
             result.append(entry)
             continue
 
@@ -1331,6 +1341,19 @@ def _route_choice(
             "below_target_minimum"
             if check_target_minimum and route.to_amount_min < target.minimum_raw else None
         )
+        if (expected_source.is_native and expected_source == item.asset
+                and route.evidence.costs_complete
+                and sum(fee.amount for fee in route.fee_costs
+                        if fee.included is False and fee.token == expected_source)
+                >= int(item.base["raw_balance"])):
+            early_reason = "source_native_fee_exceeds_balance"
+            item.base.setdefault("native_fee_rejections", []).append({
+                "route_id": route.route_id,
+                "balance_raw": item.base["raw_balance"],
+                "extra_fee_raw": str(sum(fee.amount for fee in route.fee_costs
+                                         if fee.included is False
+                                         and fee.token == expected_source)),
+            })
     except ValueError:
         early_reason = "route_identity_mismatch"
     if early_reason:

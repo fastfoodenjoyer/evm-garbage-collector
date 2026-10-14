@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import UTC, datetime
@@ -202,6 +203,22 @@ class _RelayGasReserveChanged(ValueError):
         super().__init__(self.reason)
 
 
+def _amount_too_low(diagnostic):
+    """Recognize Relay's structured economic refusal, including a persisted job error."""
+    for item in diagnostic.get("exceptions", []):
+        if item.get("http_status") == 400:
+            try:
+                body = json.loads(item.get("http_response_body", ""))
+            except (ValueError, TypeError):
+                body = None
+            if isinstance(body, dict) and body.get("errorCode") == "AMOUNT_TOO_LOW":
+                return True
+        provider = item.get("provider")
+        if isinstance(provider, dict) and _amount_too_low(provider):
+            return True
+    return False
+
+
 def _search_error(error, target=None):
     retry_at = getattr(error, "retry_at", None)
     reason = getattr(error, "reason", "relay_quote_failed")
@@ -215,7 +232,10 @@ def _search_error(error, target=None):
         cause = cause.__cause__
     if retry_at is None and is_transient_error(error):
         retry_at = time.time() + 5
-    result = {"reason": reason, "diagnostic": exception_diagnostic(error), "retry_at": retry_at}
+    diagnostic = exception_diagnostic(error)
+    if retry_at is None and _amount_too_low(diagnostic):
+        reason = "below_target_minimum"
+    result = {"reason": reason, "diagnostic": diagnostic, "retry_at": retry_at}
     if target is not None:
         result["destination_chain_id"] = target.chain_id
     return result
@@ -391,7 +411,12 @@ def quote_relay_entry(base, client, targets, *, loss_limit, quote_floor, deposit
                 if detail["retry_at"] is not None:
                     entry["search"]["pending"].append(detail)
         entry["relay_candidates"] = quotes
-        entry["search"]["complete"] = len(quotes) == len(targets)
+        refused = sum(e["reason"] == "below_target_minimum"
+                      for e in entry["search"]["errors"])
+        entry["search"]["complete"] = len(quotes) + refused == len(targets)
+        if not quotes and refused == len(targets):
+            entry["reason"] = "below_target_minimum"
+            return entry
         if quotes:
             entry["quote_status"] = "available"
         if not entry["search"]["complete"]:

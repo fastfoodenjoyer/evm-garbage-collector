@@ -149,6 +149,7 @@ class Network:
     token_review_status: str = "pending"
     notes: str = ""
     alchemy_network: str | None = None
+    alchemy_rpc_network: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -179,6 +180,8 @@ class Network:
             raise ConfigError("token_review_status none requires an empty token list")
         if self.alchemy_network is not None and not isinstance(self.alchemy_network, str):
             raise ConfigError("alchemy_network must be a string or null")
+        if self.alchemy_rpc_network is not None and not isinstance(self.alchemy_rpc_network, str):
+            raise ConfigError("alchemy_rpc_network must be a string or null")
 
     def validate(self) -> Network:
         issues: list[str] = []

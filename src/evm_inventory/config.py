@@ -111,6 +111,7 @@ def _network_from_dict(value: Any, index: int) -> Network:
             token_review_status=data.get("token_review_status", "pending"),
             notes=data.get("notes", ""),
             alchemy_network=data.get("alchemy_network"),
+            alchemy_rpc_network=data.get("alchemy_rpc_network"),
         )
         return network
     except (TypeError, KeyError) as exc:

@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from .collection import collect_wallets
+from .collection import _unresolved, collect_wallets
 from .config import add_allowlisted_tokens, load_catalog, load_wallets, snapshot, validate_delays
 from .defi_operations import execute_defi, quote_defi
 from .diagnostics import exception_diagnostic, redact_text
@@ -403,17 +403,18 @@ def main(argv=None):
             Path(args.output).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
             with Store(args.db) as store:
                 store.save_run_artifact("route_quote", Path(args.output).read_bytes())
+            incomplete = any(_unresolved(entry) for entry in plan["entries"])
             print(
                 json.dumps(
                     {
-                        "status": "quoted",
+                        "status": "incomplete" if incomplete else "quoted",
                         "output": str(args.output),
                         **plan["summary"],
                         **_quote_progress(plan),
                     }
                 )
             )
-            return 0
+            return 3 if incomplete else 0
         if args.cmd == "execute-routes":
             require_trusted_deposit_addresses(args.trust_deposit_addresses)
             routing_settings = load_routing_settings()
@@ -545,8 +546,11 @@ def _execution_rpc_urls(catalog) -> dict[int, str]:
     key = os.environ.get("ALCHEMY_RPC_API_KEY") or os.environ.get("ALCHEMY_API_KEY")
     urls: dict[int, str] = {}
     for network in catalog.networks:
-        if key and network.alchemy_network:
-            urls[network.chain_id] = f"https://{network.alchemy_network}.g.alchemy.com/v2/{key}"
-        else:
+        rpc_network = getattr(network, "alchemy_rpc_network", None) or network.alchemy_network
+        if key and rpc_network:
+            urls[network.chain_id] = f"https://{rpc_network}.g.alchemy.com/v2/{key}"
+        elif network.rpc_urls:
             urls[network.chain_id] = network.rpc_urls[0]
+        else:
+            raise ConfigError(f"network {network.chain_id}: configured Alchemy RPC key required")
     return urls

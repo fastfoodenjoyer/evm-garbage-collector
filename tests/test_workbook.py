@@ -142,3 +142,137 @@ def test_selected_workbook_range_ignores_invalid_unselected_rows(tmp_path: Path)
     )
 
     assert [row.ordinal for row in rows] == [1]
+
+
+def _proxy_workbook(tmp_path, ordinals=(1, 2, 4, 9), reserve_count=6):
+    output = tmp_path / "proxy-wallets.xlsx"
+    create_wallet_template(output)
+    workbook = load_workbook(output)
+    sheet = workbook[WORKSHEET_NAME]
+    for index, ordinal in enumerate(ordinals):
+        sheet.append([ordinal, f"0x{index + 1:040x}", "0x" + "a" * 64,
+                      f"0x{index + 11:040x}", "", f"http://user:secret@primary{index}:8000"])
+        sheet.append([None] * 6)
+    for index in range(reserve_count):
+        sheet.append([None, None, None, None, None, f"http://user:secret@reserve{index}:8000"])
+    workbook.save(output)
+    workbook.close()
+    return output
+
+
+def test_proxy_assignments_follow_physical_wallet_order_with_gaps(tmp_path):
+    from evm_inventory.workbook import load_proxy_assignments
+
+    path = _proxy_workbook(tmp_path)
+    assignments = load_proxy_assignments(path)
+    wallet4 = f"0x{3:040x}"
+    assert assignments[wallet4] == (
+        "http://user:secret@primary2:8000", "http://user:secret@reserve2:8000"
+    )
+    assert assignments[f"0x{1:040x}"][-1] == "http://user:secret@reserve4:8000"
+    assert assignments[f"0x{2:040x}"][-1] == "http://user:secret@reserve5:8000"
+    selected = load_wallet_workbook(path, ordinal_ranges=((4, 4),), require_rabby_proxy=True)
+    assert len(selected) == 1
+    assert selected[0].proxy_pool == assignments[wallet4]
+    assert assignments[selected[0].public_address] == assignments[wallet4]
+    assert len(load_wallet_workbook(path, require_rabby_proxy=True)) == 4
+
+
+def test_legacy_proxy_assignments_require_no_reserves(tmp_path):
+    from evm_inventory.workbook import load_proxy_assignments
+
+    path = _proxy_workbook(tmp_path, reserve_count=0)
+    assert list(map(len, load_proxy_assignments(path).values())) == [1] * 4
+
+
+def test_proxy_assignments_do_not_validate_private_keys(tmp_path):
+    from evm_inventory.workbook import load_proxy_assignments
+
+    path = _proxy_workbook(tmp_path)
+    book = load_workbook(path)
+    book[WORKSHEET_NAME].cell(2, 3, "unselected-secret-invalid-key")
+    book.save(path)
+    assert len(load_proxy_assignments(path)) == 4
+    assert len(load_wallet_workbook(path, ordinal_ranges=((4, 4),))) == 1
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("incomplete", "reserve"),
+    ("duplicate", "duplicate"),
+    ("between", "proxy-only"),
+    ("before", "proxy-only"),
+    ("partial", "row 10"),
+    ("multiline", "invalid Rabby proxy"),
+    ("identity", "invalid public EVM address"),
+    ("ordinal", "duplicate #"),
+])
+def test_proxy_assignment_errors_are_sanitized(tmp_path, change, expected):
+    from evm_inventory.workbook import load_proxy_assignments
+
+    path = _proxy_workbook(tmp_path)
+    book = load_workbook(path)
+    sheet = book[WORKSHEET_NAME]
+    if change == "incomplete":
+        sheet.delete_rows(12, 4)
+    elif change == "duplicate":
+        sheet.cell(10, 6, sheet.cell(2, 6).value)
+    elif change == "between":
+        sheet.cell(3, 6, "http://secret@between:8000")
+    elif change == "before":
+        sheet.insert_rows(2)
+        sheet.cell(2, 6, "http://secret@before:8000")
+    elif change == "partial":
+        sheet.cell(10, 3, "private-secret")
+    elif change == "multiline":
+        sheet.cell(10, 6, "http://secret@reserve:8000\nhttp://secret@second:8000")
+    elif change == "identity":
+        sheet.cell(2, 2, "private-secret")
+    elif change == "ordinal":
+        sheet.cell(4, 1, 1)
+    book.save(path)
+    with pytest.raises(ConfigError, match=expected) as error:
+        load_proxy_assignments(path)
+    assert "secret" not in str(error.value)
+    assert "http://" not in str(error.value)
+
+
+def test_dry_run_validates_reserve_pool_before_writing(tmp_path):
+    path = _proxy_workbook(tmp_path, reserve_count=1)
+    with pytest.raises(ConfigError, match="reserve"):
+        dry_run_workbook(path)
+    assert load_workbook(path)[WORKSHEET_NAME].cell(2, 5).value is None
+
+
+def test_dry_run_preserves_valid_reserve_rows(tmp_path):
+    path = _proxy_workbook(tmp_path)
+    assert dry_run_workbook(path)["wallets"] == 4
+    assert load_workbook(path)[WORKSHEET_NAME].cell(10, 5).value is None
+
+
+def test_required_legacy_proxy_pool_rejects_duplicate_primaries(tmp_path):
+    path = _proxy_workbook(tmp_path, reserve_count=0)
+    book = load_workbook(path)
+    sheet = book[WORKSHEET_NAME]
+    sheet.cell(4, 6, sheet.cell(2, 6).value)
+    book.save(path)
+    with pytest.raises(ConfigError, match="row 4: duplicate Rabby proxy"):
+        load_wallet_workbook(path, require_rabby_proxy=True, ordinal_ranges=((4, 4),))
+
+
+def test_proxy_assignment_helper_closes_workbook_on_validation_error(tmp_path, monkeypatch):
+    import evm_inventory.workbook as module
+
+    path = _proxy_workbook(tmp_path, reserve_count=1)
+    book = load_workbook(path, read_only=True, data_only=True)
+    original_close = book.close
+    closed = []
+
+    def close():
+        closed.append(True)
+        original_close()
+
+    monkeypatch.setattr(book, "close", close)
+    monkeypatch.setattr(module, "load_workbook", lambda *args, **kwargs: book)
+    with pytest.raises(ConfigError, match="incomplete first reserve set"):
+        module.load_proxy_assignments(path)
+    assert closed == [True]

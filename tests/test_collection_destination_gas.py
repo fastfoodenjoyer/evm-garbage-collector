@@ -478,3 +478,43 @@ def test_collection_callback_keeps_full_search_context_and_allows_source_retry(t
     assert len(quote_times) == 2 and quote_times[1] < 1010
     assert result["status"] == "completed"
     assert len(list(tmp_path.glob("*.sqlite"))) == 1
+
+
+def test_terminal_upfront_fee_refusal_releases_destination_native_reserves(tmp_path):
+    blocked = {**native(81457), 'status': 'manual_review',
+               'reason': 'source_native_fee_exceeds_balance',
+               'search': {'complete': True, 'errors': [], 'pending': []}}
+    targets = [native(chain) for chain in (8453, 10, 42161)]
+    plan = {'entries': [blocked, *targets], 'search_scope': {
+        'enabled_targets': [{'chain_id': chain} for chain in (8453, 10, 42161)]}}
+    result, rounds = run(plan, tmp_path / 'inventory.sqlite')
+    assert all(rounds[0][(WALLET, chain, 'native')] is False for chain in (8453, 10, 42161))
+    assert result['status'] == 'completed'
+
+
+def test_fee_refusal_with_pending_alternative_keeps_destination_gas(tmp_path):
+    blocked = {**native(81457), 'status': 'manual_review',
+               'reason': 'source_native_fee_exceeds_balance',
+               'search': {'complete': False, 'errors': ['quota_wait'],
+                          'pending': [{'reason': 'quota_wait', 'retry_at': 2000}]}}
+    plan = {'entries': [blocked, native(8453)], 'search_scope': {
+        'enabled_targets': [{'chain_id': 8453}]}}
+    result, rounds = run(plan, tmp_path / 'inventory.sqlite')
+    assert rounds[0][(WALLET, 8453, 'native')] is True
+    assert result['reason'] == 'planning_incomplete'
+
+
+def test_fee_refusal_preserves_gas_for_already_broadcast_saved_continuation(tmp_path):
+    b = {**bridge(), 'status': 'manual_review',
+         'reason': 'source_native_fee_exceeds_balance', 'steps': [],
+         'search': {'complete': True, 'errors': [], 'pending': []}}
+    path = tmp_path / 'inventory.sqlite'
+    with Journal(path) as journal:
+        p = journal.get_or_create_position(position_key=_position_key(b), wallet=WALLET)
+        journal.record_step_intent(position_id=p['id'], step_key='bridge', nonce=9,
+                                   calldata_digest='a'*64, signed_payload_digest='b'*64,
+                                   tx_hash='0x'+'c'*64)
+        journal.save_checkpoint(p['id'], 'canonical_prepared', {
+            'continuation': {**native(8453), 'steps': []}})
+    _, rounds = run({'entries': [b, native(8453)]}, path)
+    assert rounds[0][(WALLET, 8453, 'native')] is True

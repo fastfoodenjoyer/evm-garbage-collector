@@ -54,6 +54,7 @@ class QuoteJobs:
         self.clock = clock or time.time
         self.lease_owner = uuid.uuid4().hex
         self._attempted: set[str] = set()
+        self.wait_recheck = None
         self._failures: dict[str, tuple[dict, float | None]] = {}
         with self.db() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS quote_jobs (
@@ -80,7 +81,7 @@ class QuoteJobs:
             result[column] = json.loads(result[column]) if result[column] else None
         return result
 
-    def read(self, job_key: str) -> dict | None:
+    def read(self, job_key: str, *, include_inflight: bool = False) -> dict | None:
         """Read reusable results or persisted failures without extending freshness."""
         now = self.clock()
         with self.db() as db:
@@ -98,6 +99,8 @@ class QuoteJobs:
                         (now, self.scope, job_key),
                     )
                     return None
+                return self._decode(row)
+            if include_inflight and row["state"] == "inflight":
                 return self._decode(row)
             if row["state"] in ("error", "quota_wait"):
                 return self._decode(row)
@@ -133,9 +136,14 @@ class QuoteJobs:
                             reason="error", retry_at=row["retry_at"], diagnostic=diagnostic
                         )
                 if state in ("quota_wait", "error") and row["retry_at"] is not None:
-                    if row["retry_at"] > now:
+                    retry_at = row["retry_at"]
+                    if state == "quota_wait" and self.wait_recheck is not None:
+                        refreshed = self.wait_recheck(diagnostic)
+                        if refreshed is not None:
+                            retry_at = refreshed
+                    if retry_at > now:
                         raise JobInProgress(
-                            reason=state, retry_at=row["retry_at"], diagnostic=diagnostic
+                            reason=state, retry_at=retry_at, diagnostic=diagnostic
                         )
             token = Claim(job_key, uuid.uuid4().hex, self.lease_owner)
             db.execute(

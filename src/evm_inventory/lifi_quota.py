@@ -122,6 +122,22 @@ class LifiQuotaStore:
             blocked,
         )
 
+    def available_at(self, bucket, *, purpose="planning"):
+        """Read capacity without reserving; dispatch must still reserve atomically."""
+        now = self.clock()
+        with self.db() as db:
+            state, times, _ = self._state(db, bucket, now)
+        reserve = state["reserve"] if purpose == "planning" else 0
+        capacity = state["limit"] - reserve
+        retry = [now, state["cooldown"] or now]
+        if capacity <= 0:
+            retry.append(state["reset_at"] or now + state["window"])
+        elif len(times) >= capacity:
+            retry.append(times[min(len(times) - 1, len(times) - capacity)] + state["window"])
+        if state["remaining"] is not None and state["remaining"] <= reserve:
+            retry.append(state["reset_at"] or now + state["window"])
+        return max(retry)
+
     def reserve_request(self, bucket, request_key, *, purpose="planning", paced=False):
         if purpose not in ("planning", "execution"):
             raise ValueError("invalid LI.FI request purpose")

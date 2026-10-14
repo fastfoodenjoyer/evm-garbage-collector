@@ -556,3 +556,25 @@ def test_quote_progress_reports_pairs_and_readable_retry():
     assert progress["pending"][0]["retry_at_moscow"].endswith("+03:00")
     assert progress["pending"][0]["diagnostic"]["exceptions"][0]["message"] == "remaining=5"
     assert progress["lifi_requests"]["w"]["http_attempts"] == 3
+
+
+def test_quote_routes_returns_incomplete_and_saves_pool_wait(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr('evm_inventory.cli._load_dotenv', lambda: None)
+    wallet = SimpleNamespace(public_address='0x' + '1' * 40,
+                             bitget_deposit_address='0x' + '2' * 40,
+                             rabby_proxy='http://localhost:1234', row_number=2)
+    monkeypatch.setattr('evm_inventory.cli.load_wallet_workbook', lambda *a, **k: [wallet])
+    monkeypatch.setattr('evm_inventory.cli.wallet_range_batches', lambda *a, **k: ((wallet,),))
+    entry = dict(wallet=wallet.public_address, chain_id=10, asset_id='native',
+                 status='manual_review', reason='proxy_pool_exhausted',
+                 search={'complete': False, 'pending': [{'reason': 'proxy_pool_exhausted',
+                                                        'retry_at': 2000.}]})
+    monkeypatch.setattr('evm_inventory.cli.create_live_plan',
+                        lambda *a, **k: {'summary': {'manual_review': 1}, 'entries': [entry]})
+    output = tmp_path / 'plan.json'
+    code = main(['quote-routes', '--balances', str(tmp_path / 'balances.csv'),
+                 '--workbook', str(tmp_path / 'wallets.xlsx'), '--output', str(output),
+                 '--db', str(tmp_path / 'inventory.sqlite')])
+    assert code == 3
+    assert json.loads(capsys.readouterr().out)['status'] == 'incomplete'
+    assert json.loads(output.read_text())['entries'][0]['reason'] == 'proxy_pool_exhausted'
